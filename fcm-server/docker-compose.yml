@@ -1,0 +1,28 @@
+# From repo root:  docker compose -f fcm-server/docker-compose.yml up -d --build
+# Mounts ./zatca-cert (your keys). Set CORS in .env next to this file, e.g.:
+#   ZATCA_CORS_ORIGINS=https://app.yourdomain.com,https://www.yourdomain.com
+# Or:  set ZATCA_CORS_ORIGINS=...  (Windows) / export ZATCA_CORS_ORIGINS=...  (Linux)
+#
+# Exposes HTTP on host port 3002 — put Nginx/Caddy in front for HTTPS (see DEPLOY.md).
+
+services:
+  zatca:
+    build:
+      context: ..
+      dockerfile: fcm-server/Dockerfile
+    ports:
+      - "${ZATCA_PORT:-3002}:3002"
+    environment:
+      ZATCA_PORT: 3002
+      ZATCA_HOST: 0.0.0.0
+      ZATCA_CERT_DIR: /app/zatca-cert
+      ZATCA_CORS_ORIGINS: ${ZATCA_CORS_ORIGINS:-}
+    volumes:
+      - ../zatca-cert:/app/zatca-cert:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:3002/zatca/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 15s

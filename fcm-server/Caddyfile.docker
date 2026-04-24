@@ -1,0 +1,7 @@
+# Used by docker-compose.https.yml — Caddy and ZATCA run in the same Docker network.
+# 1) Replace zatca-api.yourdomain.com with your real DNS name.
+# 2) Point DNS A/AAAA to this server before starting (Caddy will obtain a Let's Encrypt cert).
+
+zatca-api.yourdomain.com {
+    reverse_proxy zatca:3002
+}

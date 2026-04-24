@@ -1,0 +1,43 @@
+<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#d4f7db;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a8e6c1;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="400" height="300" fill="url(#bg1)"/>
+  <!-- Customer list representation -->
+  <rect x="50" y="40" width="300" height="220" rx="10" fill="#fff" opacity="0.95" stroke="#52b788" stroke-width="2"/>
+  <!-- Header -->
+  <rect x="50" y="40" width="300" height="35" fill="#52b788" rx="10" rx-top="10"/>
+  <text x="80" y="60" font-size="14" font-weight="bold" fill="#fff">Customer Database</text>
+  <!-- Customer rows -->
+  <rect x="60" y="85" width="280" height="12" fill="#e8f5e9" opacity="0.8"/>
+  <circle cx="65" cy="91" r="3" fill="#52b788"/>
+  <text x="80" y="93" font-size="10" fill="#2d6a4f">Ahmed Mohammed</text>
+  <text x="230" y="93" font-size="9" fill="#666">+966501234567</text>
+  
+  <rect x="60" y="105" width="280" height="12" fill="#e8f5e9" opacity="0.8"/>
+  <circle cx="65" cy="111" r="3" fill="#52b788"/>
+  <text x="80" y="113" font-size="10" fill="#2d6a4f">Fatima Ali</text>
+  <text x="230" y="113" font-size="9" fill="#666">+966509876543</text>
+  
+  <rect x="60" y="125" width="280" height="12" fill="#e8f5e9" opacity="0.8"/>
+  <circle cx="65" cy="131" r="3" fill="#52b788"/>
+  <text x="80" y="133" font-size="10" fill="#2d6a4f">Omar Hassan</text>
+  <text x="230" y="133" font-size="9" fill="#666">+966555444333</text>
+  
+  <rect x="60" y="145" width="280" height="12" fill="#e8f5e9" opacity="0.8"/>
+  <circle cx="65" cy="151" r="3" fill="#52b788"/>
+  <text x="80" y="153" font-size="10" fill="#2d6a4f">Noor Karim</text>
+  <text x="230" y="153" font-size="9" fill="#666">+966533221100</text>
+  
+  <rect x="60" y="165" width="280" height="12" fill="#e8f5e9" opacity="0.8"/>
+  <circle cx="65" cy="171" r="3" fill="#52b788"/>
+  <text x="80" y="173" font-size="10" fill="#2d6a4f">Layla Ibrahim</text>
+  <text x="230" y="173" font-size="9" fill="#666">+966599887766</text>
+  
+  <!-- Add button indicator -->
+  <rect x="260" y="190" width="70" height="22" rx="4" fill="#52b788" opacity="0.7"/>
+  <text x="295" y="203" font-size="10" font-weight="bold" fill="#fff" text-anchor="middle">+ Add New</text>
+</svg>

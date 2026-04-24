@@ -1,0 +1,49 @@
+# Optional: ZATCA API + Caddy on one host (HTTPS with automatic TLS).
+# 1. Copy Caddyfile.example → Caddyfile and set your real subdomain + email if needed.
+# 2. From repo root:
+#    docker compose -f fcm-server/docker-compose.https.yml up -d
+#
+# Caddy proxies https://zatca-api.yourdomain.com → zatca:3002
+# Set Amlak build: VITE_ZATCA_SERVICE_URL=https://zatca-api.yourdomain.com
+# Edit fcm-server/Caddyfile.docker (domain) before up.
+
+services:
+  zatca:
+    build:
+      context: ..
+      dockerfile: fcm-server/Dockerfile
+    expose:
+      - "3002"
+    environment:
+      ZATCA_PORT: 3002
+      ZATCA_HOST: 0.0.0.0
+      ZATCA_CERT_DIR: /app/zatca-cert
+      ZATCA_CORS_ORIGINS: ${ZATCA_CORS_ORIGINS:-}
+    volumes:
+      - ../zatca-cert:/app/zatca-cert:ro
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://127.0.0.1:3002/zatca/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))\""]
+      interval: 30s
+      timeout: 8s
+      retries: 3
+      start_period: 15s
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile.docker:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      zatca:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  caddy_config:

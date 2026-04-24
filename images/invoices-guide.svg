@@ -1,0 +1,31 @@
+<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg3" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#d4f7db;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a8e6c1;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="400" height="300" fill="url(#bg3)"/>
+  <!-- Invoice document -->
+  <rect x="70" y="30" width="260" height="220" rx="8" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.96"/>
+  <!-- Invoice header -->
+  <rect x="70" y="30" width="260" height="40" fill="#52b788"/>
+  <text x="200" y="58" font-size="16" font-weight="bold" fill="#fff" text-anchor="middle">INVOICE</text>
+  <!-- Invoice details -->
+  <text x="90" y="90" font-size="10" font-weight="bold" fill="#2d6a4f">Invoice #INV-2024-001</text>
+  <text x="90" y="110" font-size="9" fill="#666">Customer: Ahmed Mohammed</text>
+  <text x="90" y="125" font-size="9" fill="#666">Property: Unit 5A - Apartment</text>
+  <!-- Amount box -->
+  <rect x="250" y="100" width="70" height="35" rx="4" fill="#c8e6c9" opacity="0.7" stroke="#52b788" stroke-width="1"/>
+  <text x="285" y="115" font-size="8" fill="#666" text-anchor="middle" font-weight="bold">Amount Due</text>
+  <text x="285" y="130" font-size="14" fill="#2d6a4f" text-anchor="middle" font-weight="bold">5,000 SAR</text>
+  <!-- Line items -->
+  <line x1="80" y1="145" x2="330" y2="145" stroke="#e0f0e0" stroke-width="1"/>
+  <text x="90" y="160" font-size="9" fill="#2d6a4f" font-weight="bold">Monthly Rent</text>
+  <text x="280" y="160" font-size="9" fill="#2d6a4f" font-weight="bold">5,000 SAR</text>
+  <line x1="80" y1="170" x2="330" y2="170" stroke="#e0f0e0" stroke-width="1"/>
+  <!-- Due date -->
+  <rect x="85" y="185" width="250" height="50" rx="4" fill="#f0f8f5" opacity="0.8" stroke="#81c784" stroke-width="1" stroke-dasharray="2,2"/>
+  <text x="200" y="205" font-size="10" font-weight="bold" fill="#2d6a4f" text-anchor="middle">Due Date: 15 February 2024</text>
+  <text x="200" y="225" font-size="9" fill="#52b788" text-anchor="middle" font-style="italic">Payment Methods: Cash, Bank Transfer</text>
+</svg>

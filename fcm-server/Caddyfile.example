@@ -1,0 +1,10 @@
+# Example for Caddy (automatic HTTPS). Copy to the VPS as Caddyfile and point DNS to the server.
+# Install: https://caddyserver.com/docs/install
+#
+# Replace the domain. Caddy obtains Let's Encrypt certificates automatically.
+# The ZATCA container must listen on localhost:3002 OR use docker network name "zatca:3002"
+# if Caddy runs in the same compose stack (see docker-compose.https.yml).
+
+zatca-api.yourdomain.com {
+    reverse_proxy 127.0.0.1:3002
+}

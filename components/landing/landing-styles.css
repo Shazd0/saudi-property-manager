@@ -1,0 +1,513 @@
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700;800;900&display=swap');
+
+/* ── Reset & Global ── */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+/* Hide scrollbar entirely for full-screen app feel */
+.amlak-void::-webkit-scrollbar { display: none; }
+.amlak-void { -ms-overflow-style: none; scrollbar-width: none; }
+
+:root {
+  --void: #000000;
+  --accent: #007AFF;
+  --accent-glow: rgba(0, 122, 255, 0.4);
+  --glass-bg: rgba(255, 255, 255, 0.05);
+  --glass-bg-hover: rgba(255, 255, 255, 0.08);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-border-hover: rgba(255, 255, 255, 0.2);
+  --glass-blur: blur(24px);
+  --text-primary: #ffffff;
+  --text-secondary: rgba(255, 255, 255, 0.55);
+  --text-tertiary: rgba(255, 255, 255, 0.3);
+  --saudi-green: #37B34A;
+  --radius-sm: 12px;
+  --radius-md: 20px;
+  --radius-lg: 28px;
+  --radius-xl: 40px;
+}
+
+/* ── Canvas Container ── */
+.amlak-void {
+  background: var(--void);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  overflow-x: hidden;
+  position: relative;
+}
+
+.amlak-void[dir="rtl"] {
+  font-family: 'IBM Plex Sans Arabic', 'Inter', sans-serif;
+}
+
+/* Fixed canvas background */
+.frame-canvas {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 0;
+  pointer-events: none;
+}
+
+/* ── Glassmorphism System ── */
+.glass {
+  background: var(--glass-bg);
+  backdrop-filter: var(--glass-blur);
+  -webkit-backdrop-filter: var(--glass-blur);
+  border: 1px solid var(--glass-border);
+  border-radius: var(--radius-md);
+  position: relative;
+  overflow: hidden;
+  transition: all 0.4s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+}
+
+.glass::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 1px;
+  background: linear-gradient(
+    135deg,
+    rgba(255, 255, 255, 0.15) 0%,
+    transparent 40%,
+    transparent 60%,
+    rgba(255, 255, 255, 0.08) 100%
+  );
+  -webkit-mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  mask: linear-gradient(#fff 0 0) content-box, linear-gradient(#fff 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  pointer-events: none;
+}
+
+.glass:hover {
+  background: var(--glass-bg-hover);
+  border-color: var(--glass-border-hover);
+  transform: translateY(-2px);
+}
+
+/* ── Sticky Header ── */
+.landing-header {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 72px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0 40px;
+  z-index: 1000;
+  transition: background 0.5s ease;
+}
+
+.landing-header.scrolled {
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.logo-mark {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-weight: 800;
+  font-size: 22px;
+  letter-spacing: -0.5px;
+}
+
+.logo-img {
+  width: 38px;
+  height: 38px;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  transition: filter 0.3s;
+}
+
+.lang-pill {
+  display: flex;
+  align-items: center;
+  height: 38px;
+  border-radius: 19px;
+  padding: 3px;
+  cursor: pointer;
+  gap: 0;
+  font-size: 13px;
+  font-weight: 600;
+  min-width: 110px;
+  user-select: none;
+}
+
+.lang-pill span {
+  flex: 1;
+  text-align: center;
+  z-index: 1;
+  line-height: 32px;
+  border-radius: 16px;
+  transition: color 0.3s;
+}
+
+.lang-pill span.active-lang {
+  color: #fff;
+  background: var(--accent);
+}
+
+/* ── Scroll Progress ── */
+.scroll-track {
+  position: fixed;
+  right: 16px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 120px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  z-index: 1000;
+  overflow: hidden;
+}
+
+.scroll-thumb {
+  width: 100%;
+  background: var(--accent);
+  border-radius: 2px;
+  transition: height 0.15s linear;
+  box-shadow: 0 0 8px var(--accent-glow);
+}
+
+/* ── Phase: Hero ── */
+.hero-section {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 10;
+  pointer-events: none;
+  transition: opacity 0.4s ease;
+}
+
+.hero-title {
+  font-size: clamp(2.5rem, 6vw, 5rem);
+  font-weight: 900;
+  text-align: center;
+  letter-spacing: -3px;
+  line-height: 1.05;
+  background: linear-gradient(180deg, #ffffff 0%, rgba(255, 255, 255, 0.5) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  max-width: 800px;
+  padding: 0 20px;
+}
+
+.hero-subtitle {
+  margin-top: 20px;
+  font-size: clamp(1rem, 2vw, 1.25rem);
+  font-weight: 400;
+  color: var(--text-secondary);
+  text-align: center;
+  letter-spacing: 0.5px;
+  max-width: 600px;
+  padding: 0 20px;
+}
+
+.hero-badges {
+  display: flex;
+  gap: 16px;
+  margin-top: 40px;
+}
+
+.hero-badge {
+  padding: 10px 22px;
+  border-radius: 100px;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+
+/* ── Phase: Feature Cards ── */
+.feature-layer {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 20;
+  pointer-events: none;
+  will-change: opacity;
+}
+
+.feature-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 20px;
+  max-width: 1100px;
+  width: 90%;
+  pointer-events: all;
+}
+
+.feature-card {
+  padding: 36px 28px;
+  border-radius: var(--radius-lg);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  opacity: 0;
+  transform: translateY(50px) scale(0.95);
+  transition: all 0.7s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.feature-card.visible {
+  opacity: 1;
+  transform: translateY(0) scale(1);
+}
+
+.feature-card:hover {
+  box-shadow: 0 8px 40px rgba(0, 122, 255, 0.12);
+}
+
+.feature-card .card-icon-wrap {
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  background: rgba(0, 122, 255, 0.12);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--accent);
+}
+
+.feature-card h3 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: -0.3px;
+}
+
+.feature-card p {
+  font-size: 0.88rem;
+  color: var(--text-secondary);
+  line-height: 1.55;
+}
+
+/* span 2 columns for the hero card */
+.feature-card.span-2 {
+  grid-column: span 2;
+}
+
+/* ── Phase: Dashboard / CTA ── */
+.cta-layer {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 30;
+  pointer-events: none;
+  will-change: opacity;
+  gap: 50px;
+}
+
+.cta-title {
+  font-size: clamp(2rem, 4vw, 3.5rem);
+  font-weight: 800;
+  text-align: center;
+  letter-spacing: -2px;
+  background: linear-gradient(180deg, #ffffff 0%, rgba(255, 255, 255, 0.6) 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  max-width: 700px;
+}
+
+.cta-buttons {
+  display: flex;
+  gap: 20px;
+  pointer-events: all;
+}
+
+.cta-btn {
+  padding: 18px 44px;
+  border-radius: var(--radius-xl);
+  font-size: 17px;
+  font-weight: 700;
+  cursor: pointer;
+  border: none;
+  transition: all 0.3s cubic-bezier(0.25, 0.46, 0.45, 0.94);
+  letter-spacing: -0.3px;
+}
+
+.cta-btn.primary {
+  background: var(--accent);
+  color: #fff;
+  box-shadow: 0 0 30px var(--accent-glow), 0 4px 20px rgba(0, 0, 0, 0.3);
+}
+
+.cta-btn.primary:hover {
+  transform: translateY(-3px);
+  box-shadow: 0 0 50px var(--accent-glow), 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+
+.cta-btn.secondary {
+  background: transparent;
+  color: var(--text-primary);
+  border: 1px solid var(--glass-border);
+}
+
+.cta-btn.secondary:hover {
+  background: var(--glass-bg);
+  border-color: var(--glass-border-hover);
+  transform: translateY(-3px);
+}
+
+.tech-badges {
+  display: flex;
+  gap: 40px;
+  opacity: 0.35;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  pointer-events: none;
+}
+
+/* ── Stats Row (replaces dashboard) ── */
+.stats-row {
+  display: flex;
+  gap: 50px;
+  pointer-events: none;
+}
+
+.stat-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.stat-val {
+  font-size: 2.5rem;
+  font-weight: 900;
+  letter-spacing: -2px;
+  color: var(--text-primary);
+}
+
+.stat-val.accent { color: var(--accent); }
+.stat-val.green { color: var(--saudi-green); }
+
+.stat-label {
+  font-size: 0.7rem;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 2px;
+  font-weight: 600;
+}
+
+/* ── Loading Screen ── */
+.loading-screen {
+  position: fixed;
+  inset: 0;
+  background: var(--void);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 99999;
+  gap: 30px;
+}
+
+.loading-logo-img {
+  width: 80px;
+  height: 80px;
+  object-fit: contain;
+  filter: brightness(0) invert(1);
+  animation: loader-pulse 1.8s ease-in-out infinite;
+}
+
+@keyframes loader-pulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.1); }
+}
+
+.loading-text {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 5px;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.loading-bar {
+  width: 200px;
+  height: 2px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 1px;
+  overflow: hidden;
+}
+
+.loading-bar-fill {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 1px;
+  transition: width 0.3s ease;
+}
+
+/* ── Responsive ── */
+@media (max-width: 900px) {
+  .feature-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .feature-card.span-2 {
+    grid-column: span 2;
+  }
+  .landing-header {
+    padding: 0 20px;
+  }
+  .stats-row {
+    gap: 30px;
+  }
+}
+
+@media (max-width: 600px) {
+  .feature-grid {
+    grid-template-columns: 1fr;
+    gap: 14px;
+  }
+  .feature-card.span-2 {
+    grid-column: span 1;
+  }
+  .feature-card {
+    padding: 24px 20px;
+  }
+  .hero-badges {
+    flex-direction: column;
+    align-items: center;
+  }
+  .cta-buttons {
+    flex-direction: column;
+    align-items: center;
+  }
+  .stats-row {
+    flex-wrap: wrap;
+    gap: 24px;
+    justify-content: center;
+  }
+  .stat-val {
+    font-size: 1.8rem;
+  }
+  .tech-badges {
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+  }
+}

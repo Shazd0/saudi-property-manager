@@ -1,0 +1,19 @@
+<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="greenGradient9" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#d4f7db;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a8e6c1;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="400" height="300" fill="url(#greenGradient9)"/>
+  <rect x="70" y="70" width="80" height="120" rx="8" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.9"/>
+  <path d="M 75 75 L 145 75 L 145 145 L 75 145 Z" fill="#e8f5e9"/>
+  <text x="110" y="110" font-size="20" fill="#52b788" text-anchor="middle" font-weight="bold">⬇</text>
+  <rect x="250" y="70" width="80" height="120" rx="8" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.9"/>
+  <rect x="260" y="90" width="60" height="12" fill="#52b788"/>
+  <rect x="260" y="108" width="60" height="12" fill="#c8e6c9"/>
+  <rect x="260" y="126" width="60" height="12" fill="#c8e6c9"/>
+  <path d="M 155 130 L 245 130" stroke="#52b788" stroke-width="2" fill="none"/>
+  <polygon points="245,130 235,125 235,135" fill="#52b788"/>
+  <text x="200" y="25" font-size="24" font-weight="bold" fill="#2d6a4f" text-anchor="middle">Import & Export</text>
+</svg>

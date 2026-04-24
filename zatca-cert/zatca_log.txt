@@ -1,0 +1,3 @@
+HTTP Status: 400
+Raw response: Invalid Request
+ZATCA error response: Invalid Request

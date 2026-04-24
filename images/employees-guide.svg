@@ -1,0 +1,20 @@
+<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="greenGradient6" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#d4f7db;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a8e6c1;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="400" height="300" fill="url(#greenGradient6)"/>
+  <circle cx="120" cy="100" r="35" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.9"/>
+  <circle cx="120" cy="90" r="8" fill="#52b788"/>
+  <path d="M 120 105 Q 130 120 140 115" fill="none" stroke="#52b788" stroke-width="2"/>
+  <rect x="60" y="160" width="120" height="100" rx="8" fill="#c8e6c9" opacity="0.6"/>
+  <text x="120" y="195" font-size="14" font-weight="bold" fill="#2d6a4f" text-anchor="middle">Manager</text>
+  <circle cx="280" cy="100" r="35" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.9"/>
+  <circle cx="280" cy="90" r="8" fill="#52b788"/>
+  <path d="M 280 105 Q 290 120 300 115" fill="none" stroke="#52b788" stroke-width="2"/>
+  <rect x="220" y="160" width="120" height="100" rx="8" fill="#c8e6c9" opacity="0.6"/>
+  <text x="280" y="195" font-size="14" font-weight="bold" fill="#2d6a4f" text-anchor="middle">Employee</text>
+  <text x="200" y="25" font-size="24" font-weight="bold" fill="#2d6a4f" text-anchor="middle">Employee Management</text>
+</svg>

@@ -1,0 +1,59 @@
+<svg viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg4" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#d4f7db;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#a8e6c1;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <rect width="400" height="300" fill="url(#bg4)"/>
+  <!-- Building 1 -->
+  <rect x="50" y="40" width="70" height="130" rx="4" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.95"/>
+  <rect x="50" y="40" width="70" height="25" fill="#52b788"/>
+  <text x="85" y="57" font-size="10" font-weight="bold" fill="#fff" text-anchor="middle">Building A</text>
+  <!-- Windows -->
+  <circle cx="62" cy="75" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="108" cy="75" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="62" cy="100" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="108" cy="100" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="62" cy="125" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="108" cy="125" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <text x="85" y="160" font-size="9" fill="#2d6a4f" text-anchor="middle" font-weight="bold">8 Units</text>
+  <rect x="65" y="170" width="40" height="12" rx="2" fill="#81c784" opacity="0.6"/>
+  <text x="85" y="178" font-size="8" fill="#fff" text-anchor="middle">Occupied</text>
+  
+  <!-- Building 2 -->
+  <rect x="155" y="40" width="70" height="130" rx="4" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.95"/>
+  <rect x="155" y="40" width="70" height="25" fill="#52b788"/>
+  <text x="190" y="57" font-size="10" font-weight="bold" fill="#fff" text-anchor="middle">Building B</text>
+  <!-- Windows -->
+  <circle cx="167" cy="75" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="213" cy="75" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="167" cy="100" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="213" cy="100" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="167" cy="125" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="213" cy="125" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <text x="190" y="160" font-size="9" fill="#2d6a4f" text-anchor="middle" font-weight="bold">12 Units</text>
+  <rect x="170" y="170" width="40" height="12" rx="2" fill="#ffa726" opacity="0.6"/>
+  <text x="190" y="178" font-size="8" fill="#fff" text-anchor="middle">Mixed</text>
+  
+  <!-- Building 3 -->
+  <rect x="260" y="40" width="70" height="130" rx="4" fill="#fff" stroke="#52b788" stroke-width="2" opacity="0.95"/>
+  <rect x="260" y="40" width="70" height="25" fill="#52b788"/>
+  <text x="295" y="57" font-size="10" font-weight="bold" fill="#fff" text-anchor="middle">Building C</text>
+  <!-- Windows -->
+  <circle cx="272" cy="75" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="318" cy="75" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="272" cy="100" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="318" cy="100" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="272" cy="125" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <circle cx="318" cy="125" r="4" fill="#a5d6a7" opacity="0.6"/>
+  <text x="295" y="160" font-size="9" fill="#2d6a4f" text-anchor="middle" font-weight="bold">5 Units</text>
+  <rect x="275" y="170" width="40" height="12" rx="2" fill="#ef5350" opacity="0.5"/>
+  <text x="295" y="178" font-size="8" fill="#fff" text-anchor="middle">Vacant</text>
+  
+  <!-- Summary -->
+  <rect x="60" y="210" width="280" height="70" rx="6" fill="#f0f8f5" opacity="0.8" stroke="#52b788" stroke-width="1" stroke-dasharray="2,2"/>
+  <text x="200" y="230" font-size="11" font-weight="bold" fill="#2d6a4f" text-anchor="middle">Total: 25 Units | Occupied: 8 | Vacant: 5 | Mixed: 12</text>
+  <text x="200" y="250" font-size="9" fill="#666" text-anchor="middle">Occupancy Rate: 80% | Avg Rent: 5,500 SAR</text>
+  <text x="200" y="270" font-size="9" fill="#666" text-anchor="middle">Total Revenue: 137,500 SAR/month</text>
+</svg>

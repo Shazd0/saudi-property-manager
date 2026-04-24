@@ -1,0 +1,345 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Letterhead - مؤسسة أحمد بن محمد بن داود عثمان للشحن الجوي</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        html, body {
+            width: 100%;
+            height: 100%;
+        }
+        
+        body {
+            font-family: 'Inter', 'Segoe UI', sans-serif;
+            background: linear-gradient(135deg, #f0f4f8 0%, #e2e8f0 100%);
+            padding: 15px;
+        }
+        
+        .controls {
+            display: flex;
+            justify-content: center;
+            gap: 12px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        
+        .btn {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 5px;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+        }
+        
+        .btn-pdf {
+            background: linear-gradient(135deg, #0f3d2f 0%, #1a5a3f 100%);
+            color: white;
+        }
+        
+        .btn-pdf:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(15, 61, 47, 0.3);
+        }
+        
+        .btn-print {
+            background: white;
+            color: #333;
+            border: 1.5px solid #cbd5e0;
+        }
+        
+        .btn-print:hover {
+            border-color: #0f3d2f;
+            color: #0f3d2f;
+        }
+        
+        .page {
+            width: 210mm;
+            height: 297mm;
+            margin: 0 auto;
+            background: white;
+            box-shadow: 0 15px 50px rgba(0,0,0,0.2);
+            position: relative;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+        }
+        
+        .watermark {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            width: 280px;
+            height: 280px;
+            opacity: 0.02;
+            pointer-events: none;
+            z-index: 0;
+        }
+        
+        .watermark svg {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #0f3d2f 0%, #1a5a3f 100%);
+            padding: 18px 32px;
+            color: white;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 4px solid #d4af37;
+            gap: 18px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .logo-section {
+            display: flex;
+            align-items: center;
+            gap: 14px;
+            flex: 1;
+        }
+        
+        .logo {
+            width: 60px;
+            height: 60px;
+            background: white;
+            border-radius: 4px;
+            padding: 5px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            flex-shrink: 0;
+            box-shadow: 0 3px 10px rgba(0,0,0,0.2);
+        }
+        
+        .logo svg {
+            width: 100%;
+            height: 100%;
+        }
+        
+        .company-info h1 {
+            font-size: 19px;
+            margin-bottom: 2px;
+            font-weight: 700;
+            letter-spacing: 0.3px;
+        }
+        
+        .company-info p {
+            font-size: 11px;
+            opacity: 0.95;
+            font-weight: 500;
+            letter-spacing: 0.2px;
+        }
+        
+        .contact-info {
+            text-align: left;
+            font-size: 10px;
+            line-height: 1.5;
+            background: rgba(255, 255, 255, 0.08);
+            padding: 9px 13px;
+            border-radius: 3px;
+            flex-shrink: 0;
+        }
+        
+        .contact-info p {
+            margin: 2px 0;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 10px;
+            font-weight: 500;
+        }
+        
+        .contact-label {
+            font-weight: 600;
+            opacity: 0.9;
+            min-width: 40px;
+        }
+        
+        .divider {
+            height: 2px;
+            background: linear-gradient(90deg, transparent 0%, #d4af37 50%, transparent 100%);
+            margin: 7px 32px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .content {
+            padding: 8px 32px;
+            flex: 1;
+            color: #2d3748;
+            font-size: 13px;
+            line-height: 1.6;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .footer {
+            position: relative;
+            background: #f7fafc;
+            border-top: 2px solid #d4af37;
+            padding: 9px 32px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-size: 9px;
+            color: #596274;
+            font-weight: 500;
+            z-index: 1;
+            flex-shrink: 0;
+            gap: 13px;
+        }
+        
+        .footer-left {
+            display: flex;
+            gap: 13px;
+            align-items: center;
+            flex: 1;
+        }
+        
+        .footer-right {
+            display: flex;
+            gap: 13px;
+            align-items: center;
+        }
+        
+        .footer-item {
+            display: flex;
+            align-items: center;
+            gap: 3px;
+            white-space: nowrap;
+        }
+        
+        @media print {
+            body {
+                background: white;
+                margin: 0;
+                padding: 0;
+            }
+            .controls {
+                display: none;
+            }
+            .page {
+                margin: 0;
+                box-shadow: none;
+            }
+        }
+        
+        @media screen {
+            .page {
+                margin: 0 auto 30px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="controls">
+        <button class="btn btn-pdf" onclick="downloadPDF()">📄 تحميل PDF</button>
+        <button class="btn btn-print" onclick="window.print()">🖨️ طباعة</button>
+    </div>
+
+    <div class="page">
+        <div class="watermark">
+            <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 240'>
+                <!-- Shield outline -->
+                <path d='M 50 30 L 190 30 L 190 120 Q 120 180 120 180 Q 50 120 50 120 Z' fill='none' stroke='%230f3d2f' stroke-width='2'/>
+                
+                <!-- Airplane -->
+                <path d='M 120 45 L 145 80 L 130 85 L 120 65 L 110 85 L 95 80 Z' fill='%231a3a5f'/>
+                <rect x='115' y='85' width='10' height='20' fill='%231a3a5f'/>
+                
+                <!-- Swords -->
+                <g>
+                    <!-- Left sword -->
+                    <path d='M 85 130 Q 70 115 60 140' fill='none' stroke='%23228B22' stroke-width='5' stroke-linecap='round'/>
+                    <path d='M 85 130 Q 95 145 110 150' fill='none' stroke='%23228B22' stroke-width='4' stroke-linecap='round'/>
+                </g>
+                <g>
+                    <!-- Right sword -->
+                    <path d='M 155 130 Q 170 115 180 140' fill='none' stroke='%23228B22' stroke-width='5' stroke-linecap='round'/>
+                    <path d='M 155 130 Q 145 145 130 150' fill='none' stroke='%23228B22' stroke-width='4' stroke-linecap='round'/>
+                </g>
+            </svg>
+        </div>
+        
+        <div class="header">
+            <div class="logo-section">
+                <div class="logo">
+                    <svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 240 240'>
+                        <!-- Shield outline -->
+                        <path d='M 50 30 L 190 30 L 190 120 Q 120 180 120 180 Q 50 120 50 120 Z' fill='none' stroke='%230f3d2f' stroke-width='2.5'/>
+                        
+                        <!-- Airplane -->
+                        <path d='M 120 45 L 145 80 L 130 85 L 120 65 L 110 85 L 95 80 Z' fill='%231a3a5f'/>
+                        <rect x='115' y='85' width='10' height='20' fill='%231a3a5f'/>
+                        
+                        <!-- Swords -->
+                        <g>
+                            <!-- Left sword -->
+                            <path d='M 85 130 Q 70 115 60 140' fill='none' stroke='%23228B22' stroke-width='5' stroke-linecap='round'/>
+                            <path d='M 85 130 Q 95 145 110 150' fill='none' stroke='%23228B22' stroke-width='4' stroke-linecap='round'/>
+                        </g>
+                        <g>
+                            <!-- Right sword -->
+                            <path d='M 155 130 Q 170 115 180 140' fill='none' stroke='%23228B22' stroke-width='5' stroke-linecap='round'/>
+                            <path d='M 155 130 Q 145 145 130 150' fill='none' stroke='%23228B22' stroke-width='4' stroke-linecap='round'/>
+                        </g>
+                    </svg>
+                </div>
+                <div class="company-info">
+                    <h1>مؤسسة أحمد بن محمد</h1>
+                    <p>الشحن الجوي الدولي</p>
+                </div>
+            </div>
+            <div class="contact-info">
+                <p><span class="contact-label">الهاتف:</span> +966 11 1900</p>
+                <p><span class="contact-label">الموقع:</span> mc.gov.sa</p>
+                <p><span class="contact-label">البريد:</span> info@example.com</p>
+            </div>
+        </div>
+        
+        <div class="divider"></div>
+        
+        <div class="content">
+            <!-- محتوى الرسالة هنا -->
+        </div>
+        
+        <div class="footer">
+            <div class="footer-left">
+                <div class="footer-item">الرياض - المملكة العربية السعودية</div>
+            </div>
+            <div class="footer-right">
+                <div class="footer-item">الرقم الوطني الموحد: 7034524087</div>
+                <div class="footer-item">© 2024</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function downloadPDF() {
+            const element = document.querySelector('.page');
+            const opt = {
+                margin: [0, 0, 0, 0],
+                filename: 'letterhead.pdf',
+                image: { type: 'jpeg', quality: 0.99 },
+                html2canvas: { scale: 2, useCORS: true, logging: false, allowTaint: true },
+                jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' }
+            };
+            html2pdf().set(opt).from(element).save();
+        }
+    </script>
+</body>
+</html>
