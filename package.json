@@ -8,6 +8,7 @@
   "main": "electron/main.cjs",
   "scripts": {
     "dev": "concurrently \"vite --force\" \"node fcm-server/zatca-service.js\"",
+    "postinstall": "npm --prefix fcm-server install",
     "start": "node fcm-server/zatca-service.js",
     "zatca:server": "node fcm-server/zatca-service.js",
     "zatca:docker": "docker compose -f fcm-server/docker-compose.yml up -d --build",
