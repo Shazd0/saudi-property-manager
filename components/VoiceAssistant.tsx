@@ -4,6 +4,7 @@ import { Mic, MicOff, X, Volume2, Receipt } from 'lucide-react';
 import SoundService from '../services/soundService';
 import { ExpenseCategory } from '../types';
 import { getTransactions, getBuildings, getCustomers, getContracts, getUsers, getOccupancyStats, getTasks, getVendors } from '../services/firestoreService';
+import { answerDataQuestion } from '../services/amlakAiContext';
 import { useLanguage } from '../i18n';
 
 // ─── Route map ──────────────────────────────────────────────────────────────
@@ -355,6 +356,12 @@ const QA_RULES: QARule[] = [
 ];
 
 async function answerQuestion(text: string, user: any): Promise<string | null> {
+  try {
+    const fromContext = await answerDataQuestion(text);
+    if (fromContext) return fromContext;
+  } catch {
+    /* fall through to legacy rules */
+  }
   for (const rule of QA_RULES) {
     for (const pat of rule.patterns) {
       if (pat.test(text)) {

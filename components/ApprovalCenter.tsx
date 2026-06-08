@@ -69,7 +69,7 @@ const DRow: React.FC<{ icon?: any; label: string; value: any; highlight?: boolea
 };
 
 // ── Rich Transaction / Contract Detail View ──
-const TransactionDetailView: React.FC<{ payload: any; type: string; users: Record<string, string> }> = ({ payload, type, users }) => {
+const TransactionDetailView: React.FC<{ payload: any; type: string; users: Record<string, string>; customerRoomMap: Record<string, string> }> = ({ payload, type, users, customerRoomMap }) => {
   const { t } = useLanguage();
   const p = payload || {};
   const { language } = useLanguage();
@@ -748,7 +748,7 @@ const ApprovalCenter: React.FC<ApprovalCenterProps> = ({ currentUser }) => {
                     <Eye className="w-3 h-3" /> {t('approval.fullDetails')}
                   </p>
                   {effectivePayload && !effectivePayload._notFound && !effectivePayload._error ? (
-                    <TransactionDetailView payload={effectivePayload} type={approval.type} users={users} />
+                    <TransactionDetailView payload={effectivePayload} type={approval.type} users={users} customerRoomMap={customerRoomMap} />
                   ) : effectivePayload?._notFound ? (
                     <div className="bg-amber-50 rounded-xl p-4 border border-amber-100 text-center">
                       <p className="text-xs font-bold text-amber-700">{t('approval.txNotFound')}</p>

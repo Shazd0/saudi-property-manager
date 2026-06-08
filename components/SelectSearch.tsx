@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { matchesAdvancedSearch } from '../utils/advancedSearch';
 
 interface Option {
   value: string;
@@ -16,7 +17,9 @@ interface SelectSearchProps {
 
 const SelectSearch: React.FC<SelectSearchProps> = ({ options, value, onChange, placeholder, disabled, className }) => {
   const [search, setSearch] = useState('');
-  const filtered = options.filter(opt => opt.label.toLowerCase().includes(search.toLowerCase()));
+  const filtered = options.filter((opt) =>
+    matchesAdvancedSearch(search, `${opt.label} ${opt.value}`),
+  );
 
   return (
     <div className={`relative ${className || ''}`}>

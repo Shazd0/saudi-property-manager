@@ -17,10 +17,14 @@ import {
   BadgeCheck,
   XCircle,
 } from 'lucide-react';
-import { fmtDate, fmtDateTime, dateToLocalStr } from '../utils/dateFormat';
+import { fmtDate, fmtDateTime, dateToLocalStr, localDateStr } from '../utils/dateFormat';
 import { formatNameWithRoom } from '../utils/customerDisplay';
 import { getInstallmentStartDates } from '../utils/installmentSchedule';
 import { useLanguage } from '../i18n';
+import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
+import { nonResFeeDueForInstallment } from '../utils/nonResidentialFeeSchedule';
+import { getCarriedPriorInstallmentWindow } from '../utils/priorBalanceCarriedInstallment';
+import type { Building } from '../types';
 
 type SortField = 'DATE' | 'BUILDING' | 'UNIT' | 'CUSTOMER' | 'AMOUNT' | 'DAYS';
 type SortDir = 'ASC' | 'DESC';
@@ -29,21 +33,52 @@ type StatusFilter = 'ALL' | 'OVERDUE' | 'UPCOMING';
 const alphaNum = (a: string, b: string) =>
   String(a || '').localeCompare(String(b || ''), undefined, { numeric: true, sensitivity: 'base' });
 
+/** Contract dates may be YYYY-MM-DD strings or Firestore Timestamp-like objects. */
+function contractDateToYmd(v: unknown): string {
+  if (v == null || v === '') return '';
+  if (typeof v === 'string') {
+    const s = v.trim();
+    const m = s.match(/^(\d{4}-\d{2}-\d{2})/);
+    if (m) return m[1];
+    const d = new Date(s);
+    return isNaN(d.getTime()) ? '' : dateToLocalStr(d);
+  }
+  if (v instanceof Date && !isNaN(v.getTime())) return dateToLocalStr(v);
+  if (typeof v === 'object' && v !== null) {
+    const o = v as { toDate?: () => Date; seconds?: number; _seconds?: number };
+    if (typeof o.toDate === 'function') {
+      try {
+        const d = o.toDate();
+        if (d instanceof Date && !isNaN(d.getTime())) return dateToLocalStr(d);
+      } catch {
+        /* ignore */
+      }
+    }
+    const sec = typeof o.seconds === 'number' ? o.seconds : typeof o._seconds === 'number' ? o._seconds : NaN;
+    if (!Number.isNaN(sec)) {
+      const d = new Date(sec * 1000);
+      return isNaN(d.getTime()) ? '' : dateToLocalStr(d);
+    }
+  }
+  return '';
+}
+
+/** Whole calendar days from startYmd to endYmd (end inclusive as "today"); uses noon local to avoid DST edge cases. */
+function wholeCalendarDaysFromYmd(startYmd: string, endYmd: string): number {
+  if (!startYmd || !endYmd) return 0;
+  const a = new Date(startYmd + 'T12:00:00');
+  const b = new Date(endYmd + 'T12:00:00');
+  if (isNaN(a.getTime()) || isNaN(b.getTime())) return 0;
+  return Math.floor((b.getTime() - a.getTime()) / 86400000);
+}
+
 const Monitoring: React.FC = () => {
   const [contracts, setContracts] = useState<any[]>([]);
   const [transactions, setTransactions] = useState<any[]>([]);
   const [customers, setCustomers] = useState<any[]>([]);
   const [buildings, setBuildings] = useState<any[]>([]);
 
-  const todayDate = (() => {
-    const d = new Date();
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  })();
-
-  const defaultReportEndDate = (() => {
-    const d = new Date(2026, 3, 24);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-  })();
+  const defaultReportEndDate = localDateStr();
 
   const { t, isRTL } = useLanguage();
 
@@ -60,7 +95,7 @@ const Monitoring: React.FC = () => {
   useEffect(() => {
     (async () => {
       const [cs, txs, custs, blds] = await Promise.all([
-        getContracts(),
+        getContracts({ includeDeleted: true }),
         getTransactions(),
         getCustomers(),
         getBuildings(),
@@ -102,6 +137,7 @@ const Monitoring: React.FC = () => {
   const dueRoomsRaw = activeContracts
     .flatMap((c: any) => {
       try {
+        const todayYmd = localDateStr();
         const customer = customers.find((x: any) => x.id === c.customerId) || {};
         const building = buildings.find((b: any) => b.id === c.buildingId) || {};
         const buildingName = building.name
@@ -110,23 +146,38 @@ const Monitoring: React.FC = () => {
           ? String(c.buildingName).trim()
           : '-';
 
-        const cutoff = reportUpTo && reportUpTo.trim() ? new Date(reportUpTo) : new Date();
         const today = new Date();
+        /** Payments always counted through today — "Report up to" only limits installment due dates, not paid amounts. */
+        const payThroughYmd = todayYmd;
 
         const totalInstallments = Number(c.installmentCount) > 0 ? Number(c.installmentCount) : 1;
         const upfrontPaid = Number((c as any).upfrontPaid || 0);
 
-        // Filter rent-only payments (exclude FEES entries — those are tracked separately)
+        // Rent payments linked to this contract only (same rules as Contracts / Entry / VAT quick entry)
+        const catalog = (contracts || []).filter((x: any) => !x.deleted);
+        const catalogIncludingDeleted = contracts || [];
+        const nonResContract = isNonResidentialBuildingForContract((buildings || []) as Building[], c);
+
+        let priorContractResolved: any;
+        const rid = String((c as any).renewedFromId || '').trim();
+        if (rid) priorContractResolved = catalogIncludingDeleted.find((x: any) => x.id === rid);
+        const priorNoStored = String((c as any).priorLeaseContractNoAtRenewal || '').trim();
+        if (!priorContractResolved && priorNoStored) {
+          priorContractResolved = catalogIncludingDeleted.find(
+            (x: any) =>
+              String(x.contractNo || '').trim() === priorNoStored && x.buildingId === c.buildingId,
+          );
+        }
+
         const rentTxs = transactions.filter((tx: any) => {
-          if (!tx || tx.contractId !== c.id || tx.status === 'REJECTED') return false;
+          if (!tx) return false;
+          // Residential: no separate feesEntry stream (fees are in installments). Non-res: feesEntry handled in feePaidRaw.
           if ((tx as any).feesEntry) return false;
+          if (!transactionAppliesToContract(tx, c, catalog)) return false;
           if (!tx.date) return true;
-          try {
-            const tDate = new Date(tx.date);
-            return !isNaN(tDate.getTime()) && tDate <= cutoff;
-          } catch {
-            return false;
-          }
+          const tYmd = contractDateToYmd(tx.date);
+          if (!tYmd) return false;
+          return tYmd <= payThroughYmd;
         });
         // INCLUSIVE paid (what the customer actually handed over)
         const paidRawIncl = rentTxs.reduce((s: number, tx: any) => {
@@ -152,6 +203,45 @@ const Monitoring: React.FC = () => {
         }, 0);
         const paid = paidRawIncl + upfrontPaid;
         const paidExcl = paidRawExcl + upfrontPaid;
+        let priorO = Math.max(0, Number((c as any).priorLeaseOutstandingAtRenewal) || 0);
+        if (
+          priorO === 0 &&
+          (Number((c as any).priorLeaseEffectiveTotalAtRenewal) > 0 ||
+            String((c as any).renewedFromId || '').trim() ||
+            String((c as any).priorLeaseContractNoAtRenewal || '').trim())
+        ) {
+          const eff = Number((c as any).priorLeaseEffectiveTotalAtRenewal) || 0;
+          const snapPaid = Number((c as any).priorLeasePaidAtRenewal) || 0;
+          if (eff > snapPaid + 0.0001) {
+            priorO = Math.round((eff - snapPaid) * 100) / 100;
+          }
+        }
+        // Still no prior row? Match ended lease same unit/customer (often deleted / missing renewedFromId).
+        if (!priorContractResolved && priorO > 0) {
+          const newFromYmd = contractDateToYmd(c.fromDate);
+          const uid = String(c.customerId || '').trim();
+          const unit = String(c.unitName || '').trim();
+          const bid = c.buildingId;
+          const candidates = catalogIncludingDeleted.filter(
+            (x: any) =>
+              x.id !== c.id &&
+              x.buildingId === bid &&
+              String(x.unitName || '').trim() === unit &&
+              (!uid || String(x.customerId || '').trim() === uid),
+          );
+          const scored = candidates
+            .map((x: any) => ({
+              x,
+              toY: contractDateToYmd(x.toDate),
+              fromY: contractDateToYmd(x.fromDate),
+            }))
+            .filter((o) => o.toY || o.fromY)
+            .filter((o) => !newFromYmd || !o.toY || o.toY <= newFromYmd)
+            .sort((a, b) => String(b.toY || b.fromY || '').localeCompare(String(a.toY || a.fromY || '')));
+          priorContractResolved = scored[0]?.x;
+        }
+        /** Payments applied to the new lease schedule after renewal prior balance (same FIFO as Entry). */
+        const paidForInstallments = Math.max(0, paid - priorO);
 
         // RENT-ONLY installment amounts (treat rentValue as inclusive of VAT, matching VAT Report)
         const rentValue = Number((c as any).rentValue || 0);
@@ -161,35 +251,66 @@ const Monitoring: React.FC = () => {
         const other = Math.round(rentPerInstIncl);
         const effectiveTotal = rentValue; // inclusive rent total
 
-        // FEES installment amounts (water + internet + parking + management periodic, plus one-time on first)
-        const periodicFees = (Number((c as any).waterFee) || 0)
-          + (Number((c as any).internetFee) || 0)
-          + (Number((c as any).parkingFee) || 0)
-          + (Number((c as any).managementFee) || 0);
-        const oneTimeFees = (Number((c as any).insuranceFee) || 0)
-          + (Number((c as any).serviceFee) || 0)
-          + (Number((c as any).officeFeeAmount) || 0)
-          + (Number((c as any).otherAmount) || 0)
-          - (Number((c as any).otherDeduction) || 0);
-        const feesPerInst = totalInstallments > 0 ? periodicFees / totalInstallments : 0;
-        const firstFees = Math.round(feesPerInst + oneTimeFees);
-        const otherFees = Math.round(feesPerInst);
-        const effectiveFeesTotal = periodicFees + oneTimeFees;
+        // Residential: use saved installment schedule (same as Entry / computeInstallmentProgress).
+        // firstInstallment/otherInstallment already include fees split — do NOT add resFee on top.
+        const totalValueStored = Number((c as any).totalValue || 0);
+        const effectiveContractTotal = totalValueStored + upfrontPaid;
+        let resScheduleFirst = Number((c as any).firstInstallment || 0) + upfrontPaid;
+        const resScheduleOther = Number((c as any).otherInstallment || 0);
+        const sumSchedule =
+          resScheduleFirst + resScheduleOther * Math.max(0, totalInstallments - 1);
+        if (
+          effectiveContractTotal > 0 &&
+          Math.abs(sumSchedule - effectiveContractTotal) > Math.max(5, totalInstallments)
+        ) {
+          resScheduleFirst = Math.max(
+            0,
+            effectiveContractTotal - resScheduleOther * Math.max(0, totalInstallments - 1),
+          );
+        }
+        const resScheduleFirstRounded = Math.round(resScheduleFirst);
+        const resScheduleOtherRounded = Math.round(resScheduleOther);
+        const useResidentialStoredSchedule =
+          !nonResContract &&
+          (totalValueStored > 0 ||
+            Number((c as any).firstInstallment) > 0 ||
+            Number((c as any).otherInstallment) > 0);
+        // Residential: include contract fees into monitoring schedule so cards/PDF show full amounts.
+        // Split fees into:
+        // - periodic fees: water/internet/parking (spread across installments)
+        // - one-time fees: management (Ejar), office/service/insurance/other - deduction (1st installment only)
+        const resFeeDueForInstallment = (contract: any, instNo: number): number => {
+          const count = Number(contract.installmentCount) > 0 ? Number(contract.installmentCount) : 1;
+          const water = Number(contract.waterFee || 0);
+          const internet = Number(contract.internetFee || 0);
+          const parking = Number(contract.parkingFee || 0);
+          const periodicTotal = water + internet + parking;
+          const periodicPerInst = count > 0 ? periodicTotal / count : 0;
+          const management = Number(contract.managementFee || 0);
+          const office = Number(contract.officeFeeAmount || 0);
+          const service = Number(contract.serviceFee || 0);
+          const insurance = Number(contract.insuranceFee || 0);
+          const other = Number(contract.otherAmount || 0);
+          const deduction = Number(contract.otherDeduction || 0);
+          const oneTime = management + office + service + insurance + other - deduction;
+          const fees = periodicPerInst + (instNo === 1 ? oneTime : 0);
+          return Math.max(0, Math.round(fees));
+        };
 
-        // Paid fees (from feesEntry transactions within cutoff)
-        const feePaidRaw = transactions
-          .filter((tx: any) => {
-            if (!tx || tx.contractId !== c.id || tx.status === 'REJECTED') return false;
-            if (!(tx as any).feesEntry) return false;
-            if (!tx.date) return true;
-            try {
-              const tDate = new Date(tx.date);
-              return !isNaN(tDate.getTime()) && tDate <= cutoff;
-            } catch {
-              return false;
-            }
-          })
-          .reduce((s: number, tx: any) => s + (Number(tx.amount) || 0), 0);
+        // Paid fees (feesEntry only; same contract attribution as rent)
+        const feePaidRaw = nonResContract
+          ? transactions
+              .filter((tx: any) => {
+                if (!tx) return false;
+                if (!(tx as any).feesEntry) return false;
+                if (!transactionAppliesToContract(tx, c, catalog)) return false;
+                if (!tx.date) return true;
+                const tYmd = contractDateToYmd(tx.date);
+                if (!tYmd) return false;
+                return tYmd <= payThroughYmd;
+              })
+              .reduce((s: number, tx: any) => s + (Number(tx.amount) || 0), 0)
+          : 0;
 
         const dueDates = getInstallmentDueDates(c);
         const installments: any[] = [];
@@ -198,13 +319,25 @@ const Monitoring: React.FC = () => {
           const d = dueDates[i];
           if (!d || isNaN(d.getTime())) continue;
           const dStr = dateToLocalStr(d);
-          if (filterToCutoff && dStr > filterToCutoff) continue;
+          const instNo = i + 1;
+          let rentAmt: number;
+          let feesAmt: number;
+          if (nonResContract) {
+            rentAmt = i === 0 ? first : other;
+            feesAmt = nonResFeeDueForInstallment(c, instNo);
+          } else if (useResidentialStoredSchedule) {
+            rentAmt = i === 0 ? resScheduleFirstRounded : resScheduleOtherRounded;
+            feesAmt = 0;
+          } else {
+            rentAmt = i === 0 ? first : other;
+            feesAmt = resFeeDueForInstallment(c, instNo);
+          }
           installments.push({
-            index: i + 1,
+            index: instNo,
             date: dStr,
             dateObj: d,
-            amount: i === 0 ? first : other,
-            feesAmount: i === 0 ? firstFees : otherFees,
+            amount: rentAmt,
+            feesAmount: feesAmt,
           });
         }
 
@@ -222,9 +355,10 @@ const Monitoring: React.FC = () => {
         const mobile = customer.mobileNo || customer.mobile || c.customerMobile || '';
 
         // --- Build one row per UNPAID installment (rent or fees) ---
-        // Track cumulative paid to split payments across installments
+        // Track cumulative expected to split payments across installments
         let rentCumulatedBefore = 0;
         let feesCumulatedBefore = 0;
+        let totalCumulatedBefore = 0;
 
         const contractRows: any[] = [];
 
@@ -233,23 +367,62 @@ const Monitoring: React.FC = () => {
           const rentAmt = inst.amount;
           const feesAmt = inst.feesAmount;
 
-          // Allocate paid rent to this installment (FIFO)
-          const rentPaidTowardInst = Math.max(0, Math.min(rentAmt, paid - rentCumulatedBefore));
-          const rentRemaining = Math.max(0, rentAmt - rentPaidTowardInst);
-          rentCumulatedBefore += rentAmt;
+          let rentPaidTowardInst = 0;
+          let feesPaidTowardInst = 0;
+          let rentRemaining = rentAmt;
+          let feesRemaining = feesAmt;
 
-          // Allocate paid fees to this installment (FIFO)
-          const feesPaidTowardInst = Math.max(0, Math.min(feesAmt, feePaidRaw - feesCumulatedBefore));
-          const feesRemaining = Math.max(0, feesAmt - feesPaidTowardInst);
-          feesCumulatedBefore += feesAmt;
+          if (nonResContract) {
+            // Allocate paid rent to this installment (FIFO)
+            rentPaidTowardInst = Math.max(0, Math.min(rentAmt, paidForInstallments - rentCumulatedBefore));
+            rentRemaining = Math.max(0, rentAmt - rentPaidTowardInst);
+            rentCumulatedBefore += rentAmt;
+
+            // Allocate paid fees to this installment (FIFO) using feesEntry payments
+            feesPaidTowardInst = Math.max(0, Math.min(feesAmt, feePaidRaw - feesCumulatedBefore));
+            feesRemaining = Math.max(0, feesAmt - feesPaidTowardInst);
+            feesCumulatedBefore += feesAmt;
+          } else if (useResidentialStoredSchedule) {
+            // Installment amounts already include fees (firstInstallment / otherInstallment).
+            const instTotal = rentAmt;
+            const paidTowardInst = Math.max(0, Math.min(instTotal, paidForInstallments - totalCumulatedBefore));
+            const remainingTotal = Math.max(0, instTotal - paidTowardInst);
+            totalCumulatedBefore += instTotal;
+            rentRemaining = remainingTotal;
+            feesRemaining = 0;
+            rentPaidTowardInst = Math.max(0, instTotal - remainingTotal);
+            feesPaidTowardInst = 0;
+          } else {
+            // Legacy residential (no stored schedule): rent split + separate fees; one payment stream.
+            const instTotal = rentAmt + feesAmt;
+            const paidTowardInst = Math.max(0, Math.min(instTotal, paidForInstallments - totalCumulatedBefore));
+            const remainingTotal = Math.max(0, instTotal - paidTowardInst);
+            totalCumulatedBefore += instTotal;
+
+            if (instTotal > 0) {
+              const rentShare = rentAmt / instTotal;
+              rentRemaining = Math.round(remainingTotal * rentShare);
+              feesRemaining = Math.max(0, Math.round(remainingTotal - rentRemaining));
+              rentPaidTowardInst = Math.max(0, Math.round(rentAmt - rentRemaining));
+              feesPaidTowardInst = Math.max(0, Math.round(feesAmt - feesRemaining));
+            } else {
+              rentRemaining = 0;
+              feesRemaining = 0;
+              rentPaidTowardInst = 0;
+              feesPaidTowardInst = 0;
+            }
+          }
 
           // Skip if nothing remaining for this installment (fully paid)
           if (rentRemaining === 0 && feesRemaining === 0) continue;
 
           const isPast = inst.dateObj < today;
-          const daysPast = isPast
-            ? Math.ceil((today.getTime() - inst.dateObj.getTime()) / (1000 * 60 * 60 * 24))
-            : 0;
+          // Report "up to" hides future dues past the horizon — but always keep **overdue** rows so old debt still appears.
+          if (filterToCutoff && inst.date > filterToCutoff && !isPast) {
+            continue;
+          }
+
+          const daysPast = isPast ? Math.max(0, wholeCalendarDaysFromYmd(inst.date, todayYmd)) : 0;
 
           const overdueRent = isPast ? rentRemaining : 0;
           const overdueFees = isPast ? feesRemaining : 0;
@@ -263,6 +436,13 @@ const Monitoring: React.FC = () => {
           const rentPaidBreakdown = splitVAT(rentPaidTowardInst);
           const overdueRentBreakdown = splitVAT(overdueRent);
           const dueRentBreakdown = splitVAT(dueRent);
+
+          // Fee component for labels/PDF: for bundled residential schedule, show fee breakdown only (not added to due).
+          const expectedFeesForRow = nonResContract
+            ? feesAmt
+            : useResidentialStoredSchedule
+              ? resFeeDueForInstallment(c, inst.index)
+              : feesAmt;
 
           // Next upcoming installment date after this one
           let upcomingDueDate = '';
@@ -296,11 +476,12 @@ const Monitoring: React.FC = () => {
             dueRentExcl: dueRentBreakdown.excl,
             dueRentVat: dueRentBreakdown.vat,
             // Fees
-            expectedFees: feesAmt,
+            expectedFees: expectedFeesForRow,
             paidFees: feesPaidTowardInst,
             feesOverdue: overdueFees,
             dueFees,
-            hasFees: feesAmt > 0,
+            // Only show fee amounts in UI/PDF when this installment has a fee component and something is still due on fees.
+            hasFees: feesAmt > 0 && Math.round(dueFees || 0) > 0,
             // Total
             totalOverdue: overdueRent + overdueFees,
             totalDue,
@@ -317,7 +498,118 @@ const Monitoring: React.FC = () => {
           });
         }
 
-        return contractRows;
+        const priorRemaining = Math.max(0, priorO - paid);
+        const oldLeaseToYmd = priorContractResolved ? contractDateToYmd(priorContractResolved.toDate) : '';
+        const oldLeaseFromYmd = priorContractResolved ? contractDateToYmd(priorContractResolved.fromDate) : '';
+        const renewalYmd = contractDateToYmd(c.fromDate);
+        // Unscoped income resolves only non-deleted contracts — treat the ended lease as active for this lookup only.
+        const catalogForPriorPaid = catalogIncludingDeleted.map((x: any) =>
+          priorContractResolved && x.id === priorContractResolved.id ? { ...x, deleted: false } : x,
+        );
+        const carriedWin =
+          priorContractResolved && renewalYmd
+            ? getCarriedPriorInstallmentWindow({
+                priorContract: priorContractResolved,
+                renewalYmd,
+                buildings: (buildings || []) as Building[],
+                catalog: catalogForPriorPaid,
+                transactions,
+              })
+            : null;
+
+        // Primary line: that installment’s period start; else old lease bounds / renewal fallback.
+        let priorDueStr = carriedWin
+          ? dateToLocalStr(carriedWin.startDate)
+          : oldLeaseFromYmd || oldLeaseToYmd || '';
+        let priorDateIsRenewalFallback = false;
+        if (!priorDueStr && priorO > 0) {
+          priorDueStr = contractDateToYmd(c.fromDate);
+          priorDateIsRenewalFallback = !!priorDueStr;
+        }
+        if (!priorDueStr && priorO > 0) {
+          priorDueStr = todayYmd;
+        }
+
+        let priorOldPeriodLabel = '';
+        if (carriedWin) {
+          priorOldPeriodLabel = `Inst. ${carriedWin.installmentNo}/${carriedWin.totalInstallments} · ${fmtDate(
+            carriedWin.startDate,
+          )} ${t('entry.dateRangeMid')} ${fmtDate(carriedWin.endDate)}`;
+        } else if (priorContractResolved?.toDate) {
+          priorOldPeriodLabel = fmtDate(priorContractResolved.toDate);
+        }
+
+        const rowsOut: any[] = [...contractRows];
+        if (priorO > 0 && priorRemaining > 0) {
+          const instEndYmd = carriedWin ? dateToLocalStr(carriedWin.endDate) : oldLeaseToYmd;
+          // Overdue days for prior balance = **ended lease** schedule (installment due / period end / lease end) — not new-contract renewal.
+          const oldContractDueYmd =
+            carriedWin?.dueDateYmd ||
+            (!priorDateIsRenewalFallback && !carriedWin && priorContractResolved
+              ? oldLeaseToYmd || oldLeaseFromYmd
+              : '');
+          const isPastPrior =
+            (!!oldContractDueYmd && oldContractDueYmd < todayYmd) ||
+            (!!instEndYmd && instEndYmd < todayYmd) ||
+            (!!oldLeaseToYmd && oldLeaseToYmd < todayYmd && !carriedWin);
+          const daysPastPrior = (() => {
+            if (!isPastPrior) return 0;
+            if (oldContractDueYmd && oldContractDueYmd < todayYmd) {
+              return wholeCalendarDaysFromYmd(oldContractDueYmd, todayYmd);
+            }
+            if (instEndYmd && instEndYmd < todayYmd) {
+              return wholeCalendarDaysFromYmd(instEndYmd, todayYmd);
+            }
+            if (oldLeaseToYmd && oldLeaseToYmd < todayYmd) {
+              return wholeCalendarDaysFromYmd(oldLeaseToYmd, todayYmd);
+            }
+            return 0;
+          })();
+          const paidTowardPrior = Math.min(paid, priorO);
+          const prBr = splitVAT(priorRemaining);
+          const paidPriorBr = splitVAT(paidTowardPrior);
+          const expPriorBr = splitVAT(priorO);
+          const firstInstDate = installments[0]?.date || '';
+          rowsOut.unshift({
+            contract: c,
+            isPriorLeaseRow: true,
+            installmentNo: carriedWin?.installmentNo ?? 0,
+            totalInstallments: carriedWin?.totalInstallments ?? totalInstallments,
+            expected: priorO,
+            expectedExcl: expPriorBr.excl,
+            expectedVat: expPriorBr.vat,
+            paid: paidTowardPrior,
+            paidExcl: paidPriorBr.excl,
+            paidVat: paidPriorBr.vat,
+            overdueAmount: isPastPrior ? priorRemaining : 0,
+            overdueExcl: isPastPrior ? prBr.excl : 0,
+            overdueVat: isPastPrior ? prBr.vat : 0,
+            dueRent: priorRemaining,
+            dueRentExcl: prBr.excl,
+            dueRentVat: prBr.vat,
+            expectedFees: 0,
+            paidFees: 0,
+            feesOverdue: 0,
+            dueFees: 0,
+            hasFees: false,
+            totalOverdue: isPastPrior ? priorRemaining : 0,
+            totalDue: priorRemaining,
+            isVAT,
+            customer,
+            building,
+            buildingName,
+            daysOverdue: daysPastPrior,
+            mobile,
+            nextDueDate: priorDueStr,
+            upcomingDueDate: firstInstDate,
+            frequencyMonths,
+            rowKey: `${c.id}-prior-lease`,
+            priorOldPeriodLabel,
+            priorDateIsRenewalFallback,
+          });
+        }
+
+        return rowsOut;
       } catch (err) {
         console.error('Error processing contract in Monitoring:', err, c);
         return [];
@@ -327,6 +619,9 @@ const Monitoring: React.FC = () => {
       if (!r) return false;
       const nextDueDateStr = r.nextDueDate && r.nextDueDate !== '-' ? r.nextDueDate : null;
       if (!nextDueDateStr) return false;
+      // Unpaid prior lease from renewal: always include so it is not dropped by "report up to" vs contract start quirks.
+      if (r.isPriorLeaseRow && (Number(r.totalDue) || 0) > 0) return true;
+      if ((Number(r.overdueAmount) || 0) + (Number(r.feesOverdue) || 0) > 0) return true;
       return nextDueDateStr <= reportUpTo;
     });
 
@@ -373,7 +668,7 @@ const Monitoring: React.FC = () => {
       let cmp = 0;
       switch (sortField) {
         case 'DATE':
-          cmp = new Date(a.nextDueDate).getTime() - new Date(b.nextDueDate).getTime();
+          cmp = String(a.nextDueDate || '').localeCompare(String(b.nextDueDate || ''));
           if (cmp === 0) cmp = b.overdueAmount - a.overdueAmount;
           break;
         case 'BUILDING':
@@ -802,57 +1097,87 @@ const Monitoring: React.FC = () => {
                         <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-violet-100 text-violet-700">
                           <Hash className="w-3 h-3" /> {t('monitoring.unit')} {r.contract.unitName}
                         </span>
-                        <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
-                          <Timer className="w-3 h-3" /> Every {r.frequencyMonths}mo
-                        </span>
-                        {r.installmentNo && (
-                          <span className="inline-flex items-center gap-1 text-[11px] font-black px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700">
-                            <Hash className="w-3 h-3" /> Inst. {r.installmentNo}/{r.totalInstallments}
+                        {r.isPriorLeaseRow ? (
+                          <span className="inline-flex items-center gap-1 text-[11px] font-black px-2 py-0.5 rounded-full bg-sky-100 text-sky-800 border border-sky-200">
+                            <TrendingUp className="w-3 h-3" /> {t('entry.priorLeasePaymentLabel')}
                           </span>
+                        ) : (
+                          <>
+                            <span className="inline-flex items-center gap-1 text-[11px] font-bold px-2 py-0.5 rounded-full bg-amber-100 text-amber-800">
+                              <Timer className="w-3 h-3" /> Every {r.frequencyMonths}mo
+                            </span>
+                            {r.installmentNo ? (
+                              <span className="inline-flex items-center gap-1 text-[11px] font-black px-2 py-0.5 rounded-full bg-indigo-100 text-indigo-700">
+                                <Hash className="w-3 h-3" /> Inst. {r.installmentNo}/{r.totalInstallments}
+                              </span>
+                            ) : null}
+                          </>
                         )}
                       </div>
-                      <div className="mt-2 grid grid-cols-3 gap-2 text-[11px]">
+                      <div className="mt-2 grid grid-cols-2 gap-2 text-[11px]">
                         <div className="bg-white/80 rounded-lg px-2 py-1 border border-slate-100">
-                          <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">Next Due</div>
+                          <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">
+                            {r.isPriorLeaseRow ? t('entry.priorLeasePeriod') : t('monitoring.nextDue')}
+                          </div>
                           <div className="font-bold text-slate-700">{r.nextDueDate ? fmtDate(r.nextDueDate) : '-'}</div>
+                          {r.isPriorLeaseRow && r.priorDateIsRenewalFallback && (
+                            <div className="text-[8px] font-bold text-amber-800 leading-tight mt-0.5">
+                              {t('entry.priorLeaseBalanceDue')}
+                            </div>
+                          )}
+                          {r.isPriorLeaseRow && r.priorOldPeriodLabel && (
+                            <div className="text-[9px] font-semibold text-slate-500 leading-tight mt-0.5">
+                              {r.priorOldPeriodLabel}
+                            </div>
+                          )}
                           {r.upcomingDueDate && (
                             <div className="text-[9px] font-semibold text-slate-500 leading-tight mt-0.5">
-                              Upcoming: <span className="font-bold text-slate-600">{fmtDate(r.upcomingDueDate)}</span>
+                              {t('monitoring.upcoming')}: <span className="font-bold text-slate-600">{fmtDate(r.upcomingDueDate)}</span>
                             </div>
                           )}
                         </div>
-                        <div className="bg-white/80 rounded-lg px-2 py-1 border border-slate-100">
-                          <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">Rent Expected {r.isVAT ? <span className="text-[8px] text-emerald-600">(incl. VAT)</span> : ''}</div>
-                          <div className="font-bold text-slate-700">{Number(r.expected).toLocaleString()}</div>
-                          {r.isVAT && (
+                        <div
+                          className={`rounded-lg px-2 py-1 border ${
+                            isOverdue && (r.dueRent || 0) > 0
+                              ? 'bg-amber-50/90 border-amber-200'
+                              : 'bg-white/80 border-slate-100'
+                          }`}
+                        >
+                          <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">
+                            {r.isPriorLeaseRow ? t('entry.priorLeasePaymentLabel') : t('monitoring.rentOutstanding')}
+                            {r.isVAT ? <span className="text-[8px] text-sky-600"> ({t('monitoring.inclVat')})</span> : ''}
+                          </div>
+                          <div className={`font-bold ${(r.dueRent || 0) > 0 ? 'text-sky-700' : 'text-slate-400'}`}>
+                            {Math.round(r.dueRent || 0).toLocaleString()}
+                          </div>
+                          {r.isVAT && (r.dueRent || 0) > 0 && (
                             <div className="text-[9px] font-semibold text-slate-500 leading-tight">
-                              {Math.round(r.expectedExcl).toLocaleString()} + VAT {Math.round(r.expectedVat).toLocaleString()}
-                            </div>
-                          )}
-                        </div>
-                        <div className="bg-white/80 rounded-lg px-2 py-1 border border-slate-100">
-                          <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">Rent Paid {r.isVAT ? <span className="text-[8px] text-emerald-600">(incl. VAT)</span> : ''}</div>
-                          <div className="font-bold text-emerald-600">{Number(r.paid).toLocaleString()}</div>
-                          {r.isVAT && (
-                            <div className="text-[9px] font-semibold text-slate-500 leading-tight">
-                              {Math.round(r.paidExcl).toLocaleString()} + VAT {Math.round(r.paidVat).toLocaleString()}
+                              {Math.round(r.dueRentExcl).toLocaleString()} + {t('monitoring.vat')} {Math.round(r.dueRentVat).toLocaleString()}
                             </div>
                           )}
                         </div>
                       </div>
                       {r.hasFees && (
-                        <div className="mt-1.5 grid grid-cols-3 gap-2 text-[11px]">
-                          <div className={`rounded-lg px-2 py-1 border ${r.feesOverdue > 0 ? 'bg-amber-50 border-amber-200' : 'bg-white/80 border-slate-100'}`}>
-                            <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">Fees Expected <span className="text-[8px] text-slate-500">(No VAT)</span></div>
+                        <div className="mt-1.5 grid grid-cols-2 gap-2 text-[11px]">
+                          <div
+                            className={`rounded-lg px-2 py-1 border ${
+                              isOverdue && (r.dueFees || 0) > 0 ? 'bg-amber-50 border-amber-200' : 'bg-white/80 border-slate-100'
+                            }`}
+                          >
+                            <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">
+                              {t('monitoring.feesExpected')} <span className="text-[8px] text-slate-500">({t('monitoring.noVat')})</span>
+                            </div>
                             <div className="font-bold text-slate-700">{Number(r.expectedFees).toLocaleString()}</div>
                           </div>
-                          <div className={`rounded-lg px-2 py-1 border ${r.feesOverdue > 0 ? 'bg-amber-50 border-amber-200' : 'bg-white/80 border-slate-100'}`}>
-                            <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">Fees Paid</div>
-                            <div className="font-bold text-emerald-600">{Number(r.paidFees).toLocaleString()}</div>
-                          </div>
-                          <div className={`rounded-lg px-2 py-1 border ${r.feesOverdue > 0 ? 'bg-rose-50 border-rose-200' : 'bg-white/80 border-slate-100'}`}>
-                            <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">Fees Due</div>
-                            <div className={`font-bold ${r.feesOverdue > 0 ? 'text-rose-600' : 'text-slate-500'}`}>{Number(r.feesOverdue).toLocaleString()}</div>
+                          <div
+                            className={`rounded-lg px-2 py-1 border ${
+                              isOverdue && (r.dueFees || 0) > 0 ? 'bg-rose-50 border-rose-200' : 'bg-white/80 border-slate-100'
+                            }`}
+                          >
+                            <div className="font-black text-slate-400 uppercase tracking-wider text-[9px]">{t('monitoring.feesOutstanding')}</div>
+                            <div className={`font-bold ${(r.dueFees || 0) > 0 ? (isOverdue ? 'text-rose-600' : 'text-sky-600') : 'text-slate-400'}`}>
+                              {Math.round(r.dueFees || 0).toLocaleString()}
+                            </div>
                           </div>
                         </div>
                       )}
@@ -880,7 +1205,8 @@ const Monitoring: React.FC = () => {
                       </div>
                       {isOverdue && (
                         <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-black px-2 py-0.5 rounded-full bg-rose-600 text-white">
-                          <Flame className="w-3 h-3" /> {r.daysOverdue}d
+                          <Flame className="w-3 h-3" />
+                          {r.daysOverdue}d
                         </div>
                       )}
                     </div>
@@ -1030,81 +1356,225 @@ function escapeHtml(s: any): string {
 function handleExportPDF(rows: any[], upToDate?: string, sortModeLabel?: string, buildingsLabel?: string) {
   const date = upToDate || new Date().toISOString().split('T')[0];
   const title = `Installments Due (Up To ${fmtDate(date)})`;
-  const rowsHtml = rows
-    .map(
-      (r, idx) => `<tr>
-      <td class="tc">${idx + 1}</td>
-      <td>${escapeHtml(r.building?.name || r.contract?.buildingName || '-')}</td>
-      <td class="tc">${escapeHtml(r.contract?.unitName || '-')}</td>
+  const rowsSorted = [...rows].sort((a: any, b: any) => {
+    const byDate = String(a.nextDueDate || '').localeCompare(String(b.nextDueDate || ''));
+    if (byDate !== 0) return byDate;
+    return alphaNum(
+      String(a.buildingName || a.building?.name || a.contract?.buildingName || ''),
+      String(b.buildingName || b.building?.name || b.contract?.buildingName || ''),
+    );
+  });
+  const rowsHtml = rowsSorted
+    .map((r, idx) => {
+      const isOverdue = (Number(r.overdueAmount) || 0) + (Number(r.feesOverdue) || 0) > 0;
+      const rowCls = `data-row ${isOverdue ? 'is-overdue' : 'is-scheduled'}${r.isPriorLeaseRow ? ' is-prior' : ''}`;
+      const dueCls = isOverdue ? 'amt-overdue' : 'amt-scheduled';
+      const statusSym = r.isPriorLeaseRow ? (isOverdue ? 'P!' : 'P') : isOverdue ? '!' : '\u00B7';
+      const statusTitle = r.isPriorLeaseRow
+        ? isOverdue
+          ? 'Prior lease, overdue'
+          : 'Prior lease'
+        : isOverdue
+          ? 'Overdue'
+          : 'Scheduled / upcoming';
+      return `<tr class="${rowCls}">
+      <td class="tc num">${idx + 1}</td>
+      <td class="tc sym-cell" title="${escapeHtml(statusTitle)}">${statusSym}</td>
+      <td class="td-strong">${escapeHtml(r.building?.name || r.buildingName || r.contract?.buildingName || '-')}</td>
+      <td class="tc td-strong">${escapeHtml(r.contract?.unitName || '-')}</td>
       <td>${escapeHtml(formatNameWithRoom(r.customer?.nameEn || r.customer?.name || r.contract?.customerName || '-', r.customer?.roomNumber))}</td>
-      <td>${escapeHtml(r.mobile || '-')}</td>
-      <td class="tr ${(r.overdueAmount > 0 || r.feesOverdue > 0) ? 'overdue' : 'dueUpcoming'}">${Number(r.totalDue || r.totalOverdue || 0).toLocaleString()}${((r.dueRent || 0) > 0 || (r.dueFees || 0) > 0) ? `<div class="sub">${(r.dueRent || 0) > 0 ? `Rent ${Math.round(r.dueRent).toLocaleString()}${r.isVAT ? ` (Excl ${Math.round(r.dueRentExcl).toLocaleString()} · VAT ${Math.round(r.dueRentVat).toLocaleString()})` : ''}` : ''}${(r.dueRent || 0) > 0 && (r.dueFees || 0) > 0 ? ' · ' : ''}${(r.dueFees || 0) > 0 ? `Fees ${Math.round(r.dueFees).toLocaleString()}` : ''}${(r.overdueAmount > 0 || r.feesOverdue > 0) ? ` · <span class="tag-overdue">OVERDUE ${r.daysOverdue}d</span>` : ''}</div>` : ''}</td>
-      <td class="tr">${Number(r.expected).toLocaleString()}${r.isVAT ? `<div class="sub">Excl ${Math.round(r.expectedExcl).toLocaleString()} · VAT ${Math.round(r.expectedVat).toLocaleString()}</div>` : ''}${r.hasFees ? `<div class="sub">Fees ${Math.round(r.expectedFees).toLocaleString()}</div>` : ''}</td>
-      <td class="tr paid">${Number(r.paid).toLocaleString()}${r.isVAT ? `<div class="sub">Excl ${Math.round(r.paidExcl).toLocaleString()} · VAT ${Math.round(r.paidVat).toLocaleString()}</div>` : ''}${r.hasFees ? `<div class="sub">Fees ${Math.round(r.paidFees).toLocaleString()}</div>` : ''}</td>
-      <td class="tc">Every ${r.frequencyMonths}mo</td>
-      <td class="tc">${escapeHtml(r.nextDueDate || '-')}${r.installmentNo ? `<div class="sub">Inst. ${r.installmentNo}/${r.totalInstallments}</div>` : ''}${r.upcomingDueDate ? `<div class="sub">Upcoming: ${escapeHtml(fmtDate(r.upcomingDueDate))}</div>` : ''}</td>
-      <td class="tc">${r.daysOverdue}</td>
-    </tr>`,
-    )
+      <td class="td-mono">${escapeHtml(r.mobile || '-')}</td>
+      <td class="tr ${dueCls}">${Number(r.totalDue || r.totalOverdue || 0).toLocaleString()}<span class="sar"> SAR</span>${(Number(r.dueRent) || 0) > 0 || (Number(r.dueFees) || 0) > 0 ? `<div class="sub">${(Number(r.dueRent) || 0) > 0 ? `Rent ${Math.round(Number(r.dueRent)).toLocaleString()}${r.isVAT ? ` (Excl ${Math.round(Number(r.dueRentExcl)).toLocaleString()} · VAT ${Math.round(Number(r.dueRentVat)).toLocaleString()})` : ''}` : ''}${(Number(r.dueRent) || 0) > 0 && (Number(r.dueFees) || 0) > 0 ? ' · ' : ''}${(Number(r.dueFees) || 0) > 0 ? `Fees ${Math.round(Number(r.dueFees)).toLocaleString()}` : ''}${isOverdue ? ` · <span class="tag-overdue">Overdue ${Number(r.daysOverdue) || 0}d</span>` : ''}</div>` : ''}</td>
+      <td class="tr td-muted">${Number(r.expected).toLocaleString()}${r.isVAT ? `<div class="sub">Excl ${Math.round(Number(r.expectedExcl)).toLocaleString()} · VAT ${Math.round(Number(r.expectedVat)).toLocaleString()}</div>` : ''}${r.hasFees ? `<div class="sub">Fees ${Math.round(Number(r.expectedFees)).toLocaleString()}</div>` : ''}</td>
+      <td class="tc">${r.isPriorLeaseRow ? '—' : `Every ${r.frequencyMonths}mo`}</td>
+      <td class="tc">${escapeHtml(fmtDate(r.nextDueDate || ''))}${r.isPriorLeaseRow ? `<div class="sub">${r.priorOldPeriodLabel ? escapeHtml(r.priorOldPeriodLabel) : 'Old lease (renewal)'}</div>` : r.installmentNo ? `<div class="sub">Inst. ${r.installmentNo}/${r.totalInstallments}</div>` : ''}${r.upcomingDueDate ? `<div class="sub">Upcoming: ${escapeHtml(fmtDate(r.upcomingDueDate))}</div>` : ''}</td>
+      <td class="tc"><span class="days-pill ${isOverdue ? 'days-hot' : 'days-cool'}">${r.daysOverdue}</span></td>
+    </tr>`;
+    })
     .join('');
 
-  const total = rows.reduce((s: number, r: any) => s + (r.totalDue || r.totalOverdue || r.overdueAmount || 0), 0);
+  const total = rowsSorted.reduce((s: number, r: any) => s + (r.totalDue || r.totalOverdue || r.overdueAmount || 0), 0);
+  const overdueCount = rowsSorted.filter(
+    (r: any) => (Number(r.overdueAmount) || 0) + (Number(r.feesOverdue) || 0) > 0,
+  ).length;
+  const priorCount = rowsSorted.filter((r: any) => r.isPriorLeaseRow).length;
 
-  const html = `<!doctype html><html><head><meta charset="utf-8" /><title>${title}</title>
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>${escapeHtml(title)}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" /><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,600&display=swap" rel="stylesheet" />
     <style>
+      :root{--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--surface:#ffffff;--accent:#0d9488;--accent2:#059669;--danger:#be123c;--danger-bg:#fff1f2;--cool:#0369a1;--cool-bg:#f0f9ff;--radius:20px}
       *{box-sizing:border-box}
-      body{font-family:Inter,Segoe UI,Arial,sans-serif;color:#0f172a;padding:24px;background:#f8fafc;margin:0}
-      .head{background:linear-gradient(135deg,#059669,#0d9488,#0891b2);color:#fff;padding:22px 24px;border-radius:18px;margin-bottom:18px;box-shadow:0 10px 24px rgba(5,150,105,.25)}
-      .head h1{margin:0;font-size:22px;letter-spacing:.3px}
-      .head .meta{opacity:.9;font-size:12px;margin-top:6px}
-      .pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-      .pill{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700}
-      .card{background:#fff;border-radius:16px;padding:14px;box-shadow:0 6px 20px rgba(15,23,42,.06);border:1px solid #e2e8f0}
-      table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}
-      th{background:#ecfdf5;color:#065f46;padding:10px 8px;border-bottom:2px solid #10b981;text-align:left;font-weight:800;text-transform:uppercase;font-size:10px;letter-spacing:.6px}
-      td{padding:9px 8px;border-bottom:1px solid #f1f5f9}
-      tr:nth-child(even) td{background:#f8fafc}
+      body{margin:0;padding:28px 20px 40px;font-family:'Plus Jakarta Sans',system-ui,-apple-system,Segoe UI,sans-serif;background:linear-gradient(165deg,#ecfdf5 0%,#f8fafc 38%,#f1f5f9 100%);color:var(--ink);font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased}
+      .sheet{max-width:1120px;margin:0 auto;background:var(--surface);border-radius:var(--radius);box-shadow:0 25px 50px -12px rgba(15,23,42,.12),0 0 0 1px rgba(15,23,42,.04);overflow:hidden}
+      .hero{position:relative;padding:32px 36px 28px;background:linear-gradient(145deg,#042f2e 0%,#0f766e 42%,#115e59 100%);color:#ecfdf5}
+      .hero::after{content:'';position:absolute;left:0;right:0;bottom:0;height:4px;background:linear-gradient(90deg,#fbbf24,#34d399,#2dd4bf)}
+      .brand-row{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:10px}
+      .brand{display:flex;align-items:center;gap:12px}
+      .brand img{height:40px;width:auto;object-fit:contain;filter:brightness(0) invert(1) opacity(.92)}
+      .eyebrow{font-size:10px;font-weight:800;letter-spacing:.22em;text-transform:uppercase;opacity:.72}
+      .hero h1{margin:6px 0 0;font-size:clamp(20px,2.4vw,26px);font-weight:800;letter-spacing:-.02em;line-height:1.2}
+      .hero-sub{margin-top:10px;font-size:13px;font-weight:500;opacity:.88}
+      .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+      .chip{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22);backdrop-filter:blur(6px)}
+      .chip b{font-weight:800;opacity:1}
+      .summary{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:22px 36px;background:linear-gradient(180deg,#f8fafc,#fff);border-bottom:1px solid var(--line)}
+      @media(max-width:720px){.summary{grid-template-columns:1fr}}
+      .kpi{padding:16px 18px;border-radius:14px;border:1px solid var(--line);background:#fff;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+      .kpi-label{display:block;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+      .kpi-value{font-size:22px;font-weight:800;letter-spacing:-.02em;color:var(--ink)}
+      .kpi-value .unit{font-size:12px;font-weight:700;color:var(--muted);margin-left:4px}
+      .kpi-note{font-size:11px;color:var(--muted);margin-top:6px;font-weight:500}
+      .legend{display:flex;flex-wrap:wrap;gap:16px;padding:14px 36px 0;font-size:11px;font-weight:600;color:var(--muted)}
+      .legend span{display:inline-flex;align-items:center;gap:8px}
+      .sym-key{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:900;background:#f1f5f9;border:1px solid #cbd5e1;border-radius:4px;padding:1px 6px}
+      .dot{width:10px;height:10px;border-radius:50%}
+      .dot-overdue{background:var(--danger)}
+      .dot-scheduled{background:var(--cool)}
+      .dot-prior{background:#7c3aed}
+      .table-wrap{padding:18px 36px 28px;overflow-x:auto}
+      .section-h{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
+      .table-print{width:100%;table-layout:fixed;border-collapse:collapse;font-size:11px;border:2px solid #64748b}
+      .table-print th,.table-print td{border:1px solid #cbd5e1;padding:8px 6px;vertical-align:top;word-wrap:break-word;overflow-wrap:break-word}
+      .table-print thead th{text-align:left;font-size:8px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:#1e293b;background:#e2e8f0;border-bottom:2px solid #64748b;white-space:normal;line-height:1.2}
+      .table-print thead th.tc{text-align:center}
+      .table-print thead th.tr{text-align:right}
+      .table-print tbody td{background:#fff}
+      .table-print .sym-cell{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:900;font-size:13px;line-height:1;padding:8px 4px;white-space:nowrap;width:1%}
+      .data-row.is-overdue:not(.is-prior) .sym-cell{color:var(--danger)}
+      .data-row.is-scheduled:not(.is-prior) .sym-cell{color:var(--cool)}
+      .data-row.is-prior .sym-cell{color:#6d28d9}
+      .data-row:hover td{background:#fafafa}
+      .data-row td:first-child::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:0 2px 2px 0}
+      .data-row.is-overdue:not(.is-prior) td:first-child::before{background:var(--danger)}
+      .data-row.is-prior.is-overdue td:first-child::before{background:linear-gradient(180deg,#6d28d9 0%,#be123c 100%)}
+      .data-row.is-prior:not(.is-overdue) td:first-child::before{background:#7c3aed}
+      .data-row.is-scheduled:not(.is-prior) td:first-child::before{background:#38bdf8}
+      .data-row td{position:relative}
+      .data-row td:first-child{padding-left:14px}
+      .data-row.is-overdue:not(.is-prior) td{background:linear-gradient(90deg,var(--danger-bg) 0%,transparent 52%)}
+      .data-row.is-scheduled:not(.is-prior) td{background:linear-gradient(90deg,var(--cool-bg) 0%,transparent 48%)}
+      .data-row.is-prior:not(.is-overdue) td{background:linear-gradient(90deg,#f5f3ff 0%,transparent 48%)}
+      .data-row.is-prior.is-overdue td{background:linear-gradient(90deg,#fff1f2 0%,#f5f3ff 42%,transparent 58%)}
       .tc{text-align:center}
-      .tr{text-align:right;font-weight:700}
-      .overdue{color:#e11d48}
-      .dueUpcoming{color:#0284c7}
-      .paid{color:#059669}
-      .sub{font-size:9px;font-weight:600;color:#64748b;margin-top:2px}
-      .tag-overdue{background:#fee2e2;color:#b91c1c;padding:1px 6px;border-radius:999px;font-weight:800}
-      tfoot td{background:#064e3b;color:#fff;font-weight:800;padding:12px 8px}
-      @media print{body{background:#fff}.card{box-shadow:none}}
+      .tr{text-align:right}
+      .num{font-variant-numeric:tabular-nums;font-weight:700;color:var(--muted)}
+      .td-strong{font-weight:600;color:#1e293b}
+      .td-mono{font-variant-numeric:tabular-nums;font-size:11.5px;color:#475569}
+      .amt-overdue{color:var(--danger);font-weight:800;font-variant-numeric:tabular-nums}
+      .amt-scheduled{color:var(--cool);font-weight:800;font-variant-numeric:tabular-nums}
+      .sar{font-size:10px;font-weight:700;opacity:.75;margin-left:2px}
+      .td-muted{color:#475569;font-weight:600;font-variant-numeric:tabular-nums}
+      .sub{font-size:10px;font-weight:600;color:var(--muted);margin-top:4px;line-height:1.35;max-width:280px;margin-left:auto}
+      tr .sub{margin-left:0;margin-right:0}
+      .tr .sub{max-width:220px;margin-left:auto;text-align:right}
+      .tag-overdue{display:inline-block;margin-top:2px;padding:2px 8px;border-radius:999px;font-size:9px;font-weight:800;background:#fecdd3;color:#9f1239}
+      .days-pill{display:inline-flex;min-width:2rem;justify-content:center;padding:4px 8px;border-radius:8px;font-weight:800;font-size:12px;font-variant-numeric:tabular-nums}
+      .days-hot{background:#ffe4e6;color:#9f1239}
+      .days-cool{background:#e0f2fe;color:#075985}
+      tfoot td{padding:12px 8px;font-weight:800;font-size:12px;background:#0f766e!important;color:#fff!important;border:1px solid #0f766e!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+      tfoot .grand{font-size:14px;letter-spacing:-.02em}
+      .doc-foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;padding:16px 36px 22px;font-size:10px;font-weight:600;color:var(--muted);border-top:1px solid var(--line);background:#fafafa}
+      @media print{
+        @page{size:A4 landscape;margin:8mm 10mm}
+        body{padding:0!important;background:#fff!important;font-size:10pt}
+        .sheet{box-shadow:none!important;border-radius:0!important;max-width:none!important}
+        .hero{border-radius:0!important;-webkit-print-color-adjust:exact;print-color-adjust:exact;padding:14px 18px!important}
+        .hero h1{font-size:16pt!important}
+        .chips,.hero-sub{display:none!important}
+        .summary{grid-template-columns:repeat(3,1fr)!important;padding:10px 14px!important;gap:8px!important}
+        .kpi{padding:10px 12px!important}
+        .kpi-value{font-size:14pt!important}
+        .legend{padding:8px 14px 0!important;font-size:9pt}
+        .table-wrap{padding:10px 14px 14px!important}
+        .table-print{font-size:8pt!important;border-color:#334155!important}
+        .table-print th,.table-print td{border-color:#64748b!important;padding:4px 4px!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        .table-print thead th{font-size:7pt!important;line-height:1.15!important}
+        .table-print .sym-cell{font-size:11pt!important;padding:4px 2px!important}
+        .sub{font-size:7pt!important;max-width:none!important}
+        .days-pill{padding:2px 5px!important;font-size:8pt!important}
+        .data-row td:first-child::before{display:none!important}
+        .data-row td:first-child{padding-left:6px!important}
+        .data-row td{background:#fff!important}
+        .data-row:hover td{background:#fff!important}
+        .summary,.kpi,.doc-foot{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        thead{display:table-header-group}
+        tfoot{display:table-footer-group}
+        tbody tr{page-break-inside:auto;break-inside:auto}
+        thead tr,tfoot tr{page-break-inside:avoid;break-inside:avoid}
+      }
     </style>
   </head><body>
-    <div class="head">
-      <h1>${title}</h1>
-      <div class="meta">Generated: ${escapeHtml(fmtDateTime(new Date()))}</div>
-      <div class="pills">
-        <span class="pill">Sort: ${escapeHtml(sortModeLabel || 'Default')}</span>
-        <span class="pill">Buildings: ${escapeHtml(buildingsLabel || 'All')}</span>
-        <span class="pill">Total Items: ${rows.length}</span>
+    <div class="sheet">
+      <header class="hero">
+        <div class="brand-row">
+          <div class="brand">
+            <img src="/images/cologo.png" alt="" onerror="this.style.display='none'" />
+            <div>
+              <div class="eyebrow">Monitoring · Collections</div>
+              <h1>${escapeHtml(title)}</h1>
+              <p class="hero-sub">Outstanding installments and prior lease balances — print or save as PDF.</p>
+            </div>
+          </div>
+        </div>
+        <div class="chips">
+          <span class="chip">Sort <b>${escapeHtml(sortModeLabel || 'Default')}</b></span>
+          <span class="chip">Buildings <b>${escapeHtml(buildingsLabel || 'All')}</b></span>
+          <span class="chip">Report date <b>${escapeHtml(fmtDate(date))}</b></span>
+          <span class="chip">Generated <b>${escapeHtml(fmtDateTime(new Date()))}</b></span>
+        </div>
+      </header>
+      <section class="summary">
+        <div class="kpi">
+          <span class="kpi-label">Total due (this view)</span>
+          <span class="kpi-value grand">${total.toLocaleString()}<span class="unit">SAR</span></span>
+          <p class="kpi-note">Sum of “Due” column for all listed rows.</p>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Lines on report</span>
+          <span class="kpi-value">${rowsSorted.length}</span>
+          <p class="kpi-note">${rowsSorted.length - overdueCount} not yet overdue${priorCount ? ` · ${priorCount} prior-lease row${priorCount === 1 ? '' : 's'}` : ''}</p>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">Overdue lines</span>
+          <span class="kpi-value">${overdueCount}</span>
+          <p class="kpi-note">Use “Days” + color cues to prioritize follow-up.</p>
+        </div>
+      </section>
+      <div class="legend">
+        <span><span class="sym-key">!</span> Overdue</span>
+        <span><span class="sym-key">&#183;</span> Scheduled / upcoming</span>
+        <span><span class="sym-key">P</span> Prior lease</span>
+        <span><span class="sym-key">P!</span> Prior + overdue</span>
+        <span style="margin-left:8px;opacity:.85">(Symbol column prints clearly in B/W PDF.)</span>
       </div>
+      <div class="table-wrap">
+        <p class="section-h">Detail</p>
+        <table class="table-print" role="table">
+          <colgroup>
+            <col style="width:3%" /><col style="width:3.5%" /><col style="width:12%" /><col style="width:7%" /><col style="width:14%" /><col style="width:9%" />
+            <col style="width:10%" /><col style="width:10%" /><col style="width:6%" /><col style="width:14%" /><col style="width:5.5%" />
+          </colgroup>
+          <thead><tr>
+            <th class="tc">#</th><th class="tc" title="Status">St</th><th>Building</th><th class="tc">Unit</th><th>Customer</th><th class="tc">Mobile</th>
+            <th class="tr">Due</th>
+            <th class="tr">Expected</th>
+            <th class="tc">Freq</th><th class="tc">Next due</th><th class="tc">Days</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+          <tfoot><tr>
+            <td colspan="6" class="tr" style="font-weight:800">Grand total due</td>
+            <td class="tr grand">${total.toLocaleString()} SAR</td>
+            <td colspan="4" style="opacity:.92;font-weight:600;font-size:11px">All buildings in this export</td>
+          </tr></tfoot>
+        </table>
+      </div>
+      <footer class="doc-foot"><span>Amlak · Property management</span><span>Confidential — for internal use</span></footer>
     </div>
-    <div class="card">
-    <table>
-      <thead><tr>
-        <th>#</th><th>Building</th><th>Unit</th><th>Customer</th><th>Mobile</th>
-        <th style="text-align:right">Due</th>
-        <th style="text-align:right">Expected</th>
-        <th style="text-align:right">Paid</th>
-        <th>Frequency</th><th>Next Due</th><th>Days Overdue</th>
-      </tr></thead>
-      <tbody>${rowsHtml}</tbody>
-      <tfoot><tr>
-        <td colspan="5" style="text-align:right">TOTAL DUE</td>
-        <td class="tr">${total.toLocaleString()} SAR</td>
-        <td colspan="5"></td>
-      </tr></tfoot>
-    </table>
-    </div>
-    <script>window.onload = () => setTimeout(()=>window.print(),300);</script>
+    <script>window.onload=function(){setTimeout(function(){window.print()},320)};</script>
   </body></html>`;
 
-  const w = window.open('', '_blank', 'width=1024,height=800');
+  const w = window.open('', '_blank', 'width=1120,height=900');
   if (!w) return;
   w.document.write(html);
   w.document.close();
@@ -1122,58 +1592,194 @@ function handleExportExpiringPDF(rows: any[], upToDate?: string, sortModeLabel?:
       const customerName = formatNameWithRoom(customerBaseName, r.customer?.roomNumber);
       const unitName = contract.unitName || '-';
       const toDate = contract.toDate ? fmtDate(contract.toDate) : '-';
-      return `<tr>
-      <td class="tc">${idx + 1}</td>
-      <td>${escapeHtml(buildingName)}</td>
-      <td class="tc">${escapeHtml(unitName)}</td>
+      const d = typeof r.daysRemaining === 'number' ? r.daysRemaining : NaN;
+      const rowCls = !Number.isFinite(d)
+        ? 'data-row is-unknown'
+        : d <= 30
+          ? 'data-row is-urgent'
+          : d <= 90
+            ? 'data-row is-soon'
+            : 'data-row is-normal';
+      const daysCell = Number.isFinite(d)
+        ? `<span class="days-pill ${d <= 30 ? 'pill-critical' : d <= 90 ? 'pill-warn' : 'pill-ok'}">${d}</span>`
+        : `<span class="days-pill pill-na">—</span>`;
+      const tierSym = !Number.isFinite(d) ? '?' : d <= 30 ? 'H' : d <= 90 ? 'M' : 'L';
+      const tierTitle = !Number.isFinite(d)
+        ? 'No end date'
+        : d <= 30
+          ? 'Critical: 30 days or less'
+          : d <= 90
+            ? 'Soon: 31–90 days'
+            : 'Later: 91+ days';
+      return `<tr class="${rowCls}">
+      <td class="tc num">${idx + 1}</td>
+      <td class="tc sym-cell" title="${escapeHtml(tierTitle)}">${tierSym}</td>
+      <td class="td-strong">${escapeHtml(buildingName)}</td>
+      <td class="tc td-strong">${escapeHtml(unitName)}</td>
       <td>${escapeHtml(customerName)}</td>
-      <td>${escapeHtml(r.customer?.mobileNo || r.customer?.mobile || '-')}</td>
-      <td class="tc">${escapeHtml(toDate)}</td>
-      <td class="tc">${typeof r.daysRemaining === 'number' ? r.daysRemaining : '-'}</td>
+      <td class="td-mono">${escapeHtml(r.customer?.mobileNo || r.customer?.mobile || '-')}</td>
+      <td class="tc td-strong">${escapeHtml(toDate)}</td>
+      <td class="tc">${daysCell}</td>
     </tr>`;
     })
     .join('');
 
-  const html = `<!doctype html><html><head><meta charset="utf-8" /><title>${title}</title>
+  const urgentCount = rows.filter((r: any) => typeof r.daysRemaining === 'number' && r.daysRemaining <= 30).length;
+  const soonCount = rows.filter(
+    (r: any) => typeof r.daysRemaining === 'number' && r.daysRemaining > 30 && r.daysRemaining <= 90,
+  ).length;
+
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>${escapeHtml(title)}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" /><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,400;0,500;0,600;0,700;0,800;1,600&display=swap" rel="stylesheet" />
     <style>
+      :root{--ink:#0f172a;--muted:#64748b;--line:#e2e8f0;--surface:#fff;--indigo:#4338ca;--violet:#6d28d9;--amber:#d97706;--rose:#be123c;--radius:20px}
       *{box-sizing:border-box}
-      body{font-family:Inter,Segoe UI,Arial,sans-serif;color:#0f172a;padding:24px;background:#f8fafc;margin:0}
-      .head{background:linear-gradient(135deg,#2563eb,#6366f1,#8b5cf6);color:#fff;padding:22px 24px;border-radius:18px;margin-bottom:18px;box-shadow:0 10px 24px rgba(37,99,235,.25)}
-      .head h1{margin:0;font-size:22px;letter-spacing:.3px}
-      .head .meta{opacity:.9;font-size:12px;margin-top:6px}
-      .pills{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-      .pill{background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.3);padding:4px 10px;border-radius:999px;font-size:11px;font-weight:700}
-      .card{background:#fff;border-radius:16px;padding:14px;box-shadow:0 6px 20px rgba(15,23,42,.06);border:1px solid #e2e8f0}
-      table{width:100%;border-collapse:separate;border-spacing:0;font-size:12px}
-      th{background:#eef2ff;color:#3730a3;padding:10px 8px;border-bottom:2px solid #6366f1;text-align:left;font-weight:800;text-transform:uppercase;font-size:10px;letter-spacing:.6px}
-      td{padding:9px 8px;border-bottom:1px solid #f1f5f9}
-      tr:nth-child(even) td{background:#f8fafc}
+      body{margin:0;padding:28px 20px 40px;font-family:'Plus Jakarta Sans',system-ui,-apple-system,Segoe UI,sans-serif;background:linear-gradient(165deg,#eef2ff 0%,#f8fafc 45%,#faf5ff 100%);color:var(--ink);font-size:13px;line-height:1.45;-webkit-font-smoothing:antialiased}
+      .sheet{max-width:960px;margin:0 auto;background:var(--surface);border-radius:var(--radius);box-shadow:0 25px 50px -12px rgba(30,27,75,.14),0 0 0 1px rgba(15,23,42,.04);overflow:hidden}
+      .hero{position:relative;padding:32px 36px 28px;background:linear-gradient(135deg,#1e1b4b 0%,#4338ca 38%,#5b21b6 100%);color:#eef2ff}
+      .hero::after{content:'';position:absolute;left:0;right:0;bottom:0;height:4px;background:linear-gradient(90deg,#fbbf24,#f472b6,#a78bfa)}
+      .brand-row{display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap}
+      .brand{display:flex;align-items:center;gap:12px}
+      .brand img{height:40px;width:auto;object-fit:contain;filter:brightness(0) invert(1) opacity(.9)}
+      .eyebrow{font-size:10px;font-weight:800;letter-spacing:.22em;text-transform:uppercase;opacity:.72}
+      .hero h1{margin:6px 0 0;font-size:clamp(20px,2.4vw,26px);font-weight:800;letter-spacing:-.02em;line-height:1.2}
+      .hero-sub{margin-top:10px;font-size:13px;font-weight:500;opacity:.88;max-width:52ch}
+      .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:18px}
+      .chip{display:inline-flex;align-items:center;gap:6px;padding:7px 14px;border-radius:999px;font-size:11px;font-weight:700;background:rgba(255,255,255,.12);border:1px solid rgba(255,255,255,.22)}
+      .chip b{font-weight:800}
+      .summary{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;padding:22px 36px;background:linear-gradient(180deg,#f8fafc,#fff);border-bottom:1px solid var(--line)}
+      @media(max-width:700px){.summary{grid-template-columns:1fr}}
+      .kpi{padding:16px 18px;border-radius:14px;border:1px solid var(--line);background:#fff;box-shadow:0 1px 2px rgba(15,23,42,.04)}
+      .kpi-label{display:block;font-size:10px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);margin-bottom:6px}
+      .kpi-value{font-size:22px;font-weight:800;letter-spacing:-.02em}
+      .kpi-note{font-size:11px;color:var(--muted);margin-top:6px;font-weight:500}
+      .legend{display:flex;flex-wrap:wrap;gap:16px;padding:14px 36px 0;font-size:11px;font-weight:600;color:var(--muted)}
+      .legend span{display:inline-flex;align-items:center;gap:8px}
+      .sym-key{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:900;background:#f1f5f9;border:1px solid #cbd5e1;border-radius:4px;padding:1px 6px}
+      .dot{width:10px;height:10px;border-radius:50%}
+      .dot-c{background:var(--rose)}
+      .dot-w{background:var(--amber)}
+      .dot-n{background:#22c55e}
+      .table-wrap{padding:18px 36px 28px;overflow-x:auto}
+      .section-h{font-size:11px;font-weight:800;letter-spacing:.1em;text-transform:uppercase;color:var(--muted);margin:0 0 12px}
+      .table-print{width:100%;table-layout:fixed;border-collapse:collapse;font-size:12px;border:2px solid #64748b}
+      .table-print th,.table-print td{border:1px solid #cbd5e1;padding:9px 7px;vertical-align:middle;word-wrap:break-word;overflow-wrap:break-word}
+      .table-print thead th{text-align:left;font-size:9px;font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:#1e293b;background:#e0e7ff;border-bottom:2px solid #6366f1;line-height:1.2;white-space:normal}
+      .table-print thead th.tc{text-align:center}
+      .table-print tbody td{background:#fff;position:relative}
+      .table-print .sym-cell{font-family:ui-monospace,Menlo,Consolas,monospace;font-weight:900;font-size:14px;line-height:1;padding:9px 4px;white-space:nowrap;width:1%}
+      .data-row.is-urgent .sym-cell{color:var(--rose)}
+      .data-row.is-soon .sym-cell{color:var(--amber)}
+      .data-row.is-normal .sym-cell{color:#047857}
+      .data-row td:first-child::before{content:'';position:absolute;left:0;top:0;bottom:0;width:4px;border-radius:0 2px 2px 0}
+      .data-row.is-urgent td:first-child::before{background:var(--rose)}
+      .data-row.is-soon td:first-child::before{background:var(--amber)}
+      .data-row.is-normal td:first-child::before{background:#34d399}
+      .data-row td:first-child{padding-left:14px}
+      .data-row.is-urgent td{background:linear-gradient(90deg,#fff1f2 0%,transparent 50%)}
+      .data-row.is-soon td{background:linear-gradient(90deg,#fffbeb 0%,transparent 48%)}
+      .data-row.is-normal td{background:linear-gradient(90deg,#ecfdf5 0%,transparent 42%)}
+      .data-row.is-unknown .sym-cell{color:#64748b}
+      .data-row.is-unknown td:first-child::before{background:#94a3b8}
+      .data-row.is-unknown td{background:linear-gradient(90deg,#f1f5f9 0%,transparent 40%)}
       .tc{text-align:center}
-      @media print{body{background:#fff}.card{box-shadow:none}}
+      .num{font-variant-numeric:tabular-nums;font-weight:700;color:var(--muted)}
+      .td-strong{font-weight:600;color:#1e293b}
+      .td-mono{font-variant-numeric:tabular-nums;font-size:11.5px;color:#475569}
+      .days-pill{display:inline-flex;min-width:2.25rem;justify-content:center;padding:5px 10px;border-radius:10px;font-weight:800;font-size:12px;font-variant-numeric:tabular-nums}
+      .pill-critical{background:#ffe4e6;color:#9f1239}
+      .pill-warn{background:#fef3c7;color:#92400e}
+      .pill-ok{background:#d1fae5;color:#065f46}
+      .pill-na{background:#f1f5f9;color:#94a3b8}
+      .doc-foot{display:flex;flex-wrap:wrap;justify-content:space-between;gap:12px;padding:16px 36px 22px;font-size:10px;font-weight:600;color:var(--muted);border-top:1px solid var(--line);background:#fafafa}
+      @media print{
+        @page{size:A4 landscape;margin:8mm 10mm}
+        body{padding:0!important;background:#fff!important;font-size:10pt}
+        .sheet{box-shadow:none!important;border-radius:0!important;max-width:none!important}
+        .hero{-webkit-print-color-adjust:exact;print-color-adjust:exact;padding:14px 18px!important}
+        .hero h1{font-size:16pt!important}
+        .chips,.hero-sub{display:none!important}
+        .summary{grid-template-columns:repeat(3,1fr)!important;padding:10px 14px!important;gap:8px!important}
+        .kpi{padding:10px 12px!important}
+        .kpi-value{font-size:14pt!important}
+        .legend{padding:8px 14px 0!important;font-size:9pt}
+        .table-wrap{padding:10px 14px 14px!important}
+        .table-print{font-size:9pt!important;border-color:#334155!important}
+        .table-print th,.table-print td{border-color:#64748b!important;padding:5px 6px!important;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        .table-print thead th{font-size:8pt!important}
+        .table-print .sym-cell{font-size:12pt!important}
+        .data-row td:first-child::before{display:none!important}
+        .data-row td:first-child{padding-left:6px!important}
+        .data-row td{background:#fff!important}
+        .summary,.kpi,.doc-foot{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+        thead{display:table-header-group}
+        tbody tr{page-break-inside:auto;break-inside:auto}
+        thead tr{page-break-inside:avoid;break-inside:avoid}
+      }
     </style>
   </head><body>
-    <div class="head">
-      <h1>${title}</h1>
-      <div class="meta">Generated: ${escapeHtml(fmtDateTime(new Date()))}</div>
-      <div class="pills">
-        <span class="pill">Sort: ${escapeHtml(sortModeLabel || 'Default')}</span>
-        <span class="pill">Buildings: ${escapeHtml(buildingsLabel || 'All')}</span>
-        <span class="pill">Total Items: ${rows.length}</span>
+    <div class="sheet">
+      <header class="hero">
+        <div class="brand-row">
+          <div class="brand">
+            <img src="/images/cologo.png" alt="" onerror="this.style.display='none'" />
+            <div>
+              <div class="eyebrow">Monitoring · Renewals</div>
+              <h1>${escapeHtml(title)}</h1>
+              <p class="hero-sub">Active contracts approaching end date — plan renewals, notices, and unit turnover.</p>
+            </div>
+          </div>
+        </div>
+        <div class="chips">
+          <span class="chip">Sort <b>${escapeHtml(sortModeLabel || 'Default')}</b></span>
+          <span class="chip">Buildings <b>${escapeHtml(buildingsLabel || 'All')}</b></span>
+          <span class="chip">Report date <b>${escapeHtml(fmtDate(date))}</b></span>
+          <span class="chip">Generated <b>${escapeHtml(fmtDateTime(new Date()))}</b></span>
+        </div>
+      </header>
+      <section class="summary">
+        <div class="kpi">
+          <span class="kpi-label">Contracts listed</span>
+          <span class="kpi-value">${rows.length}</span>
+          <p class="kpi-note">Every row is one active contract in the expiring window.</p>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">≤ 30 days left</span>
+          <span class="kpi-value" style="color:var(--rose)">${urgentCount}</span>
+          <p class="kpi-note">Highest priority for renewal outreach.</p>
+        </div>
+        <div class="kpi">
+          <span class="kpi-label">31–90 days left</span>
+          <span class="kpi-value" style="color:var(--amber)">${soonCount}</span>
+          <p class="kpi-note">${Math.max(0, rows.length - urgentCount - soonCount)} contracts beyond 90 days.</p>
+        </div>
+      </section>
+      <div class="legend">
+        <span><span class="sym-key">H</span> High — ≤30 days</span>
+        <span><span class="sym-key">M</span> Medium — 31–90 days</span>
+        <span><span class="sym-key">L</span> Low — 91+ days</span>
+        <span><span class="sym-key">?</span> No end date</span>
       </div>
+      <div class="table-wrap">
+        <p class="section-h">Expiring contracts</p>
+        <table class="table-print" role="table">
+          <colgroup>
+            <col style="width:4%" /><col style="width:4%" /><col style="width:18%" /><col style="width:10%" /><col style="width:22%" /><col style="width:12%" /><col style="width:14%" /><col style="width:10%" />
+          </colgroup>
+          <thead><tr>
+            <th class="tc">#</th><th class="tc" title="Urgency tier">St</th><th>Building</th><th class="tc">Unit</th><th>Customer</th><th class="tc">Mobile</th>
+            <th class="tc">Contract end</th><th class="tc">Days left</th>
+          </tr></thead>
+          <tbody>${rowsHtml}</tbody>
+        </table>
+      </div>
+      <footer class="doc-foot"><span>Amlak · Property management</span><span>Confidential — for internal use</span></footer>
     </div>
-    <div class="card">
-    <table>
-      <thead><tr>
-        <th>#</th><th>Building</th><th>Unit</th><th>Customer</th><th>Mobile</th>
-        <th>End Date</th><th>Days Remaining</th>
-      </tr></thead>
-      <tbody>${rowsHtml}</tbody>
-    </table>
-    </div>
-    <script>window.onload = () => setTimeout(()=>window.print(),300);</script>
+    <script>window.onload=function(){setTimeout(function(){window.print()},320)};</script>
   </body></html>`;
 
-  const w = window.open('', '_blank', 'width=1024,height=800');
+  const w = window.open('', '_blank', 'width=1020,height=880');
   if (!w) return;
   w.document.write(html);
   w.document.close();

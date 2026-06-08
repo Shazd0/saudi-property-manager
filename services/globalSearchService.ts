@@ -12,7 +12,7 @@ export interface GlobalSearchResult {
 export async function globalSearch(query: string): Promise<GlobalSearchResult[]> {
   const q = query.toLowerCase();
   const [customers, contracts, buildings] = await Promise.all([
-    getCustomers({ includeDeleted: false }),
+    getCustomers({ includeDeleted: false, acrossBooks: true }),
     getContracts({ includeDeleted: false }),
     getBuildings({ includeDeleted: false })
   ]);

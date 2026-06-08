@@ -1,5 +1,10 @@
-import { initializeApp } from "firebase/app";
-import { getFirestore } from "firebase/firestore";
+import { initializeApp, getApps, getApp } from "firebase/app";
+import {
+  initializeFirestore,
+  getFirestore,
+  persistentLocalCache,
+  persistentMultipleTabManager,
+} from "firebase/firestore";
 import { getAuth } from "firebase/auth";
 import { getStorage } from "firebase/storage";
 
@@ -9,11 +14,31 @@ const firebaseConfig = {
   projectId: "saudi-property-manager",
   storageBucket: "saudi-property-manager.firebasestorage.app",
   messagingSenderId: "854165833434",
-  appId: "1:854165833434:web:bc550b5c79266bd1fb07e3"
+  appId: "1:854165833434:web:bc550b5c79266bd1fb07e3",
 };
 
-export const app = initializeApp(firebaseConfig);
+/** Reuse existing app on Vite HMR / duplicate imports — avoid "app already exists". */
+export const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
 
-export const db = getFirestore(app);
+function initFirestore() {
+  try {
+    return initializeFirestore(app, {
+      localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }),
+      ignoreUndefinedProperties: true,
+    });
+  } catch {
+    // Firestore already initialized (HMR or second import) — return existing instance.
+    return getFirestore(app);
+  }
+}
+
+// Explicit IndexedDB cache + ignoreUndefinedProperties (recommended modular setup).
+export const db = initFirestore();
+
+/** Always use this after HMR — avoids stale `db` breaking collection(). */
+export function getDb() {
+  return getFirestore(app);
+}
+
 export const auth = getAuth(app);
 export const storage = getStorage(app);

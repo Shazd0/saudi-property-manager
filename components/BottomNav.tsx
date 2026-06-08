@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, PlusCircle, History, Briefcase, MoreHorizontal, FileSignature, Users, Grid3X3 } from 'lucide-react';
+import { LayoutDashboard, PlusCircle, History, Briefcase, FileSignature, Users } from 'lucide-react';
 import SoundService from '../services/soundService';
 import HapticService from '../services/hapticService';
 import { User, UserRole } from '../types';
@@ -8,11 +8,12 @@ import { useLanguage } from '../i18n';
 
 interface BottomNavProps {
   user: User;
-  onMenuClick: () => void;
+  /** Kept for API compatibility; full menu opens from the app header. */
+  onMenuClick?: () => void;
   pendingApprovals?: number;
 }
 
-const BottomNav: React.FC<BottomNavProps> = ({ user, onMenuClick, pendingApprovals = 0 }) => {
+const BottomNav: React.FC<BottomNavProps> = ({ user }) => {
   const { t, isRTL } = useLanguage();
   const isAdmin = user.role === UserRole.ADMIN;
   const isEngineer = user.role === UserRole.ENGINEER;
@@ -74,23 +75,6 @@ const BottomNav: React.FC<BottomNavProps> = ({ user, onMenuClick, pendingApprova
             </li>
           )
         )}
-
-        {/* More / Menu */}
-        <li className="bnav-item">
-          <button
-            onClick={() => { SoundService.play('open'); HapticService.medium(); onMenuClick(); }}
-            className="bnav-link bnav-menu-btn"
-            aria-label={t('nav.menu')}
-          >
-            <span className="bnav-icon-wrap" style={{ position: 'relative' }}>
-              <Grid3X3 size={22} strokeWidth={2} />
-              {pendingApprovals > 0 && (
-                <span className="bnav-badge">{pendingApprovals > 9 ? '9+' : pendingApprovals}</span>
-              )}
-            </span>
-            <span className="bnav-label">{t('nav.menu')}</span>
-          </button>
-        </li>
       </ul>
     </nav>
   );

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import ReactDOM from 'react-dom';
 import { ChevronDown, Search, X } from 'lucide-react';
 import { useLanguage } from '../i18n';
+import { matchesAdvancedSearch } from '../utils/advancedSearch';
 
 interface Option {
   value: string;
@@ -37,16 +38,20 @@ const SearchableSelect: React.FC<SearchableSelectProps> = ({
   const inputRef = useRef<HTMLInputElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
 
-  const filteredOptions = options.filter(opt =>
-    (opt.label || '').toLowerCase().includes(searchTerm.toLowerCase()) ||
-    (opt.sublabel || '').toLowerCase().includes(searchTerm.toLowerCase())
+  const filteredOptions = options.filter((opt) =>
+    matchesAdvancedSearch(searchTerm, `${opt.label || ''} ${opt.sublabel || ''} ${opt.value || ''}`),
   );
 
   const selectedOption = options.find(opt => opt.value === value);
 
   useEffect(() => {
     if (isOpen && inputRef.current) {
-      inputRef.current.focus();
+      // Avoid page jump when focusing inside a portal (notably in long/scrollable screens like Treasury)
+      try {
+        (inputRef.current as any).focus({ preventScroll: true });
+      } catch {
+        inputRef.current.focus();
+      }
     }
   }, [isOpen]);
 
@@ -80,7 +85,7 @@ const SearchableSelect: React.FC<SearchableSelectProps> = ({
         left: rect.left,
         width: rect.width,
         maxHeight: Math.max(dropH, 120),
-        zIndex: 9999,
+        zIndex: 60000,
       });
     };
     update();
@@ -98,10 +103,19 @@ const SearchableSelect: React.FC<SearchableSelectProps> = ({
 
   useEffect(() => {
     if (isOpen && listRef.current && filteredOptions.length > 0) {
-      const highlighted = listRef.current.children[highlightedIndex] as HTMLElement;
-      if (highlighted) {
-        highlighted.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      }
+      // IMPORTANT: Do not use `scrollIntoView` here — it can scroll the page/body even
+      // though the list is in a portal, causing "jump to bottom" behavior.
+      const listEl = listRef.current;
+      const item = listEl.children[highlightedIndex] as HTMLElement | undefined;
+      if (!item) return;
+
+      const top = item.offsetTop;
+      const bottom = top + item.offsetHeight;
+      const viewTop = listEl.scrollTop;
+      const viewBottom = viewTop + listEl.clientHeight;
+
+      if (top < viewTop) listEl.scrollTop = top;
+      else if (bottom > viewBottom) listEl.scrollTop = Math.max(0, bottom - listEl.clientHeight);
     }
   }, [highlightedIndex, isOpen]);
 

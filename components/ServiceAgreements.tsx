@@ -6,6 +6,7 @@ import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
 import { fmtDate, fmtDateTime } from '../utils/dateFormat';
+import { buildServiceAgreementSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import { useLanguage } from '../i18n';
 
 const AGREEMENT_TYPES = [
@@ -285,10 +286,8 @@ const ServiceAgreements: React.FC = () => {
   };
 
   const filteredAgreements = agreements.filter(a => {
-    const matchSearch = !searchTerm || 
-      a.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      a.vendorName.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      (a.buildingName || '').toLowerCase().includes(searchTerm.toLowerCase());
+    const matchSearch =
+      !searchTerm.trim() || matchesAdvancedSearch(searchTerm, buildServiceAgreementSearchHaystack(a));
     const matchType = !filterType || a.agreementType === filterType;
     const matchStatus = !filterStatus || a.status === filterStatus;
     return matchSearch && matchType && matchStatus;

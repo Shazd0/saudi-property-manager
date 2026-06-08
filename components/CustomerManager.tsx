@@ -2,6 +2,7 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { isValidSaudiIdOrIqama } from '../utils/saudiIdValidation';
 import { isValidSaudiMobile, isValidEmail, isValidSaudiVAT, isValidSaudiCR } from '../utils/validators';
+import { buildCustomerSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import ReactDOM from 'react-dom';
 import { Customer } from '../types';
 import { getCustomers, saveCustomer, deleteCustomer } from '../services/firestoreService';
@@ -105,7 +106,7 @@ const CustomerManager: React.FC = () => {
 
   useEffect(() => { 
     (async () => { 
-      const data = await getCustomers({ includeDeleted: true }); 
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true }); 
       setCustomers(data || []); 
       setFilteredCustomers(data || []); 
     })(); 
@@ -115,12 +116,12 @@ const CustomerManager: React.FC = () => {
     // Filter by deleted status first
     const visibleCustomers = customers.filter((c: Customer & { deleted?: boolean }) => showDeleted ? (c as any).deleted === true : !(c as any).deleted);
     
-    if (!searchTerm) { setFilteredCustomers(visibleCustomers); } 
-    else {
-        const lower = searchTerm.toLowerCase();
-        setFilteredCustomers(visibleCustomers.filter((c: Customer) => 
-          (c.nameEn?.toLowerCase() || '').includes(lower) || (c.nameAr || '').includes(lower) || (c.mobileNo || '').includes(lower) || (c.idNo || '').includes(lower) || (c.code || '').toString().includes(lower)
-        ));
+    if (!searchTerm.trim()) {
+      setFilteredCustomers(visibleCustomers);
+    } else {
+      setFilteredCustomers(
+        visibleCustomers.filter((c: Customer) => matchesAdvancedSearch(searchTerm, buildCustomerSearchHaystack(c))),
+      );
     }
   }, [searchTerm, customers, showDeleted]);
 
@@ -212,7 +213,7 @@ const CustomerManager: React.FC = () => {
       code: customerCode || '01'
     };
     await saveCustomer(newCustomer);
-    const data = await getCustomers({ includeDeleted: true });
+    const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
     setCustomers(data || []);
     setFilteredCustomers(data || []);
     setView('LIST');
@@ -225,7 +226,7 @@ const CustomerManager: React.FC = () => {
       if (!customer) return;
       const updated = { ...customer, deleted: true, deletedAt: Date.now() } as any;
       await saveCustomer(updated);
-      const data = await getCustomers({ includeDeleted: true });
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
       setCustomers(data || []);
       if (view === 'FORM' && formData.id === id) {
         setView('LIST');
@@ -234,7 +235,7 @@ const CustomerManager: React.FC = () => {
       showToast(`Customer "${name}" moved to trash.`, 'info', 6000, 'Undo', async () => {
         const restored = { ...updated, deleted: false, deletedAt: undefined } as any;
         await saveCustomer(restored);
-        const refreshed = await getCustomers({ includeDeleted: true });
+        const refreshed = await getCustomers({ includeDeleted: true, acrossBooks: true });
         setCustomers(refreshed || []);
         showSuccess(`Customer "${name}" restored.`);
       });
@@ -247,7 +248,7 @@ const CustomerManager: React.FC = () => {
       if (!customer) return;
       const updated = { ...customer, deleted: false, deletedAt: undefined } as any;
       await saveCustomer(updated);
-      const data = await getCustomers({ includeDeleted: true });
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
       setCustomers(data || []);
       showSuccess(`Customer "${name}" restored.`);
     });
@@ -256,7 +257,7 @@ const CustomerManager: React.FC = () => {
   const handlePermanentDelete = async (id: string, name: string) => {
     openConfirm(`PERMANENTLY delete customer "${name}"? This cannot be undone!`, async () => {
       await deleteCustomer(id);
-      const data = await getCustomers({ includeDeleted: true });
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
       setCustomers(data || []);
       showSuccess(`Customer "${name}" permanently deleted.`);
     }, { danger: true });
@@ -273,7 +274,7 @@ const CustomerManager: React.FC = () => {
         const updated = { ...c, deleted: false, deletedAt: undefined } as any;
         await saveCustomer(updated);
       }
-      const data = await getCustomers({ includeDeleted: true });
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
       setCustomers(data || []);
       showSuccess('All trashed customers restored.');
     });
@@ -289,7 +290,7 @@ const CustomerManager: React.FC = () => {
       for (const c of deleted) {
         await deleteCustomer(c.id);
       }
-      const data = await getCustomers({ includeDeleted: true });
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
       setCustomers(data || []);
       showSuccess('All trashed customers permanently deleted.');
     }, { danger: true });
@@ -308,7 +309,7 @@ const CustomerManager: React.FC = () => {
             console.error('Failed to delete customer:', customer.id, err);
           }
         }
-        const data = await getCustomers({ includeDeleted: true });
+        const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
         setCustomers(data || []);
         setFilteredCustomers(data || []);
         setImportStatus(`✓ Permanently deleted all ${deletedCount} customers`);
@@ -345,7 +346,7 @@ const CustomerManager: React.FC = () => {
               console.error('Failed to delete customer:', customer.id, err);
             }
           }
-          const data = await getCustomers({ includeDeleted: true });
+          const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
           setCustomers(data || []);
           setFilteredCustomers(data || []);
           setImportStatus(`✓ Permanently deleted ${deletedCount} customers (codes ${startCode}-${endCode})`);
@@ -464,7 +465,7 @@ const CustomerManager: React.FC = () => {
         }
         
         setImportStatus(`✓ Imported ${successCount} of ${importedCustomers.length} customers`);
-        const data = await getCustomers({ includeDeleted: true });
+        const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
         setCustomers(data || []);
         setFilteredCustomers(data || []);
         
@@ -572,7 +573,7 @@ const CustomerManager: React.FC = () => {
           }
 
           // Refresh customer list
-          const updatedData = await getCustomers({ includeDeleted: true });
+          const updatedData = await getCustomers({ includeDeleted: true, acrossBooks: true });
           setCustomers(updatedData || []);
           setFilteredCustomers(updatedData || []);
 
@@ -1036,7 +1037,7 @@ const CustomerManager: React.FC = () => {
             }
           }
 
-          const updatedData = await getCustomers({ includeDeleted: true });
+          const updatedData = await getCustomers({ includeDeleted: true, acrossBooks: true });
           setCustomers(updatedData || []);
           setFilteredCustomers(updatedData || []);
 
@@ -1390,7 +1391,7 @@ const CustomerManager: React.FC = () => {
   const inputStyle = "w-full bg-white text-slate-900 border border-slate-300 p-3 rounded-lg focus:ring-2 focus:ring-emerald-500 outline-none shadow-sm font-bold text-sm transition-all";
 
   return (
-    <div className="premium-card mobile-tab-shell tab-customers min-h-[600px] animate-fade-in overflow-hidden">
+    <div className="premium-card mobile-tab-shell tab-customers w-full max-w-full min-w-0 min-h-0 animate-fade-in overflow-x-hidden overflow-y-visible rounded-2xl pb-4 sm:pb-6 md:min-h-[600px]">
       <div className="p-4 sm:p-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 sm:gap-4 bg-slate-50/30">
         <div className="space-y-1">
             <h2 className="text-base sm:text-xl font-black text-slate-800 flex items-center gap-2">
@@ -1489,7 +1490,7 @@ const CustomerManager: React.FC = () => {
             
             <div className="mb-4 sm:mb-6 relative form-with-icon">
               <Search className="absolute left-3 sm:left-4 top-1/2 -translate-y-1/2 text-slate-400" size={18} />
-              <input type="text" placeholder={t('customer.database').toLowerCase().replace('database', 'customers...')} value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="pm-input w-full pl-10 sm:pl-12" />
+              <input type="text" placeholder={t('customer.searchPlaceholder')} value={searchTerm} onChange={e => setSearchTerm(e.target.value)} className="pm-input w-full pl-10 sm:pl-12" />
             </div>
             {showDeleted && (
               <div className="mb-4 flex flex-wrap gap-2">

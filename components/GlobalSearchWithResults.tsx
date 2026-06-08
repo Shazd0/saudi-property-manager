@@ -26,7 +26,7 @@ const GlobalSearchWithResults: React.FC<Props> = ({ searching, searchResults, se
     else if (res.type === 'building') navigate('/properties');
   };
   return (
-    <div className="mb-4">
+    <div className="mb-4 min-w-0 max-w-full">
       <GlobalSearchBar onSearch={handleGlobalSearch} />
       {searching && <div className="text-emerald-600">Searching...</div>}
       {searchResults.length > 0 && (

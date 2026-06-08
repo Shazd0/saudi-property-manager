@@ -55,7 +55,15 @@ root.render(
 );
 
 // Register service worker for offline support & PWA install prompt.
-if ('serviceWorker' in navigator) {
+// In Vite dev, service workers can intercept /@vite/client, /@react-refresh,
+// and /index.tsx?t=... after the dev server restarts. Keep dev network-only.
+if ('serviceWorker' in navigator && import.meta.env.DEV) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.getRegistrations?.().then((regs) => {
+      regs.forEach((reg) => reg.unregister());
+    }).catch(() => {});
+  });
+} else if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => {
     navigator.serviceWorker.register('/sw.js').then((reg) => {
       console.log('[App] Service worker registered, scope:', reg.scope);

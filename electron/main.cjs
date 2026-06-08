@@ -1,4 +1,4 @@
-const { app, BrowserWindow, shell, Menu, nativeTheme } = require('electron');
+const { app, BrowserWindow, shell, Menu, nativeTheme, ipcMain, dialog } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { fork } = require('node:child_process');
@@ -18,6 +18,37 @@ function startZatcaService() {
 }
 
 const isDev = !app.isPackaged;
+
+ipcMain.handle('desktop:select-directory', async () => {
+  try {
+    const win = BrowserWindow.getFocusedWindow() || BrowserWindow.getAllWindows()[0];
+    const result = await dialog.showOpenDialog(win, {
+      properties: ['openDirectory', 'createDirectory'],
+      title: 'Select folder to save invoices',
+    });
+    if (result.canceled || !result.filePaths?.[0]) return null;
+    return result.filePaths[0];
+  } catch (e) {
+    console.error('select-directory failed', e);
+    return null;
+  }
+});
+
+ipcMain.handle('desktop:write-base64-file', async (_event, payload) => {
+  try {
+    const dirPath = String(payload?.dirPath || '');
+    const fileName = String(payload?.fileName || '');
+    const base64 = String(payload?.base64 || '');
+    if (!dirPath || !fileName || !base64) return { ok: false, error: 'Invalid payload' };
+    const safeName = path.basename(fileName);
+    const outPath = path.join(dirPath, safeName);
+    fs.writeFileSync(outPath, Buffer.from(base64, 'base64'));
+    return { ok: true, path: outPath };
+  } catch (e) {
+    console.error('write-base64-file failed', e);
+    return { ok: false, error: String(e?.message || e) };
+  }
+});
 
 // Force dark mode to match the app's dark theme
 nativeTheme.themeSource = 'dark';

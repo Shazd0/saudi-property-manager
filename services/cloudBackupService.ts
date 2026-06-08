@@ -8,7 +8,7 @@ import {
   doc,
   setDoc,
 } from "firebase/firestore";
-import { db } from "../firebase";
+import { getDb } from "../firebase";
 
 // GOOGLE DRIVE SETTINGS - CONFIGURED
 const SHARED_BACKUP_FOLDER_ID = '113d0usitCgkEPNCjiaOXRo1azKzEeLG-'; // Publicly shared Google Drive folder
@@ -41,15 +41,15 @@ export const collectAllData = async () => {
   try {
     const [transactions, customers, buildings, users, contracts, vendors, tasks, banks, settings] = 
       await Promise.all([
-        getDocs(collection(db, 'transactions')),
-        getDocs(collection(db, 'customers')),
-        getDocs(collection(db, 'buildings')),
-        getDocs(collection(db, 'users')),
-        getDocs(collection(db, 'contracts')),
-        getDocs(collection(db, 'vendors')),
-        getDocs(collection(db, 'tasks')),
-        getDocs(collection(db, 'banks')),
-        getDocs(collection(db, 'meta')),
+        getDocs(collection(getDb(), 'transactions')),
+        getDocs(collection(getDb(), 'customers')),
+        getDocs(collection(getDb(), 'buildings')),
+        getDocs(collection(getDb(), 'users')),
+        getDocs(collection(getDb(), 'contracts')),
+        getDocs(collection(getDb(), 'vendors')),
+        getDocs(collection(getDb(), 'tasks')),
+        getDocs(collection(getDb(), 'banks')),
+        getDocs(collection(getDb(), 'meta')),
       ]);
 
     return {
@@ -275,7 +275,7 @@ const restoreDataToFirestore = async (backupData: any): Promise<boolean> => {
     for (const col of collections) {
       for (const item of col.data) {
         const { id, ...data } = item;
-        await setDoc(doc(db, col.name, id), data);
+        await setDoc(doc(getDb(), col.name, id), data);
       }
     }
 

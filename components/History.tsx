@@ -19,29 +19,69 @@ function useStickyState<T>(key: string, defaultValue: T): [T, React.Dispatch<Rea
   return [value, set];
 }
 import { useLanguage } from '../i18n/LanguageContext';
-import { Transaction, User, UserRole, TransactionType, TransactionStatus, ExpenseCategory, PaymentMethod, Building, Vendor } from '../types';
-import { Filter, Download, Search, AlertOctagon, ChevronDown, AlertTriangle, Trash2, Printer, MessageCircle, Home, X, CheckCircle, Calendar, RefreshCcw, SlidersHorizontal, FileText, RotateCcw, Eye, Pencil, Building2, Check } from 'lucide-react';
+import { Transaction, User, UserRole, TransactionType, TransactionStatus, ExpenseCategory, PaymentMethod, Building, Vendor, Contract } from '../types';
+import { Filter, Download, Search, AlertOctagon, ChevronDown, AlertTriangle, Trash2, Printer, MessageCircle, Home, X, CheckCircle, Calendar, RefreshCcw, SlidersHorizontal, FileText, RotateCcw, Pencil, PenLine, Building2, Check, Copy } from 'lucide-react';
 import SavedFilters from './SavedFilters';
 import { Bank } from '../types';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
-import { fmtDate, fmtDateTime } from '../utils/dateFormat';
+import HapticService from '../services/hapticService';
+import { fmtDate, fmtDateTime, isDateInCurrentMonth } from '../utils/dateFormat';
+import { addMoneyFingerprint, buildTransactionSearchHaystack, buildVendorSearchHaystack, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
-import { zatcaSignAndReportPath } from '../config/zatcaServiceUrl';
+import { transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { createVatReportSnapshot } from '../utils/vatSnapshot';
 import SearchableSelect from './SearchableSelect';
 
 interface HistoryProps {
   currentUser: User;
 }
 
+const NO_SOURCE_BUILDING_FILTER = '__NO_SOURCE_BUILDING__';
+
+/** `ym` = `YYYY-MM` (calendar month). Returns inclusive ISO date bounds. */
+function getCalendarMonthBounds(ym: string): { from: string; to: string } {
+  const [ys, ms] = ym.split('-');
+  const y = parseInt(ys, 10);
+  const m = parseInt(ms, 10);
+  if (!Number.isFinite(y) || !Number.isFinite(m) || m < 1 || m > 12) return { from: '', to: '' };
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const from = `${y}-${pad(m)}-01`;
+  const last = new Date(y, m, 0);
+  const to = `${y}-${pad(m)}-${pad(last.getDate())}`;
+  return { from, to };
+}
+
+function isFullMonthRange(from: string, to: string, till: string, ym: string): boolean {
+  if (till || !from || !to) return false;
+  const { from: f, to: end } = getCalendarMonthBounds(ym);
+  return f === from && end === to;
+}
+
+const GROUP_COLORS = [
+  'border-amber-300 bg-amber-50/70',
+  'border-orange-300 bg-orange-50/70',
+  'border-yellow-300 bg-yellow-50/70',
+  'border-lime-300 bg-lime-50/70',
+  'border-pink-300 bg-pink-50/70',
+  'border-cyan-300 bg-cyan-50/70',
+  'border-purple-300 bg-purple-50/70',
+  'border-teal-300 bg-teal-50/70',
+];
+
 const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const navigate = useNavigate();
+    const historyShellRef = useRef<HTMLDivElement | null>(null);
+    const lastHapticAtRef = useRef(0);
     const location = useLocation();
     const { showSuccess, showInfo, showError, showToast } = useToast();
-    const { t } = useLanguage();
+    const { t, language } = useLanguage();
     const [transactions, setTransactions] = useState<Transaction[]>([]);
+    /** For resolving contract numbers in details (avoid showing raw Firestore IDs). */
+    const [contracts, setContracts] = useState<Contract[]>([]);
     const [buildings, setBuildings] = useState<Building[]>([]);
     const [customers, setCustomers] = useState<any[]>([]);
     const [banks, setBanks] = useState<Bank[]>([]);
@@ -49,10 +89,55 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const [openingBalancesByBuilding, setOpeningBalancesByBuilding] = useState<Record<string, { cash: number; bank: number; date?: string }>>({});
     const [staff, setStaff] = useState<User[]>([]);
     const [owners, setOwners] = useState<User[]>([]);
+
+    const canAdminFullEdit = currentUser.role === UserRole.ADMIN;
+    const staffBuildingIds =
+        (currentUser as any).buildingIds?.length > 0
+            ? (currentUser as any).buildingIds
+            : currentUser.buildingId
+              ? [currentUser.buildingId]
+              : [];
+    const canOpenAdminEdit = (tx: Transaction) => {
+        if (!canAdminFullEdit) return false;
+        if ((tx as any).isOpeningBalance) return false;
+        if (String((tx as any).id || '').startsWith('pseudo_')) return false;
+        if ((tx as any).source === 'treasury') return false;
+        return true;
+    };
+    /** Staff may open full entry edit for transactions dated in the current month on their assigned buildings (same exclusions as admin). */
+    const canStaffFullEditCurrentMonth = (tx: Transaction) => {
+        if (currentUser.role !== UserRole.EMPLOYEE) return false;
+        if (!tx.date || !isDateInCurrentMonth(tx.date)) return false;
+        if ((tx as any).isOpeningBalance) return false;
+        if (String((tx as any).id || '').startsWith('pseudo_')) return false;
+        if ((tx as any).source === 'treasury') return false;
+        const bid = tx.buildingId;
+        if (!bid || !staffBuildingIds.includes(bid)) return false;
+        return true;
+    };
+    const canOpenFullEntryEdit = (tx: Transaction) => canOpenAdminEdit(tx) || canStaffFullEditCurrentMonth(tx);
+
+    const handleFullEntryEditTransaction = (tx: Transaction) => {
+        if (!canOpenFullEntryEdit(tx)) return;
+        navigate('/entry', { state: { transaction: tx } });
+    };
     const [transfers, setTransfers] = useState<any[]>([]);
     const [showDeleted, setShowDeleted] = useState(false);
+    const [showDuplicatesOnly, setShowDuplicatesOnly] = useState(false);
+    const emitHaptic = useCallback((pattern: 'selection' | 'medium' | 'success' | 'destructive' = 'selection') => {
+        if (!HapticService.isSupported()) return;
+        const now = Date.now();
+        if (now - lastHapticAtRef.current < 45) return; // throttle rapid taps/scroll gestures
+        lastHapticAtRef.current = now;
+        if (pattern === 'medium') HapticService.medium();
+        else if (pattern === 'success') HapticService.success();
+        else if (pattern === 'destructive') HapticService.destructive();
+        else HapticService.selection();
+    }, []);
+
     const [showViewModal, setShowViewModal] = useState(false);
     const [selectedTx, setSelectedTx] = useState<Transaction | null>(null);
+    const [debugAmounts, setDebugAmounts] = useStickyState<boolean>('hist_debugAmounts', false);
     // Edit Payment Method Modal State
     const [showEditPaymentModal, setShowEditPaymentModal] = useState(false);
     const [editPaymentTx, setEditPaymentTx] = useState<Transaction | null>(null);
@@ -122,10 +207,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             try {
                 await saveTransaction({ ...editPaymentTx!, ...newData } as any);
                 showSuccess('Transaction updated successfully.');
+                emitHaptic('success');
                 setShowEditPaymentModal(false);
                 await loadData();
             } catch (e) {
                 showError('Failed to update transaction.');
+                emitHaptic('destructive');
             }
             closeConfirm();
         }, { title: 'Confirm Edit Changes' });
@@ -145,8 +232,14 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
     const openVatModal = (tx: Transaction) => {
         setVatModalTx(tx);
-        const autoInv = `INV-${tx.id.slice(0, 8).toUpperCase()}`;
-        setVatInvoiceNumber(tx.vatInvoiceNumber || autoInv);
+        const autoInv = tx.type === TransactionType.INCOME
+            ? getNextVatInvoiceNumber(
+                transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+                tx.date,
+              )
+            : getNextVatInvoiceNumber(transactions, tx.date);
+        const purchaseBillNo = String((tx as any).vendorRefNo || '').trim();
+        setVatInvoiceNumber(tx.vatInvoiceNumber || (tx.type === TransactionType.EXPENSE ? purchaseBillNo : '') || autoInv);
         // Pre-fill customer VAT from customers list
         if (tx.type === TransactionType.INCOME) {
             const contractCustomerId = (tx as any).customerId;
@@ -203,7 +296,13 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         if (!vatModalTx || !vatBreakdown) return;
         setVatSaving(true);
         try {
-            const inv = vatInvoiceNumber.trim() || `INV-${vatModalTx.id.slice(0, 8).toUpperCase()}`;
+            const purchaseBillNo = String((vatModalTx as any).vendorRefNo || '').trim();
+            const inv = vatInvoiceNumber.trim() || (vatModalTx.type === TransactionType.EXPENSE && purchaseBillNo ? purchaseBillNo : '') || (vatModalTx.type === TransactionType.INCOME
+                ? getNextVatInvoiceNumber(
+                    transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+                    vatModalTx.date,
+                  )
+                : getNextVatInvoiceNumber(transactions, vatModalTx.date));
             const updated: Transaction = {
                 ...vatModalTx,
                 isVATApplicable: true,
@@ -229,11 +328,13 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             showSuccess(vatModalTx.type === TransactionType.INCOME
                 ? `Sales invoice ${inv} converted & reported to ZATCA.`
                 : `Purchase invoice ${inv} converted to VAT.`);
+            emitHaptic('success');
             setShowVatModal(false);
             setVatModalTx(null);
             await loadData();
         } catch (e) {
             showError('Failed to convert transaction to VAT.');
+            emitHaptic('destructive');
         }
         setVatSaving(false);
     };
@@ -284,6 +385,10 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const buildingPickerRef = useRef<HTMLDivElement | null>(null);
     const buildingTriggerRef = useRef<HTMLButtonElement | null>(null);
     const [buildingPickerRect, setBuildingPickerRect] = useState<{ top: number; left: number; width: number } | null>(null);
+    const [showMonthFilterDropdown, setShowMonthFilterDropdown] = useState(false);
+    const monthFilterTriggerRef = useRef<HTMLButtonElement | null>(null);
+    const monthFilterPanelRef = useRef<HTMLDivElement | null>(null);
+    const [monthFilterRect, setMonthFilterRect] = useState<{ top: number; left: number; width: number } | null>(null);
     const [filterBankName, setFilterBankName] = useStickyState('hist_filterBankName', 'ALL');
     const [filterCustomer, setFilterCustomer] = useStickyState('hist_filterCustomer', 'ALL');
     const [filterUnit, setFilterUnit] = useStickyState('hist_filterUnit', '');
@@ -346,7 +451,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             }
         }
 
-        const [allBuildings, allCustomers, allBanks, appSettings, allUsers, allTransfers, allVendors] = await Promise.all([
+        const [allBuildings, allCustomers, allBanks, appSettings, allUsers, allTransfers, allVendors, allContracts] = await Promise.all([
             getBuildings(),
             getCustomers(),
             getBanks(),
@@ -354,8 +459,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             getUsers(),
             getTransfers({}),
             getVendors(),
+            getContracts({ includeDeleted: true }).catch(() => [] as Contract[]),
         ]);
-        setTransactions((txs || []).filter((t: any) => !t.vatReportOnly || (t.date && t.date >= '2024-04-01')));
+        // IMPORTANT: VAT purchase/import entries (`vatReportOnly`) must still appear in History.
+        // The VAT Report tab can provide specialized views/filters, but History is the full ledger.
+        setTransactions(txs || []);
+        setContracts((allContracts as Contract[]) || []);
         setBuildings(allBuildings || []);
         setCustomers(allCustomers || []);
         setBanks(allBanks || []);
@@ -367,6 +476,21 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     };
 
     useEffect(() => { loadData(); }, []);
+
+    // Tablet/mobile touch polish: haptic on interactive taps with event delegation.
+    useEffect(() => {
+        const root = historyShellRef.current;
+        if (!root) return;
+        const onPointerDown = (ev: Event) => {
+            const target = ev.target as HTMLElement | null;
+            if (!target) return;
+            const interactive = target.closest('button, a, [role="button"], input, select, textarea, summary');
+            if (!interactive) return;
+            emitHaptic('selection');
+        };
+        root.addEventListener('pointerdown', onPointerDown, { passive: true, capture: true });
+        return () => root.removeEventListener('pointerdown', onPointerDown, true);
+    }, [emitHaptic]);
 
     // Refresh data whenever this page becomes visible again (e.g. navigating back from EntryForm)
     useEffect(() => {
@@ -414,11 +538,52 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         };
     }, [showBuildingPicker]);
 
+    // Month filter dropdown: position, outside click, Escape
+    useEffect(() => {
+        if (!showMonthFilterDropdown) return;
+
+        const updatePos = () => {
+            const el = monthFilterTriggerRef.current;
+            if (!el) return;
+            const r = el.getBoundingClientRect();
+            setMonthFilterRect({ top: r.bottom, left: r.left, width: Math.max(r.width, 220) });
+        };
+        updatePos();
+
+        const onDocClick = (e: MouseEvent) => {
+            const node = e.target as Node;
+            if (monthFilterPanelRef.current?.contains(node)) return;
+            if (monthFilterTriggerRef.current?.contains(node)) return;
+            setShowMonthFilterDropdown(false);
+        };
+        const onEsc = (e: KeyboardEvent) => {
+            if (e.key === 'Escape') setShowMonthFilterDropdown(false);
+        };
+
+        document.addEventListener('mousedown', onDocClick);
+        document.addEventListener('keydown', onEsc);
+        window.addEventListener('resize', updatePos);
+        window.addEventListener('scroll', updatePos, true);
+        return () => {
+            document.removeEventListener('mousedown', onDocClick);
+            document.removeEventListener('keydown', onEsc);
+            window.removeEventListener('resize', updatePos);
+            window.removeEventListener('scroll', updatePos, true);
+        };
+    }, [showMonthFilterDropdown]);
+
     const buildingOptions = useMemo(() => {
         if (isAdminOrManager) return buildings;
         if (userBuildingIds.length === 0) return buildings;
         return buildings.filter(b => userBuildingIds.includes(b.id));
     }, [buildings, isAdminOrManager, userBuildingIds]);
+
+    const buildingFilterOptions = useMemo(() => {
+        const base = buildingOptions.map(b => ({ id: b.id, name: b.name || b.id, isNoSource: false }));
+        return isAdminOrManager
+            ? [{ id: NO_SOURCE_BUILDING_FILTER, name: 'No source / building', isNoSource: true }, ...base]
+            : base;
+    }, [buildingOptions, isAdminOrManager]);
 
     const getBuildingName = (id?: string) => {
         if (!id) return '';
@@ -436,7 +601,21 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         return formatNameWithRoom(baseName, c.roomNumber);
     };
     const normalize = (v?: string) => String(v || '').trim().toLowerCase();
+    const transactionHasNoSourceBuilding = useCallback((tx: Transaction) => {
+        const explicitBuilding = [
+            tx.buildingId,
+            (tx as any).building,
+            (tx as any).building_id,
+            (tx as any).targetBuildingId,
+        ].some(v => String(v || '').trim());
+        if (explicitBuilding) return false;
+        if ((tx as any).source === 'treasury') return false;
+        const fromType = String((tx as any).fromType || '').toUpperCase();
+        const toType = String((tx as any).toType || '').toUpperCase();
+        return fromType !== 'BUILDING' && toType !== 'BUILDING';
+    }, []);
     const matchTransactionBuilding = useCallback((tx: Transaction, buildingId: string) => {
+        if (buildingId === NO_SOURCE_BUILDING_FILTER) return transactionHasNoSourceBuilding(tx);
         const targetId = normalize(buildingId);
         const targetName = normalize(getBuildingName(buildingId));
         if (!targetId) return false;
@@ -477,7 +656,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
         if (targetName && rawNames.includes(targetName)) return true;
         return false;
-    }, [buildings]);
+    }, [buildings, transactionHasNoSourceBuilding]);
 
     const extractCustomerIdFromDetails = (details?: string) => {
         if (!details) return undefined;
@@ -538,6 +717,121 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         setSelectedTx(null);
     };
 
+    const formatLinkedContract = (tx: Transaction): string | undefined => {
+        const cid = String(tx.contractId || '').trim();
+        if (!cid) return undefined;
+        const c = contracts.find((x) => x.id === cid);
+        if (!c) return undefined;
+        const parts = [
+            c.contractNo ? `#${c.contractNo}` : '',
+            c.buildingName || '',
+            c.unitName ? `${t('history.unitShort')} ${c.unitName}` : '',
+            c.customerName || '',
+        ].filter(Boolean);
+        return parts.join(' · ') || undefined;
+    };
+
+    const displayAmount = (tx: Transaction): number => {
+        const inclRaw = (tx as any).amountIncludingVAT ?? (tx as any).totalWithVat;
+        if (inclRaw != null && inclRaw !== '') {
+            const n = Number(inclRaw);
+            if (!Number.isNaN(n)) {
+                const base = Number(tx.amount || 0);
+                const vat = Number(tx.vatAmount || 0);
+                // Old data guard: some rows stored "amountIncludingVAT" but it equals the exclusive/base.
+                if (tx.type === TransactionType.EXPENSE && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
+                return n;
+            }
+        }
+        const base = Number(tx.amount || 0);
+        // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
+        // and some rows may be missing `isVATApplicable` even though VAT was entered.
+        if (tx.type === TransactionType.EXPENSE && Number(tx.vatAmount || 0) > 0) {
+            return base + Number(tx.vatAmount || 0);
+        }
+        return base;
+    };
+
+    const buildDetailItems = (tx: Transaction): Array<{ label: string; value: string }> => {
+        const amountExcl = Number(tx.amountExcludingVAT ?? tx.amount ?? 0);
+        const amountVat = Number(tx.vatAmount || 0);
+        const amountIncl = displayAmount(tx);
+        const building = getBuildingName(tx.buildingId || (tx as any).building) || tx.buildingName || '-';
+        const fromBank = String((tx as any).fromBankName || '').trim();
+        const toBank = String((tx as any).toBankName || '').trim();
+        const linked = formatLinkedContract(tx);
+        const feeInv = String((tx as any).feeInvoiceNo || '').trim();
+        const isFees = !!(tx as any).feesEntry;
+        const vatRate = Number(tx.vatRate) || 15;
+        const hasVatBreakdown =
+            !!tx.isVATApplicable &&
+            !isFees &&
+            (amountVat > 0 || (tx.amountExcludingVAT != null && tx.amountIncludingVAT != null));
+
+        const out: Array<{ label: string; value: string | number | undefined | null }> = [
+            { label: t('common.date'), value: fmtDate(tx.date) },
+            { label: t('history.type'), value: tx.type },
+            { label: t('common.status'), value: tx.status || '-' },
+            { label: t('common.details'), value: tx.details || '-' },
+            { label: t('history.payment'), value: fmtPaymentMethod(tx) },
+            { label: t('history.bank'), value: tx.bankName },
+            { label: t('history.fromBank'), value: fromBank },
+            { label: t('history.toBank'), value: toBank },
+            { label: t('history.chequeNum'), value: tx.chequeNo },
+            { label: t('history.due'), value: tx.chequeDueDate ? fmtDate(tx.chequeDueDate) : '' },
+            { label: t('history.building'), value: building },
+            { label: t('history.unitNo'), value: tx.unitNumber },
+            { label: t('history.category'), value: tx.expenseCategory || '' },
+            { label: t('history.incomeSubtype'), value: tx.incomeSubType || '' },
+            { label: t('history.customer'), value: (tx as any).customerName || getCustomerName((tx as any).customerId) },
+            { label: t('history.customerVat'), value: tx.customerVATNumber },
+            { label: t('history.vendor'), value: tx.vendorName },
+            { label: t('history.vendorVat'), value: tx.vendorVATNumber },
+            { label: t('history.billRef'), value: (tx as any).vendorRefNo },
+            { label: t('history.invoice'), value: tx.vatInvoiceNumber },
+            { label: t('history.feeInvoiceNo'), value: feeInv },
+            { label: t('history.linkedContract'), value: linked },
+            { label: t('history.expectedAmount'), value: tx.expectedAmount != null && tx.expectedAmount > 0 ? `${Number(tx.expectedAmount).toLocaleString()} ${t('common.sar')}` : '' },
+        ];
+
+        if (isFees) {
+            out.push({ label: t('history.amountNoVat'), value: `${Number(tx.amount || 0).toLocaleString()} ${t('common.sar')}` });
+        } else if (hasVatBreakdown) {
+            out.push(
+                { label: t('history.amountExclVat'), value: `${amountExcl.toLocaleString()} ${t('common.sar')}` },
+                { label: t('history.vatAtRate', { rate: String(vatRate) }), value: `${amountVat.toLocaleString()} ${t('common.sar')}` },
+                { label: t('history.amountInclVat'), value: `${amountIncl.toLocaleString()} ${t('common.sar')}` },
+            );
+        } else {
+            out.push({ label: t('common.amount'), value: `${displayAmount(tx).toLocaleString()} ${t('common.sar')}` });
+        }
+
+        out.push(
+            { label: t('history.serviceAgreement'), value: tx.serviceAgreementName },
+            { label: t('history.installment'), value: (tx as any).installmentNumber },
+            {
+                label: t('history.installmentPeriod'),
+                value:
+                    (tx as any).installmentStartDate && (tx as any).installmentEndDate
+                        ? `${fmtDate((tx as any).installmentStartDate)} – ${fmtDate((tx as any).installmentEndDate)}`
+                        : '',
+            },
+            { label: t('history.employee'), value: tx.employeeName },
+            { label: t('history.owner'), value: tx.ownerName },
+            { label: t('history.createdBy'), value: tx.createdByName },
+            { label: t('history.createdAt'), value: tx.createdAt ? fmtDateTime(tx.createdAt) : '' },
+        );
+        if (tx.lastModifiedAt && (!tx.createdAt || tx.lastModifiedAt !== tx.createdAt)) {
+            out.push({ label: t('history.lastModified'), value: fmtDateTime(tx.lastModifiedAt) });
+        }
+
+        return out
+            .filter((i) => i.value !== undefined && i.value !== null && String(i.value).trim() !== '')
+            .map((i) => ({ label: i.label, value: String(i.value) }));
+    };
+
+    const linkedContractForView = selectedTx ? formatLinkedContract(selectedTx) : undefined;
+
     const handleDeleteConfirm = async () => {
         if (!txToDelete) return;
         try {
@@ -548,7 +842,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 const cn = await createCreditNote(txToDelete);
                 // Auto-report Credit Note to ZATCA (Phase 2 or offline fallback)
                 try {
-                    const zatcaUrl = zatcaSignAndReportPath();
+                    const zatcaUrl = ((import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022') + '/zatca/sign-and-report';
                     const cnPayload = {
                         invoiceNumber: cn.vatInvoiceNumber,
                         issueDate: cn.date,
@@ -575,7 +869,16 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                         for (let i = 0; i < bytes.length; i++) bytes[i] = parseInt(hex.substring(i*2,i*2+2),16);
                         qrCode = btoa(String.fromCharCode(...bytes));
                     }
-                    if (qrCode) await saveTransaction({ ...cn, zatcaQRCode: qrCode, zatcaReportedAt: new Date().toISOString() });
+                    if (qrCode) {
+                        await saveTransaction({
+                            ...cn,
+                            zatcaQRCode: qrCode,
+                            zatcaReportedAt: new Date().toISOString(),
+                            vatReportSnapshot: createVatReportSnapshot(cn as any, {
+                                customerName: (cn as any).customerName || cn.unitNumber || cn.buildingName || 'Customer',
+                            }),
+                        });
+                    }
                 } catch { /* non-fatal */ }
 
                 // â”€â”€ Undo rent: reduce upfrontPaid on the linked contract â”€â”€
@@ -838,6 +1141,51 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         keys.forEach(k => sessionStorage.removeItem(k));
     };
 
+    const setThisMonth = () => {
+        const now = new Date();
+        const start = new Date(now.getFullYear(), now.getMonth(), 1);
+        const startISO = start.toISOString().slice(0, 10);
+        const nowISO = now.toISOString().slice(0, 10);
+        setFilterDateFrom(startISO);
+        setFilterDateTo(nowISO);
+        setFilterTillDate('');
+    };
+
+    /** Calendar months for the current year only (December → January). Rebuilt when data reloads so the year stays current. */
+    const monthFilterOptions = useMemo(() => {
+        const y = new Date().getFullYear();
+        return Array.from({ length: 12 }, (_, i) => {
+            const month = 12 - i;
+            return `${y}-${String(month).padStart(2, '0')}`;
+        });
+    }, [transactions]);
+
+    const monthFilterYear = monthFilterOptions[0]?.slice(0, 4) || String(new Date().getFullYear());
+
+    const formatMonthNameOnly = useCallback(
+        (ym: string) => {
+            const [ys, ms] = ym.split('-').map(Number);
+            if (!Number.isFinite(ys) || !Number.isFinite(ms)) return ym;
+            const d = new Date(ys, ms - 1, 1);
+            return d.toLocaleDateString(language === 'ar' ? 'ar-SA' : 'en-GB', { month: 'long' });
+        },
+        [language],
+    );
+
+    const activeHistoryMonthKey = useMemo(() => {
+        if (filterTillDate) return '';
+        for (const ym of monthFilterOptions) {
+            if (isFullMonthRange(filterDateFrom, filterDateTo, filterTillDate, ym)) return ym;
+        }
+        return '';
+    }, [filterDateFrom, filterDateTo, filterTillDate, monthFilterOptions]);
+
+    const monthFilterTriggerLabel = useMemo(() => {
+        if (activeHistoryMonthKey) return formatMonthNameOnly(activeHistoryMonthKey);
+        if (!filterDateFrom && !filterDateTo && !filterTillDate) return t('history.browseByMonth');
+        return t('history.customDateRange');
+    }, [activeHistoryMonthKey, filterDateFrom, filterDateTo, filterTillDate, formatMonthNameOnly, t]);
+
     const handlePrintReceipt = (tx: Transaction) => {
         const printWindow = window.open('', 'PRINT', 'height=900,width=850');
         if (!printWindow) return;
@@ -960,7 +1308,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                   <div class="inner-frame">
                     <div class="orn orn-tl"></div><div class="orn orn-tr"></div>
                     <div class="orn orn-bl"></div><div class="orn orn-br"></div>
-                    <img src="${window.location.origin}/images/logo.png" alt="" class="watermark-bg" />
+                    <img src="${window.location.origin}/images/cologo.png" alt="" class="watermark-bg" />
                     <div class="content">
                       <div class="header">
                         <div class="header-right">
@@ -1038,7 +1386,230 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                         <div class="footer-text">This is a computer-generated document and is valid without signature &bull; هذا المستند صادر إلكترونيًا وصالح بدون توقيع</div>
                         <div class="footer-bottom">
                           <span class="footer-copy">Arar Millennium Company Ltd &copy; ${new Date().getFullYear()}</span>
-                          <span class="amlak-badge"><img src="${window.location.origin}/images/logo.png" alt="" /> Powered by Amlak</span>
+                          <span class="amlak-badge"><img src="${window.location.origin}/images/cologo.png" alt="" /> Powered by Amlak</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+              <script>window.onload=function(){setTimeout(function(){var imgs=document.images,c=0,t=imgs.length;if(!t){window.print();return}for(var i=0;i<t;i++){if(imgs[i].complete){if(++c>=t)window.print()}else{imgs[i].onload=imgs[i].onerror=function(){if(++c>=t)window.print()}}}},200);}</script>
+            </body>
+          </html>
+        `);
+        printWindow.document.close();
+        printWindow.focus();
+    };
+
+    const handlePrintPaymentVoucher = (tx: Transaction) => {
+        const printWindow = window.open('', 'PRINT_VOUCHER', 'height=900,width=850');
+        if (!printWindow) return;
+
+        const isExpense = tx.type === TransactionType.EXPENSE;
+        const voucherNo = `${isExpense ? 'PV' : 'RV'}-${(tx.id || '').slice(-6).toUpperCase() || Date.now().toString().slice(-6)}`;
+        const txDate = tx.date || new Date().toISOString().split('T')[0];
+        const amountExcl = Number(tx.amountExcludingVAT || tx.amount || 0);
+        const vatAmount = Number(tx.vatAmount || 0);
+        const amountIncl = Number(tx.amountIncludingVAT || tx.totalWithVat || tx.amount || 0);
+        const party = isExpense
+            ? ((tx as any).vendorName || tx.vendorName || 'Vendor / Supplier')
+            : ((tx as any).customerName || (tx.buildingName ? `${tx.buildingName}${tx.unitNumber ? ` - Unit ${tx.unitNumber}` : ''}` : 'Customer'));
+        const voucherTitle = isExpense ? 'سند صرف <span>|</span> PAYMENT VOUCHER' : 'سند قبض <span>|</span> RECEIPT VOUCHER';
+        const amountLabel = isExpense ? 'Amount Paid' : 'Amount Received';
+        const amountLabelAr = isExpense ? 'المبلغ المصروف' : 'المبلغ المستلم';
+        const partyLabelAr = isExpense ? 'صرفنا إلى' : 'استلمنا من';
+        const partyLabelEn = isExpense ? 'Paid To' : 'Received From';
+        const purposeFallback = isExpense ? 'Expense Payment' : 'Rent Payment';
+        const referenceValue = String(tx.vatInvoiceNumber || (tx as any).vendorRefNo || '').trim();
+
+        printWindow.document.write(`
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <meta charset="utf-8" />
+              <title>${isExpense ? 'Payment Voucher' : 'Receipt Voucher'} - ${voucherNo}</title>
+              <style>
+                @import url('https://fonts.googleapis.com/css2?family=Tajawal:wght@300;400;500;700;800&family=Inter:wght@300;400;500;600;700&display=swap');
+                :root {
+                  --g900: #064e3b; --g800: #065f46; --g700: #047857; --g600: #059669;
+                  --g500: #10b981; --g400: #34d399; --g200: #a7f3d0; --g100: #d1fae5; --g50: #ecfdf5;
+                  --text-dark: #0f1a12; --text-mid: #334844; --text-light: #6b8078;
+                  --bg: #f8fdf9; --border: #d5e8dd;
+                }
+                * { margin:0; padding:0; box-sizing:border-box; }
+                body { font-family:'Inter','Tajawal',sans-serif; background:#fff; color:var(--text-dark); }
+                .page { max-width:780px; margin:0 auto; }
+
+                .outer-frame { border:2px solid var(--g800); padding:3px; margin:20px; }
+                .inner-frame { border:1px solid var(--g400); position:relative; overflow:hidden; }
+
+                .watermark-bg { position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); opacity:0.035; width:360px; height:360px; object-fit:contain; z-index:0; pointer-events:none; }
+                .content { position:relative; z-index:1; }
+
+                .orn { position:absolute; width:26px; height:26px; border-color:var(--g400); border-style:solid; z-index:2; }
+                .orn-tl { top:6px; left:6px; border-width:2px 0 0 2px; }
+                .orn-tr { top:6px; right:6px; border-width:2px 2px 0 0; }
+                .orn-bl { bottom:6px; left:6px; border-width:0 0 2px 2px; }
+                .orn-br { bottom:6px; right:6px; border-width:0 2px 2px 0; }
+
+                .header { display:flex; align-items:center; justify-content:space-between; padding:24px 32px 20px; background:linear-gradient(135deg, var(--g900) 0%, var(--g700) 100%); position:relative; }
+                .header::after { content:''; position:absolute; bottom:0; left:0; right:0; height:3px; background:linear-gradient(90deg, var(--g400), var(--g200), var(--g400)); }
+                .header-left,.header-right { flex:1; color:white; }
+                .header-left { text-align:right; direction:rtl; }
+                .header-right { text-align:left; direction:ltr; }
+                .header-center { flex:0 0 auto; padding:0 22px; }
+                .logo-wrap { width:78px; height:78px; background:white; border-radius:50%; display:flex; align-items:center; justify-content:center; box-shadow:0 4px 18px rgba(0,0,0,.25); border:3px solid var(--g400); }
+                .logo-wrap img { width:54px; height:54px; object-fit:contain; }
+                .co-name-ar { font-family:'Tajawal',sans-serif; font-size:16px; font-weight:700; }
+                .co-name-en { font-size:11px; opacity:.85; margin-top:1px; }
+                .co-vat { font-size:9.5px; opacity:.65; margin-top:5px; letter-spacing:.5px; }
+
+                .title-ribbon { text-align:center; padding:13px 20px; background:var(--g50); border-bottom:1px solid var(--border); }
+                .title-ribbon h1 { font-size:21px; font-weight:800; color:var(--g800); letter-spacing:2px; text-transform:uppercase; font-family:'Tajawal',sans-serif; }
+                .title-ribbon h1 span { color:var(--g500); margin:0 8px; }
+
+                .meta-bar { display:flex; justify-content:center; gap:40px; padding:12px 32px; background:white; border-bottom:1px solid var(--border); }
+                .meta-item { text-align:center; }
+                .meta-label { font-size:9px; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-light); font-weight:600; margin-bottom:2px; }
+                .meta-value { font-size:15px; font-weight:700; color:var(--g800); }
+
+                .body { padding:22px 32px 18px; }
+                .amount-card { background:linear-gradient(135deg, var(--g900) 0%, var(--g700) 100%); border-radius:12px; padding:22px 28px; margin-bottom:22px; display:flex; align-items:center; justify-content:space-between; position:relative; overflow:hidden; }
+                .amount-card::before { content:''; position:absolute; top:-30px; right:-30px; width:120px; height:120px; background:rgba(52,211,153,.12); border-radius:50%; }
+                .amount-card::after { content:''; position:absolute; bottom:-20px; left:-20px; width:80px; height:80px; background:rgba(52,211,153,.08); border-radius:50%; }
+                .amount-label { font-size:11px; text-transform:uppercase; letter-spacing:1.5px; color:var(--g200); font-weight:600; position:relative; z-index:1; }
+                .amount-label-ar { font-family:'Tajawal',sans-serif; font-size:13px; color:rgba(255,255,255,.8); margin-top:2px; position:relative; z-index:1; }
+                .amount-value { font-size:30px; font-weight:800; color:white; letter-spacing:1px; position:relative; z-index:1; text-align:left; direction:ltr; }
+                .amount-currency { font-size:13px; font-weight:500; color:var(--g200); margin-top:2px; position:relative; z-index:1; text-align:left; }
+
+                .details-table { width:100%; border-collapse:collapse; margin-bottom:5px; }
+                .details-table tr { border-bottom:1px solid #e8f0eb; }
+                .details-table tr:last-child { border-bottom:none; }
+                .details-table tr:nth-child(even) { background:var(--g50); }
+                .details-table td { padding:12px 16px; vertical-align:top; }
+                .details-table .td-label { width:42%; font-weight:600; color:var(--text-mid); font-size:12px; direction:rtl; text-align:right; }
+                .details-table .td-label .en { display:block; font-size:10px; color:var(--text-light); font-weight:400; margin-top:1px; }
+                .details-table .td-value { font-weight:600; color:var(--text-dark); font-size:13px; text-align:left; direction:ltr; }
+
+                .vat-section { background:var(--g50); border:1px solid var(--border); border-radius:8px; padding:14px 18px; margin:18px 0 5px; }
+                .vat-title { font-size:10px; text-transform:uppercase; letter-spacing:1.5px; color:var(--text-light); font-weight:700; margin-bottom:10px; padding-bottom:8px; border-bottom:1px solid var(--border); }
+                .vat-row { display:flex; justify-content:space-between; padding:5px 0; font-size:12px; }
+                .vat-row .vr-label { color:var(--text-mid); }
+                .vat-row .vr-val { font-weight:700; color:var(--text-dark); direction:ltr; }
+                .vat-row.total { border-top:2px solid var(--g700); margin-top:6px; padding-top:8px; font-size:13px; }
+                .vat-row.total .vr-label { font-weight:700; color:var(--g800); }
+                .vat-row.total .vr-val { color:var(--g800); font-size:15px; }
+
+                .signatures { display:flex; justify-content:space-between; padding:32px 32px 10px; gap:30px; }
+                .sig-block { flex:1; text-align:center; }
+                .sig-line { border-bottom:2px solid var(--g800); margin-bottom:10px; height:48px; }
+                .sig-title { font-size:11px; font-weight:700; color:var(--text-mid); text-transform:uppercase; letter-spacing:1px; }
+                .sig-title-ar { font-family:'Tajawal',sans-serif; font-size:12px; color:var(--text-light); margin-top:2px; }
+
+                .footer-bar { text-align:center; padding:14px 32px; background:var(--g50); border-top:1px solid var(--border); position:relative; }
+                .footer-bar::before { content:''; position:absolute; top:0; left:32px; right:32px; height:1px; background:linear-gradient(90deg,transparent,var(--g400),transparent); }
+                .footer-text { font-size:9px; color:var(--text-light); letter-spacing:.5px; line-height:1.8; }
+                .footer-bottom { display:flex; justify-content:center; align-items:center; gap:12px; margin-top:6px; }
+                .amlak-badge { display:inline-flex; align-items:center; gap:5px; background:var(--g800); color:white; padding:3px 10px; border-radius:20px; font-size:7px; font-weight:700; letter-spacing:1.5px; text-transform:uppercase; }
+                .amlak-badge img { width:14px; height:14px; object-fit:contain; border-radius:50%; }
+                .footer-copy { font-size:8px; color:var(--text-light); letter-spacing:1px; }
+                @media print {
+                  body { -webkit-print-color-adjust:exact; print-color-adjust:exact; }
+                  .outer-frame { margin:0; }
+                  @page { margin:0.8cm; size:A4 portrait; }
+                }
+              </style>
+            </head>
+            <body>
+              <div class="page">
+                <div class="outer-frame">
+                  <div class="inner-frame">
+                    <div class="orn orn-tl"></div><div class="orn orn-tr"></div>
+                    <div class="orn orn-bl"></div><div class="orn orn-br"></div>
+                    <img src="${window.location.origin}/images/cologo.png" alt="" class="watermark-bg" />
+                    <div class="content">
+                      <div class="header">
+                        <div class="header-right">
+                          <div class="co-name-en" style="font-size:13px;font-weight:600">Arar Millennium</div>
+                          <div class="co-name-en">Company Ltd</div>
+                          <div class="co-vat">VAT: 312610089400003</div>
+                        </div>
+                        <div class="header-center">
+                          <div class="logo-wrap"><img src="${window.location.origin}/images/cologo.png" alt="Logo" /></div>
+                        </div>
+                        <div class="header-left">
+                          <div class="co-name-ar"> شركة أرار ميلينيوم المحدودة</div>
+                          <div class="co-name-en" style="opacity:.7;font-size:10px">الدمام، المملكة العربية السعودية</div>
+                          <div class="co-vat">الرقم الضريبي: 312610089400003</div>
+                        </div>
+                      </div>
+                      <div class="title-ribbon"><h1>${voucherTitle}</h1></div>
+                      <div class="meta-bar">
+                        <div class="meta-item"><div class="meta-label">Voucher No. / رقم السند</div><div class="meta-value">${voucherNo}</div></div>
+                        <div class="meta-item"><div class="meta-label">Date / التاريخ</div><div class="meta-value">${txDate}</div></div>
+                      </div>
+                      <div class="body">
+                        <div class="amount-card">
+                          <div>
+                            <div class="amount-label">${amountLabel}</div>
+                            <div class="amount-label-ar">${amountLabelAr}</div>
+                          </div>
+                          <div>
+                            <div class="amount-value">${amountIncl.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})}</div>
+                            <div class="amount-currency">SAR / ريال سعودي</div>
+                          </div>
+                        </div>
+                        <table class="details-table">
+                          <tr>
+                            <td class="td-label">${partyLabelAr}<span class="en">${partyLabelEn}</span></td>
+                            <td class="td-value">${party || '-'}</td>
+                          </tr>
+                          <tr>
+                            <td class="td-label">وذلك عن<span class="en">Payment For</span></td>
+                            <td class="td-value">${tx.details || purposeFallback}</td>
+                          </tr>
+                          <tr>
+                            <td class="td-label">المبنى / الوحدة<span class="en">Building / Unit</span></td>
+                            <td class="td-value">${tx.buildingName || '-'}${tx.unitNumber ? ` - Unit ${tx.unitNumber}` : ''}</td>
+                          </tr>
+                          <tr>
+                            <td class="td-label">الفئة<span class="en">Category</span></td>
+                            <td class="td-value">${tx.expenseCategory || (isExpense ? 'Expense' : 'Income')}</td>
+                          </tr>
+                          ${referenceValue ? `
+                          <tr>
+                            <td class="td-label">المرجع<span class="en">Reference</span></td>
+                            <td class="td-value">${referenceValue}</td>
+                          </tr>` : ''}
+                          ${tx.chequeNo ? `
+                          <tr>
+                            <td class="td-label">رقم الشيك<span class="en">Cheque No.</span></td>
+                            <td class="td-value">${tx.chequeNo}</td>
+                          </tr>` : ''}
+                          ${tx.chequeDueDate ? `
+                          <tr>
+                            <td class="td-label">تاريخ استحقاق الشيك<span class="en">Cheque Due Date</span></td>
+                            <td class="td-value">${fmtDate(tx.chequeDueDate)}</td>
+                          </tr>` : ''}
+                        </table>
+                        ${(tx.isVATApplicable || vatAmount > 0) ? `
+                        <div class="vat-section">
+                          <div class="vat-title">Tax Breakdown / تفاصيل الضريبة</div>
+                          <div class="vat-row"><span class="vr-label">Amount Excl. VAT / المبلغ قبل الضريبة</span><span class="vr-val">${amountExcl.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} SAR</span></div>
+                          <div class="vat-row"><span class="vr-label">VAT 15% / ضريبة القيمة المضافة</span><span class="vr-val">${vatAmount.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} SAR</span></div>
+                          <div class="vat-row total"><span class="vr-label">Total / الإجمالي</span><span class="vr-val">${amountIncl.toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2})} SAR</span></div>
+                        </div>` : ''}
+                      </div>
+                      <div class="signatures">
+                        <div class="sig-block"><div class="sig-line"></div><div class="sig-title">Accountant</div><div class="sig-title-ar">المحاسب</div></div>
+                        <div class="sig-block"><div class="sig-line"></div><div class="sig-title">${isExpense ? 'Receiver' : 'Payer'}</div><div class="sig-title-ar">${isExpense ? 'المستلم' : 'الدافع'}</div></div>
+                        <div class="sig-block"><div class="sig-line"></div><div class="sig-title">Approved By</div><div class="sig-title-ar">المدير المعتمد</div></div>
+                      </div>
+                      <div class="footer-bar">
+                        <div class="footer-text">This is a computer-generated document and is valid without signature &bull; هذا المستند صادر إلكترونيًا وصالح بدون توقيع</div>
+                        <div class="footer-bottom">
+                          <span class="footer-copy">Arar Millennium Company Ltd &copy; ${new Date().getFullYear()}</span>
+                          <span class="amlak-badge"><img src="${window.location.origin}/images/cologo.png" alt="" /> Powered by Amlak</span>
                         </div>
                       </div>
                     </div>
@@ -1080,12 +1651,25 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const filteredData = useMemo(() => {
         // Treasury transfers create transaction records that should appear in history
         // Inject pseudo-transactions for existing Building→Owner transfers that lack a transaction record
-        const existingTreasuryTxIds = new Set(transactions.filter(t => (t as any).transferId).map(tx => (t as any).transferId));
+        // Collect transferIds that already have a real transaction row, so we don't
+        // inject pseudo duplicates for the same transfer.
+        const existingTreasuryTxIds = new Set(
+            transactions
+                .filter((t: any) => (t as any).transferId)
+                .map((t: any) => String((t as any).transferId)),
+        );
+
+        // Strip optional `bookId:` prefix so ledger rows match transfer leg ids.
+        const rawOfBuilding = (compositeId: string | undefined): string => {
+            if (!compositeId) return '';
+            const s = String(compositeId);
+            return s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
+        };
 
         // Building ↔ Owner: inject a pseudo tx if no transaction exists for this transfer.
         const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
             ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-            && !tr.deleted && !existingTreasuryTxIds.has(tr.id)
+            && !tr.deleted && !existingTreasuryTxIds.has(String(tr.id || ''))
         ).map((tr: any) => ({
             id: `pseudo_${tr.id}`,
             date: tr.date || '',
@@ -1122,11 +1706,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         // transaction. We carefully parse composite `${bookId}:${rawId}` ids so a
         // cross-book transfer never injects a phantom leg into the wrong book.
         const interBuildingPseudo: any[] = [];
-        const rawOf = (compositeId: string | undefined): string => {
-            if (!compositeId) return '';
-            const s = String(compositeId);
-            return s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
-        };
+        const rawOf = rawOfBuilding;
         const bookOf = (compositeId: string | undefined): string => {
             if (!compositeId) return '';
             const s = String(compositeId);
@@ -1147,10 +1727,14 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
             const fromRaw = rawOf(tr.fromId);
             const toRaw = rawOf(tr.toId);
+            const trId = String(tr.id || '');
 
-            const linked = transactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
-            const hasSource = linked.some(tx => normalize((tx as any).buildingId) === normalize(fromRaw));
-            const hasDest   = linked.some(tx => normalize((tx as any).buildingId) === normalize(toRaw));
+            const linked = transactions.filter(
+                tx => String((tx as any).transferId || '') === trId && (tx as any).buildingId,
+            );
+            // Compare raw building ids: txs may store `bookId:rawId` while transfer uses composite or raw.
+            const hasSource = linked.some(tx => normalize(rawOf((tx as any).buildingId)) === normalize(fromRaw));
+            const hasDest = linked.some(tx => normalize(rawOf((tx as any).buildingId)) === normalize(toRaw));
 
             const commonPseudo = {
                 date: tr.date || '',
@@ -1249,10 +1833,57 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         // Filter by deleted status first
         result = result.filter(t => showDeleted ? (t as any).deleted === true : !(t as any).deleted);
 
-        // Search Filter
-        if (searchTerm) {
-            const lower = searchTerm.toLowerCase();
-            result = result.filter(t => JSON.stringify(t).toLowerCase().includes(lower));
+        // Search: PREFIX match (starts-with), case-insensitive.
+        // Example: "A" => A..., "A1" => A1...
+        const norm = (v: any) => String(v ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+        const compact = (v: any) =>
+            String(v ?? '')
+                .trim()
+                .toLowerCase()
+                // keep only letters+digits so "A-101" matches "A1"
+                .replace(/[^a-z0-9]+/g, '');
+        const isPrefixMatchTx = (t: Transaction, q: string): boolean => {
+            const qq = norm(q);
+            const qC = compact(q);
+            if (!qq) return true;
+            const fields: any[] = [
+                t.unitNumber,
+                (t as any).unitName,
+                (t as any).roomNumber,
+                t.buildingName,
+                getBuildingName(t.buildingId || (t as any).building),
+                (t as any).customerName,
+                getCustomerName((t as any).customerId),
+                (t as any).vendorName,
+                (t as any).vendorRefNo,
+                t.vatInvoiceNumber,
+                (t as any).chequeNo,
+                t.bankName,
+                t.type,
+                t.status,
+                t.expenseCategory,
+                t.incomeSubType,
+                t.details,
+                t.id,
+            ];
+            if (fields.some(f => norm(f).startsWith(qq) || (qC && compact(f).startsWith(qC)))) return true;
+
+            // Numeric exact matches: amount (shown amount), vatAmount, and inclusive totals.
+            const qNum = Number(qq);
+            if (!Number.isNaN(qNum) && Number.isFinite(qNum)) {
+                const candidates = [
+                    displayAmount(t),
+                    Number((t as any).amount) || 0,
+                    Number((t as any).vatAmount) || 0,
+                    Number((t as any).amountIncludingVAT ?? (t as any).totalWithVat) || 0,
+                ].map(x => Math.round(Number(x || 0) * 100) / 100);
+                const qn = Math.round(qNum * 100) / 100;
+                if (candidates.some(n => n === qn)) return true;
+            }
+            return false;
+        };
+        if (searchTerm.trim()) {
+            result = result.filter(t => isPrefixMatchTx(t, searchTerm));
         }
 
         // Specific Filters
@@ -1282,7 +1913,11 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             result = result.filter(t => getTransactionCategory(t).trim().toLowerCase() === selected);
         }
         if (filterBuildingIds.length > 0) result = result.filter(t => filterBuildingIds.some(id => matchTransactionBuilding(t, id)));
-        if (filterUnit) result = result.filter(t => t.unitNumber?.toLowerCase().includes(filterUnit.toLowerCase()));
+        if (filterUnit) {
+            const q = norm(filterUnit);
+            const qC = compact(filterUnit);
+            result = result.filter(t => norm(t.unitNumber).startsWith(q) || (qC && compact(t.unitNumber).startsWith(qC)));
+        }
 
         // VAT filter
         if (filterVat === 'WITH') result = result.filter(t => (t.vatAmount || 0) > 0);
@@ -1305,6 +1940,86 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             // ignore sorting errors
         }
 
+        // Same treasury transfer leg can appear twice (pseudo backfill + real row, legacy
+        // id mismatch, or duplicate writes). Keep one row per (transferId, building, type).
+        const legDedupeKey = (r: any): string => {
+            const tid = String(r?.transferId || '').trim();
+            if (!tid) return '';
+            const rawB = rawOfBuilding(String(r.buildingId || ''));
+            const ty = String(r?.type || '').toUpperCase();
+            return `${tid}::${normalize(rawB)}::${ty}`;
+        };
+        const byLeg = new Map<string, Transaction[]>();
+        for (const r of result) {
+            const k = legDedupeKey(r as any);
+            if (!k) continue;
+            const arr = byLeg.get(k);
+            if (arr) arr.push(r);
+            else byLeg.set(k, [r]);
+        }
+        const dropRowIds = new Set<string>();
+        for (const [, arr] of byLeg) {
+            if (arr.length <= 1) continue;
+            arr.sort((a: any, b: any) => {
+                const ap = String(a.id || '').startsWith('pseudo_') ? 1 : 0;
+                const bp = String(b.id || '').startsWith('pseudo_') ? 1 : 0;
+                if (ap !== bp) return ap - bp;
+                return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
+            });
+            for (let i = 1; i < arr.length; i++) dropRowIds.add(String(arr[i].id));
+        }
+        if (dropRowIds.size > 0) {
+            result = result.filter(r => !dropRowIds.has(String(r.id)));
+        }
+
+        // Near-identical rental income rows (double-submit or legacy twin Firestore docs): keep one, prefer richer metadata.
+        const dedupeNearIdenticalRentalIncome = (rows: Transaction[]): Transaction[] => {
+            const WINDOW_MS = 4500;
+            const amountKey = (t: Transaction) => Math.round(displayAmount(t) * 100);
+            const rowSignature = (t: Transaction) => {
+                const x = t as any;
+                return `${String(x.contractId || '')}|${String(x.date || '')}|${amountKey(t)}|${String(x.paymentMethod || '').toUpperCase()}|${String(x.bankName || '')}|${String(x.unitNumber || '')}`;
+            };
+            const rowScore = (t: Transaction) => {
+                const x = t as any;
+                let s = String(x.details || '').trim().length;
+                if (x.installmentNumber != null && !Number.isNaN(Number(x.installmentNumber))) s += 80;
+                if (x.installmentStartDate) s += 40;
+                return s;
+            };
+            const kept: Transaction[] = [];
+            for (const row of rows) {
+                const r = row as any;
+                if (
+                    r.type !== TransactionType.INCOME ||
+                    String(r.incomeSubType || '').toUpperCase() !== 'RENTAL' ||
+                    !r.contractId ||
+                    !r.date ||
+                    String(r.id || '').startsWith('pseudo_')
+                ) {
+                    kept.push(row);
+                    continue;
+                }
+                const sig = rowSignature(row);
+                const created = Number(r.createdAt) || 0;
+                let mergedIntoExisting = false;
+                for (let i = 0; i < kept.length; i++) {
+                    const existing = kept[i];
+                    const ex = existing as any;
+                    if (ex.type !== TransactionType.INCOME || String(ex.incomeSubType || '').toUpperCase() !== 'RENTAL' || !ex.contractId) continue;
+                    if (rowSignature(existing) !== sig) continue;
+                    if (Math.abs((Number(ex.createdAt) || 0) - created) > WINDOW_MS) continue;
+                    mergedIntoExisting = true;
+                    if (rowScore(row) > rowScore(existing)) kept[i] = row;
+                    break;
+                }
+                if (!mergedIntoExisting) kept.push(row);
+            }
+            return kept;
+        };
+
+        result = dedupeNearIdenticalRentalIncome(result);
+
         return result;
     }, [transactions, searchTerm, filterType, filterMethod, filterStatus, filterCategory, filterBuildingIds, filterUnit, filterDateFrom, filterDateTo, filterTillDate, filterVat, filterBankName, filterCustomer, filterEmployee, filterOwner, currentUser, showDeleted, transfers, buildings]);
 
@@ -1318,12 +2033,11 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         if (filterCategory !== 'ALL' && filterCategory !== 'Opening Balance') return [] as Transaction[];
 
         const rows: Transaction[] = [];
-        const searchLower = (searchTerm || '').toLowerCase();
-        const includeText = (text: string) => !searchLower || text.toLowerCase().includes(searchLower);
+        const q = searchTerm || '';
         const defaultDate = filterDateTo || filterDateFrom || new Date().toISOString().slice(0, 10);
 
         Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
-            if (filterBuildingIds.length > 0 && !filterBuildingIds.includes(buildingId)) return;
+            if (filterBuildingIds.length > 0 && !filterBuildingIds.some(id => id !== NO_SOURCE_BUILDING_FILTER && id === buildingId)) return;
             const openingRow = row as { cash?: number; bank?: number; date?: string };
             const rowDate = openingRow?.date || defaultDate;
             if (filterDateFrom && rowDate < filterDateFrom) return;
@@ -1335,7 +2049,18 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 if (filterMethod !== 'ALL' && filterMethod !== method) return;
                 if (method === PaymentMethod.BANK && filterBankName !== 'ALL' && !'Opening Balance'.toLowerCase().includes((filterBankName || '').toLowerCase())) return;
                 const details = `Opening Balance - ${method} - ${buildingName}`;
-                if (!includeText(details) && !includeText(buildingName) && !includeText('opening balance')) return;
+                if (q.trim()) {
+                    const obFp = new Set<string>();
+                    addMoneyFingerprint(obFp, amount);
+                    const obHay =
+                        [
+                            details,
+                            buildingName,
+                            'opening balance',
+                            method,
+                        ].join(' ') + moneyFingerprintSuffix(obFp);
+                    if (!matchesAdvancedSearch(q, obHay)) return;
+                }
                 rows.push({
                     id: `opening-${buildingId}-${method.toLowerCase()}`,
                     date: rowDate,
@@ -1392,22 +2117,184 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         });
     }, [filteredData, openingRows, filterType, filterMethod, filterStatus, filterCategory, filterBuildingIds, filterBankName, filterCustomer, filterEmployee, filterOwner, filterUnit, filterDateFrom, filterDateTo, filterTillDate, searchTerm, filterVat]);
 
+    // Duplicate detection — all fields must be exactly the same (excluding id and timestamps)
+    const duplicateIds = useMemo(() => {
+        const ids = new Set<string>();
+        const groups = new Map<string, Transaction[]>();
+        for (const tx of listData) {
+            if ((tx as any).isOpeningBalance || String(tx.id || '').startsWith('pseudo_')) continue;
+            if ((tx as any).source === 'treasury') continue;
+            const key = [
+                tx.date,
+                tx.type,
+                tx.amount,
+                displayAmount(tx),
+                tx.buildingId || '',
+                tx.buildingName || '',
+                tx.unitNumber || '',
+                tx.customerName || '',
+                tx.customerId || '',
+                tx.contractId || '',
+                tx.paymentMethod || '',
+                tx.bankName || '',
+                tx.fromBankName || '',
+                tx.toBankName || '',
+                tx.chequeNo || '',
+                tx.expenseCategory || '',
+                tx.expenseSubCategory || '',
+                tx.employeeId || '',
+                tx.employeeName || '',
+                tx.ownerId || '',
+                tx.ownerName || '',
+                tx.vendorId || '',
+                tx.vendorName || '',
+                tx.details || '',
+                tx.vatAmount || '',
+                tx.isVATApplicable || '',
+                tx.serviceAgreementId || '',
+                tx.borrowingType || '',
+                tx.incomeSubType || '',
+                tx.salaryPeriod || '',
+                tx.status || '',
+            ].join('|');
+            let arr = groups.get(key);
+            if (!arr) { arr = []; groups.set(key, arr); }
+            arr.push(tx);
+        }
+        for (const arr of groups.values()) {
+            if (arr.length < 2) continue;
+            for (const tx of arr) ids.add(tx.id);
+        }
+        return ids;
+    }, [listData]);
+
+    // Map each duplicate tx → its group key so we can label which group it belongs to
+    const duplicateGroupMap = useMemo(() => {
+        const map = new Map<string, string>();
+        const groups = new Map<string, Transaction[]>();
+        for (const tx of listData) {
+            if (!duplicateIds.has(tx.id)) continue;
+            const key = `${tx.date}|${tx.type}|${Math.round(tx.amount)}`;
+            let arr = groups.get(key);
+            if (!arr) { arr = []; groups.set(key, arr); }
+            arr.push(tx);
+        }
+        let groupIdx = 0;
+        for (const [, arr] of groups) {
+            groupIdx++;
+            const color = GROUP_COLORS[groupIdx % GROUP_COLORS.length];
+            for (const tx of arr) map.set(tx.id, color);
+        }
+        return map;
+    }, [listData, duplicateIds]);
+
+    const duplicateCount = duplicateIds.size;
+
     // Pagination — render only a slice of the list for performance
     const PAGE_SIZE = 50;
     const [visibleCount, setVisibleCount] = useState(PAGE_SIZE);
-    useEffect(() => { setVisibleCount(PAGE_SIZE); }, [listData]);
-    const visibleData = useMemo(() => listData.slice(0, visibleCount), [listData, visibleCount]);
-    const hasMore = visibleCount < listData.length;
+    useEffect(() => { setVisibleCount(PAGE_SIZE); }, [listData, showDuplicatesOnly]);
+    const effectiveList = useMemo(() => showDuplicatesOnly ? listData.filter(r => duplicateIds.has(r.id)) : listData, [listData, duplicateIds, showDuplicatesOnly]);
+    const visibleData = useMemo(() => effectiveList.slice(0, visibleCount), [effectiveList, visibleCount]);
+    const hasMore = visibleCount < effectiveList.length;
 
     const summary = useMemo(() => {
         const normalizeType = (type: any) => String(type || '').toUpperCase();
-        const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + (Number(r.amountIncludingVAT || (r as any).totalWithVat || r.amount) || 0), 0);
+        const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + displayAmount(r), 0);
+        const isOpeningBalance = (r: Transaction) =>
+            r.borrowingType === 'OPENING_BALANCE' ||
+            (r as any).isOwnerOpeningBalance === true ||
+            r.expenseCategory === 'Owner Opening Balance';
+
+        // Match listData: when any list filter is active, KPI totals should reflect the same rows as the table (category, type, search, etc.).
+        const isDefaultListFilter =
+            filterType === 'ALL' &&
+            filterMethod === 'ALL' &&
+            filterStatus === 'ALL' &&
+            filterCategory === 'ALL' &&
+            filterBuildingIds.length === 0 &&
+            filterBankName === 'ALL' &&
+            filterCustomer === 'ALL' &&
+            filterEmployee === 'ALL' &&
+            filterOwner === 'ALL' &&
+            !filterUnit &&
+            !filterDateFrom &&
+            !filterDateTo &&
+            !filterTillDate &&
+            !searchTerm &&
+            filterVat === 'ALL';
+
+        // When filters are active, ONLY movement totals (income/expense + VAT/cheques) should change.
+        // Opening/net balances should remain true ledger balances for the period.
+        const movementOverride = !isDefaultListFilter
+            ? (() => {
+                const hasDateFilterLocal = !!(filterDateFrom || filterDateTo || filterTillDate);
+                const effectiveFromLocal = filterDateFrom || '';
+                const effectiveToLocal = filterTillDate || filterDateTo || '9999-12-31';
+                const approvedFromList = filteredData.filter(t => {
+                    if ((t as any).deleted) return false;
+                    if (t.paymentMethod === 'TREASURY_REVERSAL') return false;
+                    if ((t as any).source === 'treasury') {
+                        const ft = (t as any).fromType;
+                        const tt = (t as any).toType;
+                        if ((ft === 'OWNER' && tt === 'HEAD_OFFICE') || (ft === 'HEAD_OFFICE' && tt === 'OWNER')) return false;
+                    }
+                    const status = String(t.status || TransactionStatus.APPROVED).toUpperCase();
+                    return status === TransactionStatus.APPROVED || status === 'COMPLETED' || !t.status;
+                });
+                // Match visible table/PDF rows: with no date filter, KPI totals must sum ALL filtered rows (e.g. owner filter),
+                // not only the current calendar month — otherwise PDF summary cards disagree with the exported lines.
+                const periodList = hasDateFilterLocal
+                    ? approvedFromList.filter(t => t.date && t.date >= effectiveFromLocal && t.date <= effectiveToLocal)
+                    : approvedFromList.filter(t => !!t.date);
+                const incomeRowsF = periodList.filter(
+                    r => normalizeType(r.type) === TransactionType.INCOME && !isOpeningBalance(r)
+                );
+                const expenseRowsF = periodList.filter(
+                    r => normalizeType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r)
+                );
+                const cashIncomeBase = sumAmount(incomeRowsF.filter(r => transactionCountsAsCashForSplit(r)));
+                const bankIncomeBase = sumAmount(incomeRowsF.filter(r => transactionCountsAsBankForSplit(r)));
+                const incomeTotalBase = sumAmount(incomeRowsF);
+                const cashExpense = sumAmount(expenseRowsF.filter(r => transactionCountsAsCashForSplit(r)));
+                const bankExpenseTotal = sumAmount(expenseRowsF.filter(r => transactionCountsAsBankForSplit(r)));
+                const expenseTotal = sumAmount(expenseRowsF);
+                const chequeIncome = sumAmount(
+                    incomeRowsF.filter(
+                        r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'
+                    )
+                );
+                const chequeExpense = sumAmount(
+                    expenseRowsF.filter(
+                        r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'
+                    )
+                );
+                const totalOutputVAT =
+                    incomeRowsF.filter(r => !(r as any).isCreditNote).reduce((s, r) => s + Math.abs(Number(r.vatAmount) || 0), 0) -
+                    incomeRowsF.filter(r => (r as any).isCreditNote).reduce((s, r) => s + Math.abs(Number(r.vatAmount) || 0), 0);
+                const totalInputVAT = expenseRowsF.reduce((s, r) => s + Math.abs(Number(r.vatAmount) || 0), 0);
+                return {
+                    cashIncome: cashIncomeBase,
+                    bankIncome: bankIncomeBase,
+                    incomeTotal: incomeTotalBase,
+                    cashExpense,
+                    bankExpense: bankExpenseTotal,
+                    expenseTotal,
+                    chequeIncome,
+                    chequeExpense,
+                    chequeBalance: chequeIncome - chequeExpense,
+                    totalOutputVAT,
+                    totalInputVAT,
+                    netVATPayable: totalOutputVAT - totalInputVAT,
+                };
+            })()
+            : null;
 
         // Include configured opening balances from Settings (these are always part of the historical balance)
         // They are also displayed as synthetic rows in the list but not stored as transactions
         let settingsOpeningCash = 0, settingsOpeningBank = 0;
         Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
-            if (filterBuildingIds.length > 0 && !filterBuildingIds.includes(buildingId)) return;
+            if (filterBuildingIds.length > 0 && !filterBuildingIds.some(id => id !== NO_SOURCE_BUILDING_FILTER && id === buildingId)) return;
             settingsOpeningCash += Number((row as any).cash) || 0;
             settingsOpeningBank += Number((row as any).bank) || 0;
         });
@@ -1419,7 +2306,11 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         const effectiveDateTo = filterTillDate || filterDateTo || '9999-12-31';
 
         // Inject pseudo-transactions for existing Building→Owner transfers that lack a transaction record
-        const existingTreasuryIds = new Set(transactions.filter(t => (t as any).transferId).map(tx => (t as any).transferId));
+        const existingTreasuryIds = new Set(
+            transactions
+                .filter((t: any) => (t as any).transferId)
+                .map((t: any) => String((t as any).transferId)),
+        );
         const buildingOwnerPseudoBal = (transfers || []).filter((tr: any) =>
             ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
             && !tr.deleted && !existingTreasuryIds.has(tr.id)
@@ -1503,17 +2394,18 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 const ownerCat = (t.expenseCategory || '').trim();
                 if (ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal') {
                   const bId = String((t as any).buildingId || '');
-                  return !!bId && filterBuildingIds.includes(bId);
+                  if (!bId) return filterBuildingIds.includes(NO_SOURCE_BUILDING_FILTER);
+                  return filterBuildingIds.includes(bId);
                 }
                 return filterBuildingIds.some(id => matchTransactionBuilding(t, id));
               })
             : approved;
 
-        // Opening balance is always through the last day of the previous month
+        // Opening = cumulative balance strictly before the report window (last month's closing when viewing a full month from the 1st).
         const _now = new Date();
         const _currentMonthStart = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-01`;
         const openingCutoff = hasDateFilter
-            ? effectiveDateFrom.substring(0, 8) + '01'
+            ? (filterDateFrom || _currentMonthStart)
             : _currentMonthStart;
 
         // Period transactions: filtered range when date filter is set, current month when not
@@ -1523,10 +2415,6 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
         // Exclude ALL borrowing opening balances from totals (tracked separately in BorrowingTracker/OwnerPortal)
         // Also exclude Owner Opening Balance (tracked separately)
-        const isOpeningBalance = (r: Transaction) => 
-            r.borrowingType === 'OPENING_BALANCE' || 
-            (r as any).isOwnerOpeningBalance === true ||
-            r.expenseCategory === 'Owner Opening Balance';
         const incomeRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
         // Include ALL expenses (regular + owner) for accurate totals
         const expenseRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
@@ -1534,24 +2422,18 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         // ownerExpenseTotal kept as 0 (owner expenses now merged into main expenseTotal)
         const ownerExpenseTotal = 0;
 
-        // Payment method breakdown (for display only — CASH/TREASURY = cash, BANK/CHEQUE = bank)
-        // Effective method = user-chosen method, falling back to stored paymentMethod.
-        // For treasury transfers we stamp paymentMethod='TREASURY' internally but keep the
-        // user's real choice (CASH/BANK/CHEQUE) in originalPaymentMethod — so a BANK→BANK
-        // treasury transfer is classified under Bank, not Cash.
-        const effMethod = (r: any) => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase();
-        const cashIncomeBase = sumAmount(incomeRows.filter(r => { const m = effMethod(r); return m === 'CASH' || m === 'TREASURY'; }));
-        const bankIncomeBase = sumAmount(incomeRows.filter(r => { const m = effMethod(r); return m === 'BANK' || m === 'CHEQUE'; }));
+        const cashIncomeBase = sumAmount(incomeRows.filter(r => transactionCountsAsCashForSplit(r)));
+        const bankIncomeBase = sumAmount(incomeRows.filter(r => transactionCountsAsBankForSplit(r)));
         // Totals include ALL rows regardless of payment method (avoids missing transactions with unknown/null payment method)
         const incomeTotalBase = sumAmount(incomeRows);
 
-        const cashExpense = sumAmount(expenseRows.filter(r => { const m = effMethod(r); return m === 'CASH' || m === 'TREASURY'; }));
-        const bankExpenseTotal = sumAmount(expenseRows.filter(r => { const m = effMethod(r); return m === 'BANK' || m === 'CHEQUE'; }));
+        const cashExpense = sumAmount(expenseRows.filter(r => transactionCountsAsCashForSplit(r)));
+        const bankExpenseTotal = sumAmount(expenseRows.filter(r => transactionCountsAsBankForSplit(r)));
         const expenseTotal = sumAmount(expenseRows); // ALL expenses, not just cash+bank subset
 
         // Cheque sub-totals (for separate display if needed)
-        const chequeIncome = sumAmount(incomeRows.filter(r => effMethod(r) === 'CHEQUE'));
-        const chequeExpense = sumAmount(expenseRows.filter(r => effMethod(r) === 'CHEQUE'));
+        const chequeIncome = sumAmount(incomeRows.filter(r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'));
+        const chequeExpense = sumAmount(expenseRows.filter(r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'));
 
         // Opening balance from transactions BEFORE the opening cutoff (last day of previous month)
         let openingCash = 0, openingBank = 0, openingAll = 0;
@@ -1562,15 +2444,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             // Skip borrowing opening balance entries (tracked separately in BorrowingTracker/OwnerPortal)
             if (isOpeningBalance(t)) continue;
             // Include owner expenses in opening balance (they represent real cash outflows)
-            const amt = Number(t.amount) || 0;
+            const amt = Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
             const isIncome = normalizeType(t.type) === TransactionType.INCOME;
-            const effM = String((t as any).originalPaymentMethod || t.paymentMethod || '').toUpperCase();
-            const isCash = effM === 'CASH' || effM === 'TREASURY';
-            const isBank = effM === 'BANK' || effM === 'CHEQUE';
             const netAmt = isIncome ? amt : -amt;
             openingAll += netAmt;
-            if (isCash) openingCash += netAmt;
-            else if (isBank) openingBank += netAmt;
+            if (transactionCountsAsCashForSplit(t)) openingCash += netAmt;
+            else if (transactionCountsAsBankForSplit(t)) openingBank += netAmt;
         }
 
         // Closing balances (payment method breakdown)
@@ -1579,7 +2458,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         // True net: include ALL transactions + settings opening balance regardless of payment method
         const totalNet = openingAll + settingsOpeningAll + incomeTotalBase - expenseTotal;
 
-        return {
+        const base = {
             openingCash: openingCash + settingsOpeningCash,
             openingBank: openingBank + settingsOpeningBank,
             openingTotal: openingAll + settingsOpeningAll,
@@ -1600,7 +2479,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             totalInputVAT: expenseRows.reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
             netVATPayable: (incomeRows.filter(r => !(r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0) - incomeRows.filter(r => (r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0)) - expenseRows.reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
         };
-    }, [transactions, filterBuildingIds, filterDateFrom, filterDateTo, filterTillDate, matchTransactionBuilding, transfers, openingBalancesByBuilding]);
+        if (!movementOverride) return base;
+        return { ...base, ...movementOverride };
+    }, [filteredData, transactions, filterBuildingIds, filterDateFrom, filterDateTo, filterTillDate, matchTransactionBuilding, transfers, openingBalancesByBuilding, filterType, filterMethod, filterStatus, filterCategory, filterBankName, filterCustomer, filterEmployee, filterOwner, filterUnit, searchTerm, filterVat]);
 
     // CSV Export
     const handleExportCSV = () => {
@@ -1614,8 +2495,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 const bName = getBuildingName(tx.buildingId || (tx as any).building) || tx.buildingName || '';
                 details = `Sale to ${custName || custId || '-'}${bName ? '  -  ' + bName : ''}`;
             }
-            const income = tx.type === TransactionType.INCOME ? tx.amount : '';
-            const expense = tx.type === TransactionType.EXPENSE ? tx.amount : '';
+            const shown = displayAmount(tx as any);
+            const income = tx.type === TransactionType.INCOME ? shown : '';
+            const expense = tx.type === TransactionType.EXPENSE ? shown : '';
             return [tx.date, tx.type, income, expense, tx.expenseCategory || 'Rent', getBuildingName(tx.buildingId || (tx as any).building) || tx.buildingName || '-', tx.unitNumber || '-', details, tx.status || 'APPROVED', tx.createdByName];
         });
         
@@ -1636,6 +2518,35 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                         // Determine report type
                         const isIncomeReport = filterType === 'INCOME';
                         const isExpenseReport = filterType === 'EXPENSE';
+            const catTrim = String(filterCategory || '').trim();
+            const catLc = catTrim.toLowerCase();
+            const isOwnerExpensePdf =
+                filterCategory !== 'ALL' &&
+                (
+                    filterCategory === ExpenseCategory.OWNER_EXPENSE ||
+                    catTrim === 'Owner Profit Withdrawal' ||
+                    catLc === 'owner profit withdrawal' ||
+                    catLc === 'owner_expense' ||
+                    catLc === 'owner expense'
+                );
+
+            let pdfListedIncomeSum = 0;
+            let pdfListedExpenseSum = 0;
+            if (isOwnerExpensePdf) {
+                listData.forEach((r) => {
+                    if ((r as any).deleted) return;
+                    const shown = displayAmount(r as any);
+                    const ty = String(r.type || '').toUpperCase();
+                    if (ty === TransactionType.INCOME) pdfListedIncomeSum += shown;
+                    else if (ty === TransactionType.EXPENSE) pdfListedExpenseSum += shown;
+                });
+            }
+            const pdfListedNetTotal = pdfListedExpenseSum - pdfListedIncomeSum;
+            const ownerPdfSubtitle =
+                filterOwner !== 'ALL'
+                    ? (owners.find((o) => o.id === filterOwner)?.name || '').trim()
+                    : '';
+
             // Initialize summary values before usage
             const incomeTotal = summary.incomeTotal;
             const expenseTotal = summary.expenseTotal;
@@ -1653,7 +2564,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
             // PDF Export (preview window). Opens a styled preview with filters summary and table; user can Save as PDF via browser print.
             // ...existing code...
-                const title = 'Transactions Report';
+                const title = isOwnerExpensePdf ? String(t('reports.tab.ownerExpense')) : 'Transactions Report';
                                 const filters: string[] = [];
                                 if (filterDateFrom) filters.push(`From: ${filterDateFrom}`);
                                 if (filterDateTo) filters.push(`To: ${filterDateTo}`);
@@ -1679,8 +2590,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                 if ((r as any).source === 'treasury') {
                                     details = getTreasuryLabel(r);
                                 }
-                                const income = r.type === 'INCOME' ? Number(r.amount) : 0;
-                                const expense = r.type === 'EXPENSE' ? Number(r.amount) : 0;
+                                const shown = displayAmount(r as any);
+                                const income = r.type === 'INCOME' ? shown : 0;
+                                const expense = r.type === 'EXPENSE' ? shown : 0;
                                 return `<tr>
                                     <td>${fmtDate(r.date)}</td>
                                     <td><span class="type-badge ${r.type === 'INCOME' ? 'income' : 'expense'}">${r.type}</span></td>
@@ -1691,9 +2603,46 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                 </tr>`;
                             }).join('\n');
 
-                    // ...existing code...
-                    // ...existing code...
-                    // ...existing code...
+            const escPdf = (s: string) =>
+                String(s ?? '')
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;');
+
+            const rhSubHtml = isOwnerExpensePdf
+                ? `${ownerPdfSubtitle ? escPdf(ownerPdfSubtitle) + ' · ' : ''}${escPdf(catTrim)} · Arar Millennium Company Ltd`
+                : 'Arar Millennium Company Ltd &bull;  -  -  -  -  -   -  -  -  -  -  -  -  -  - ';
+
+            const pdfSummaryCardsHtml =
+                !isOwnerExpensePdf
+                    ? `
+                                                    <!-- Opening Balance Row -->
+                                                    <div class="summary-grid-6">
+                                                      <div class="line-card" style="border-left:3px solid #f59e0b"><div class="label">Opening Cash</div><div class="value" style="color:#b45309">${summary.openingCash.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card" style="border-left:3px solid #f59e0b"><div class="label">Opening Bank</div><div class="value" style="color:#b45309">${summary.openingBank.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card" style="border-left:3px solid #eab308"><div class="label">Total Opening</div><div class="value" style="color:#a16207">${summary.openingTotal.toLocaleString()} SAR</div></div>
+                                                    </div>
+                                                    ${!isExpenseReport ? `<div class="summary-grid-6">
+                                                      <div class="line-card"><div class="label">${t('history.cashIncome')}</div><div class="value" style="color:var(--income)">${cashIncome.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card"><div class="label">${t('history.bankIncome')}</div><div class="value" style="color:var(--income)">${bankIncome.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card"><div class="label">${t('dashboard.totalIncome')}</div><div class="value" style="color:var(--income)">${incomeTotal.toLocaleString()} SAR</div></div>
+                                                    </div>` : ''}
+                                                    ${!isIncomeReport ? `<div class="summary-grid-6">
+                                                      <div class="line-card"><div class="label">${t('history.cashExpense')}</div><div class="value" style="color:var(--expense)">${cashExpense.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card"><div class="label">${t('history.bankExpense')}</div><div class="value" style="color:var(--expense)">${bankExpense.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card"><div class="label">Total Expense</div><div class="value" style="color:var(--expense)">${expenseTotal.toLocaleString()} SAR</div></div>
+                                                    </div>` : ''}
+                                                    ${!(isIncomeReport || isExpenseReport) ? `<div class="summary-grid-6">
+                                                      <div class="line-card" style="border-left:3px solid var(--income)"><div class="label">Cash Balance</div><div class="value" style="color:var(--income)">${cashBalance.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card" style="border-left:3px solid #06b6d4"><div class="label">Bank Balance</div><div class="value" style="color:#0891b2">${bankBalance.toLocaleString()} SAR</div></div>
+                                                      <div class="line-card" style="border-left:3px solid #6366f1"><div class="label">Net Balance</div><div class="value" style="color:#4f46e5">${totalNetBalance.toLocaleString()} SAR</div></div>
+                                                    </div>` : ''}`
+                    : '';
+
+            const pdfOwnerExpenseTotalHtml = isOwnerExpensePdf
+                ? `<div class="pdf-listed-total">${escPdf(String(t('common.total')))}: ${pdfListedNetTotal.toLocaleString()} SAR</div>`
+                : '';
 
                                 const html = `
                                         <html>
@@ -1759,6 +2708,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                                     .amlak-badge img { width:14px; height:14px; object-fit:contain; border-radius:50%; }
                                                     .footer-copy { font-size:8px; color:var(--text-light); letter-spacing:1px; }
 
+                                                    .pdf-listed-total { margin-top:16px; padding:14px 18px; border-radius:12px; border:2px solid var(--border); background:#fff; text-align:right; font-size:16px; font-weight:800; color:var(--expense); letter-spacing:.02em; }
+
                                                     /* Optimize for ultra-narrow screens (395px) */
                                                     @media (max-width: 420px) {
                                                       .page { padding: 16px !important; margin: 20px auto !important; }
@@ -1784,14 +2735,14 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                             </head>
                                             <body>
                                                 <div class="page">
-                                                    <img src="${window.location.origin}/images/logo.png" class="watermark" />
+                                                    <img src="${window.location.origin}/images/cologo.png" class="watermark" />
 
                                                     <div class="report-header">
                                                         <div class="rh-left">
                                                             <div class="rh-logo"><img src="${window.location.origin}/images/cologo.png" alt="Logo" /></div>
                                                             <div>
-                                                                <div class="rh-title">Transactions Report</div>
-                                                                <div class="rh-sub">Arar Millennium Company Ltd &bull;  -  -  -  -  -   -  -  -  -  -  -  -  -  - </div>
+                                                                <div class="rh-title">${title}</div>
+                                                                <div class="rh-sub">${rhSubHtml}</div>
                                                             </div>
                                                         </div>
                                                         <div class="rh-right">
@@ -1800,30 +2751,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                                         </div>
                                                     </div>
                                                     <!-- Filter bar removed as per user request -->
-                                                    <!-- Opening Balance Row -->
-                                                    <div class="summary-grid-6">
-                                                      <div class="line-card" style="border-left:3px solid #f59e0b"><div class="label">Opening Cash</div><div class="value" style="color:#b45309">${summary.openingCash.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card" style="border-left:3px solid #f59e0b"><div class="label">Opening Bank</div><div class="value" style="color:#b45309">${summary.openingBank.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card" style="border-left:3px solid #eab308"><div class="label">Total Opening</div><div class="value" style="color:#a16207">${summary.openingTotal.toLocaleString()} SAR</div></div>
-                                                    </div>
-                                                    <!-- Income Row -->
-                                                    ${!isExpenseReport ? `<div class="summary-grid-6">
-                                                      <div class="line-card"><div class="label">${t('history.cashIncome')}</div><div class="value" style="color:var(--income)">${cashIncome.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card"><div class="label">${t('history.bankIncome')}</div><div class="value" style="color:var(--income)">${bankIncome.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card"><div class="label">${t('dashboard.totalIncome')}</div><div class="value" style="color:var(--income)">${incomeTotal.toLocaleString()} SAR</div></div>
-                                                    </div>` : ''}
-                                                    <!-- Expense Row -->
-                                                    ${!isIncomeReport ? `<div class="summary-grid-6">
-                                                      <div class="line-card"><div class="label">${t('history.cashExpense')}</div><div class="value" style="color:var(--expense)">${cashExpense.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card"><div class="label">${t('history.bankExpense')}</div><div class="value" style="color:var(--expense)">${bankExpense.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card"><div class="label">Total Expense</div><div class="value" style="color:var(--expense)">${expenseTotal.toLocaleString()} SAR</div></div>
-                                                    </div>` : ''}
-                                                    <!-- Closing Balance Row -->
-                                                    ${!(isIncomeReport || isExpenseReport) ? `<div class="summary-grid-6">
-                                                      <div class="line-card" style="border-left:3px solid var(--income)"><div class="label">Cash Balance</div><div class="value" style="color:var(--income)">${cashBalance.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card" style="border-left:3px solid #06b6d4"><div class="label">Bank Balance</div><div class="value" style="color:#0891b2">${bankBalance.toLocaleString()} SAR</div></div>
-                                                      <div class="line-card" style="border-left:3px solid #6366f1"><div class="label">Net Balance</div><div class="value" style="color:#4f46e5">${totalNetBalance.toLocaleString()} SAR</div></div>
-                                                    </div>` : ''}
+                                                    ${pdfSummaryCardsHtml}
 
                                                     <table>
                                                         <thead>
@@ -1841,12 +2769,14 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                                         </tbody>
                                                     </table>
 
+                                                    ${pdfOwnerExpenseTotalHtml}
+
                                                     <div class="meta-footer">
                                                         <div>
                                                             <span>This is a computer-generated report &bull;  -  -  -   -  -  -  -  -  -  -   -  -  -  -   -  -  -  -  -  -  -  -  -  - </span><br/>
                                                             <span class="footer-copy">Arar Millennium Company Ltd &copy; ${new Date().getFullYear()}</span>
                                                         </div>
-                                                        <span class="amlak-badge"><img src="${window.location.origin}/images/logo.png" alt="" /> Powered by Amlak</span>
+                                                        <span class="amlak-badge"><img src="${window.location.origin}/images/cologo.png" alt="" /> Powered by Amlak</span>
                                                     </div>
                                                 </div>
                                                 <script>window.onload=function(){setTimeout(function(){var imgs=document.images,c=0,t=imgs.length;if(!t){window.print();return}for(var i=0;i<t;i++){if(imgs[i].complete){if(++c>=t)window.print()}else{imgs[i].onload=imgs[i].onerror=function(){if(++c>=t)window.print()}}}},200);}</script>
@@ -1907,70 +2837,157 @@ const canDelete = useCallback((tx: Transaction) => {
         // Admins and Managers can always delete
         if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) return true;
         // Staff can delete their own transactions within 30 days
-        if (t.createdBy === currentUser.id) {
-            const diff = Date.now() - (t.createdAt || 0);
+        if (tx.createdBy === currentUser.id) {
+            const diff = Date.now() - (tx.createdAt || 0);
             return diff < (30 * 24 * 60 * 60 * 1000);
         }
         return false;
     }, [currentUser.role, currentUser.id]);
 
     return (
-        <div className="mobile-tab-shell tab-history px-1 sm:px-2 pt-2 animate-fade-in">
-            <div className="premium-card tab-history-frame flex flex-col h-[calc(100vh-140px)] overflow-hidden">
+        <div
+            ref={historyShellRef}
+            className="mobile-tab-shell tab-history w-full max-w-full min-w-0 px-1 sm:px-2 pt-2 pb-4 sm:pb-6 animate-fade-in overflow-x-hidden"
+        >
+            <div className="premium-card tab-history-frame flex min-h-0 min-w-0 flex-col overflow-x-hidden rounded-2xl shadow-sm h-auto md:h-[calc(100vh-140px)] md:overflow-hidden">
                 {/* Header */}
-                <div className="relative p-3 sm:p-4 border-b border-slate-200/70 rounded-t-2xl space-y-3 shrink-0 bg-gradient-to-br from-white via-violet-50/40 to-indigo-50/30">
+                <div className="relative z-40 p-3 sm:p-4 border-b border-slate-200/70 rounded-t-2xl space-y-3 shrink-0 bg-gradient-to-br from-white via-violet-50/40 to-indigo-50/30">
                     <div className="pointer-events-none absolute -top-12 -right-16 w-56 h-56 rounded-full bg-violet-200/30 blur-3xl" />
-                    <div className="relative flex flex-col sm:flex-row gap-3 sm:gap-4 justify-between items-stretch sm:items-center">
-                        <div className="flex items-center gap-3 shrink-0">
-                            <button onClick={loadData} title={t('common.refresh') || 'Refresh'} className="w-9 h-9 rounded-xl bg-white border border-violet-200 text-violet-600 flex items-center justify-center shadow-sm hover:bg-violet-50 hover:rotate-180 transition-all">
+                    <div className="relative flex flex-col gap-3 sm:flex-row sm:gap-4 justify-between items-stretch sm:items-center">
+                        <div className="flex items-center gap-3 shrink-0 min-w-0">
+                            <button onClick={loadData} title={t('common.refresh') || 'Refresh'} className="w-9 h-9 shrink-0 rounded-xl bg-white border border-violet-200 text-violet-600 flex items-center justify-center shadow-sm hover:bg-violet-50 hover:rotate-180 transition-all">
                                 <RefreshCcw size={16} />
                             </button>
-                            <div>
+                            <div className="min-w-0">
                                 <h2 className="text-base sm:text-xl font-black text-slate-900 leading-tight tracking-tight">{t('history.transactions')}</h2>
-                                <p className="hidden sm:block text-[11px] text-slate-500 font-medium">{listData.length.toLocaleString()} {listData.length === 1 ? 'record' : 'records'} · {summary.incomeTotal.toLocaleString()} in · {summary.expenseTotal.toLocaleString()} out</p>
+                                <p className="sm:hidden text-[10px] text-slate-500 font-semibold truncate">{effectiveList.length.toLocaleString()} {effectiveList.length === 1 ? 'record' : 'records'}{showDuplicatesOnly ? ` (${t('history.findDuplicates') || 'duplicates'})` : ''}</p>
+                                <p className="hidden sm:block text-[11px] text-slate-500 font-medium">{effectiveList.length.toLocaleString()} {effectiveList.length === 1 ? 'record' : 'records'}{showDuplicatesOnly ? ` (${t('history.findDuplicates') || 'duplicates'})` : ''} · {summary.incomeTotal.toLocaleString()} in · {summary.expenseTotal.toLocaleString()} out</p>
                             </div>
                         </div>
 
-                        <div className="flex flex-wrap gap-1.5 sm:gap-2 items-center w-full sm:w-auto">
-                            <div className="relative form-with-icon group flex-1 min-w-0 sm:min-w-[220px]">
+                        <div className="flex flex-col gap-2 w-full min-w-0 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2 sm:w-auto">
+                            <div className="relative form-with-icon group w-full sm:flex-1 sm:min-w-[220px] min-w-0">
                                 <Search className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 group-focus-within:text-violet-500 transition-colors" size={15} />
                                 <input type="text" placeholder={t('history.searchDetails')} value={searchInput} onChange={e => setSearchInput(e.target.value)}
-                                    className="pl-9 pr-3 py-2 bg-white/90 backdrop-blur border border-slate-200 rounded-xl text-xs sm:text-sm focus:ring-2 focus:ring-violet-400 focus:border-violet-300 outline-none w-full xl:w-72 shadow-sm"
+                                    className="pl-9 pr-3 py-2.5 sm:py-2 bg-white/90 backdrop-blur border border-slate-200 rounded-xl text-sm sm:text-sm focus:ring-2 focus:ring-violet-400 focus:border-violet-300 outline-none w-full xl:w-72 shadow-sm min-h-[44px] sm:min-h-0"
                                 />
                             </div>
 
-                            <button onClick={() => setShowFilters(!showFilters)} className={`flex items-center gap-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold transition-all border shadow-sm ${showFilters ? 'bg-violet-600 text-white border-violet-600 hover:bg-violet-700' : 'bg-white text-slate-700 border-slate-200 hover:border-violet-200 hover:text-violet-700'}`}>
-                                <SlidersHorizontal size={14} /> <span className="hidden xs:inline">{t('common.filter')}</span>
+                            <div className="flex w-full min-w-0 flex-wrap gap-2 sm:flex-nowrap sm:items-center sm:gap-1.5 sm:overflow-x-auto sm:pb-0.5 sm:[scrollbar-width:thin]">
+                            <button onClick={() => setShowFilters(!showFilters)} className={`shrink-0 snap-start flex items-center gap-1.5 px-3 sm:px-3.5 py-2.5 sm:py-2 rounded-xl text-xs sm:text-sm font-bold transition-all border shadow-sm min-h-[44px] sm:min-h-0 ${showFilters ? 'bg-violet-600 text-white border-violet-600 hover:bg-violet-700' : 'bg-white text-slate-700 border-slate-200 hover:border-violet-200 hover:text-violet-700'}`}>
+                                <SlidersHorizontal size={14} /> <span className="hidden min-[380px]:inline">{t('common.filter')}</span>
                             </button>
 
-                            <button onClick={handleExportCSV} title="Export CSV" className="flex items-center gap-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold bg-white text-emerald-700 border border-emerald-200 hover:bg-emerald-50 transition-all shadow-sm">
+                            <button
+                                ref={monthFilterTriggerRef}
+                                type="button"
+                                onClick={() => setShowMonthFilterDropdown(v => !v)}
+                                className={`shrink-0 snap-start flex items-center gap-1.5 min-w-0 max-w-[min(200px,42vw)] sm:max-w-[240px] px-3 sm:px-3.5 py-2.5 sm:py-2 rounded-xl text-xs sm:text-sm font-bold transition-all border shadow-sm min-h-[44px] sm:min-h-0 ${
+                                    showMonthFilterDropdown || activeHistoryMonthKey
+                                        ? 'bg-indigo-50 text-indigo-900 border-indigo-200 ring-1 ring-indigo-100'
+                                        : 'bg-white text-slate-700 border-slate-200 hover:border-violet-200 hover:text-violet-700'
+                                }`}
+                                title={t('history.browseByMonth')}
+                            >
+                                <Calendar size={14} className="shrink-0 text-violet-600" />
+                                <span className="truncate font-semibold">{monthFilterTriggerLabel}</span>
+                                <ChevronDown size={14} className={`shrink-0 text-slate-400 transition-transform ${showMonthFilterDropdown ? 'rotate-180 text-violet-600' : ''}`} />
+                            </button>
+
+                            <button onClick={handleExportCSV} title="Export CSV" className="shrink-0 snap-start flex items-center justify-center gap-1.5 px-3 sm:px-3.5 py-2.5 sm:py-2 rounded-xl text-xs sm:text-sm font-bold bg-white text-emerald-700 border border-emerald-200 hover:bg-emerald-50 transition-all shadow-sm min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0">
                                 <Download size={14} />
                             </button>
-                            <button onClick={() => handleExportPDF()} title="Export PDF" className="flex items-center gap-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold bg-gradient-to-r from-violet-600 to-indigo-600 text-white hover:from-violet-700 hover:to-indigo-700 transition-all shadow-sm shadow-violet-200">
+                            <button onClick={() => handleExportPDF()} title="Export PDF" className="shrink-0 snap-start flex items-center justify-center gap-1.5 px-3 sm:px-3.5 py-2.5 sm:py-2 rounded-xl text-xs sm:text-sm font-bold bg-gradient-to-r from-violet-600 to-indigo-600 text-white hover:from-violet-700 hover:to-indigo-700 transition-all shadow-sm shadow-violet-200 min-h-[44px] min-w-[44px] sm:min-h-0 sm:min-w-0">
                                 <Printer size={14} />
                             </button>
+                            <button
+                                onClick={() => setShowDuplicatesOnly(v => !v)}
+                                title={t('history.findDuplicates') || 'Find Duplicates'}
+                                className={`shrink-0 snap-start flex items-center gap-1.5 px-3 sm:px-3.5 py-2.5 sm:py-2 rounded-xl text-xs sm:text-sm font-bold transition-all border shadow-sm min-h-[44px] sm:min-h-0 ${
+                                    showDuplicatesOnly
+                                        ? 'bg-amber-500 text-white border-amber-500 hover:bg-amber-600 ring-2 ring-amber-200'
+                                        : 'bg-white text-amber-700 border-amber-200 hover:bg-amber-50 hover:border-amber-300'
+                                }`}
+                            >
+                                <Copy size={14} />
+                                <span className="hidden min-[480px]:inline">{showDuplicatesOnly ? (t('history.showAll') || 'Show All') : (t('history.findDuplicates') || 'Duplicates')}</span>
+                                {duplicateCount > 0 && (
+                                    <span className={`text-[10px] font-black px-1.5 py-0.5 rounded-full ${showDuplicatesOnly ? 'bg-white/30 text-white' : 'bg-amber-100 text-amber-800'}`}>{duplicateCount}</span>
+                                )}
+                            </button>
                             {currentUser.role === UserRole.ADMIN && (
-                                <div className="flex items-center gap-1.5">
+                                <div className="flex items-center gap-1.5 shrink-0">
                                     <button
                                         onClick={() => setShowDeleted(!showDeleted)}
-                                        className={`flex items-center gap-1.5 px-3 sm:px-3.5 py-2 rounded-xl text-xs sm:text-sm font-bold transition-all border shadow-sm ${showDeleted ? 'bg-rose-600 text-white border-rose-600 hover:bg-rose-700' : 'bg-white text-slate-700 border-slate-200 hover:border-rose-200 hover:text-rose-700'}`}
+                                        className={`flex items-center gap-1.5 px-3 sm:px-3.5 py-2.5 sm:py-2 rounded-xl text-xs sm:text-sm font-bold transition-all border shadow-sm min-h-[44px] sm:min-h-0 ${showDeleted ? 'bg-rose-600 text-white border-rose-600 hover:bg-rose-700' : 'bg-white text-slate-700 border-slate-200 hover:border-rose-200 hover:text-rose-700'}`}
                                     >
                                         <Trash2 size={14} /> <span className="hidden sm:inline">{showDeleted ? t('history.active') : t('history.trash', { count: transactions.filter(t => (t as any).deleted).length })}</span>
                                     </button>
                                     {showDeleted && (
                                         <>
-                                            <button onClick={handleRestoreAll} title={t('history.restoreAll') as string} className="px-3 py-2 rounded-xl text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 shadow-sm"><RotateCcw size={14} /></button>
-                                            <button onClick={handleDeleteAll} title={t('history.deleteAll') as string} className="px-3 py-2 rounded-xl text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 shadow-sm"><X size={14} /></button>
+                                            <button onClick={handleRestoreAll} title={t('history.restoreAll') as string} className="px-3 py-2.5 sm:py-2 rounded-xl text-xs font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100 shadow-sm min-h-[44px] sm:min-h-0 flex items-center justify-center"><RotateCcw size={14} /></button>
+                                            <button onClick={handleDeleteAll} title={t('history.deleteAll') as string} className="px-3 py-2.5 sm:py-2 rounded-xl text-xs font-bold bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100 shadow-sm min-h-[44px] sm:min-h-0 flex items-center justify-center"><X size={14} /></button>
                                         </>
                                     )}
                                 </div>
                             )}
+                            </div>
                         </div>
                     </div>
 
+                    {showMonthFilterDropdown && monthFilterRect && createPortal(
+                        <div
+                            ref={monthFilterPanelRef}
+                            style={{
+                                position: 'fixed',
+                                top: Math.min(monthFilterRect.top + 6, window.innerHeight - 320),
+                                left: Math.max(8, Math.min(monthFilterRect.left, window.innerWidth - Math.max(monthFilterRect.width, 260) - 8)),
+                                width: Math.max(monthFilterRect.width, 260),
+                                zIndex: 60000,
+                            }}
+                            className="rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden animate-slide-up"
+                        >
+                            <div className="flex items-center gap-2.5 px-3 py-2.5 bg-gradient-to-br from-violet-50 via-white to-indigo-50/80 border-b border-slate-100">
+                                <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-gradient-to-br from-violet-600 to-indigo-600 text-white shadow-sm">
+                                    <Calendar size={15} strokeWidth={2.2} />
+                                </span>
+                                <div className="min-w-0 flex-1">
+                                    <p className="text-lg font-black text-slate-900 leading-none tracking-tight">{monthFilterYear}</p>
+                                    <p className="text-[10px] font-bold uppercase tracking-wide text-slate-500 mt-0.5">{t('history.monthPickerSubtitle')}</p>
+                                </div>
+                            </div>
+                            <div className="max-h-[min(380px,calc(100vh-180px))] overflow-y-auto overscroll-contain py-1.5 px-1.5 [scrollbar-width:thin]">
+                                {monthFilterOptions.map(ym => {
+                                    const active = activeHistoryMonthKey === ym;
+                                    return (
+                                        <button
+                                            key={ym}
+                                            type="button"
+                                            onClick={() => {
+                                                const { from, to } = getCalendarMonthBounds(ym);
+                                                setFilterDateFrom(from);
+                                                setFilterDateTo(to);
+                                                setFilterTillDate('');
+                                                setShowMonthFilterDropdown(false);
+                                            }}
+                                            className={`flex w-full items-center rounded-xl px-3 py-2.5 text-left text-sm font-semibold transition-colors ${
+                                                active
+                                                    ? 'bg-gradient-to-r from-violet-600 to-indigo-600 text-white shadow-sm'
+                                                    : 'text-slate-700 hover:bg-violet-50'
+                                            }`}
+                                        >
+                                            {formatMonthNameOnly(ym)}
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </div>,
+                        document.body,
+                    )}
+
                     {/* Advanced Filters */}
                     {showFilters && (
-                        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 xl:grid-cols-6 gap-1.5 sm:gap-2 pt-2 animate-slide-up">
+                        <div className="relative z-50 isolate mt-1 grid animate-slide-up grid-cols-1 gap-3 rounded-xl border border-violet-200/70 bg-white/90 p-3 shadow-sm backdrop-blur-sm min-[480px]:grid-cols-2 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-6 sm:gap-2 sm:p-3">
                             <div>
                                 <label className="text-[10px] font-bold text-slate-500 uppercase">{t('history.fromDate')}</label>
                                 <input type="date" value={filterDateFrom} onChange={e => setFilterDateFrom(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs" />
@@ -1983,6 +3000,24 @@ const canDelete = useCallback((tx: Transaction) => {
                                 <label className="text-[10px] font-bold text-emerald-600 uppercase">{t('history.allTillDate')}</label>
                                 <input type="date" value={filterTillDate} onChange={e => setFilterTillDate(e.target.value)} className="w-full px-3 py-2 bg-white border border-emerald-300 rounded-lg text-xs" />
                             </div>
+                            <div className="col-span-1 flex flex-col gap-2 min-[480px]:col-span-2 sm:flex-row sm:items-end sm:col-span-2 md:col-span-1 xl:col-span-1">
+                                <button
+                                    type="button"
+                                    onClick={setThisMonth}
+                                    className="w-full px-3 py-2 rounded-lg text-xs font-black bg-violet-600 text-white hover:bg-violet-700 shadow-sm"
+                                    title="Set date range to current month"
+                                >
+                                    This Month
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => { setFilterDateFrom(''); setFilterDateTo(''); setFilterTillDate(''); }}
+                                    className="px-3 py-2 rounded-lg text-xs font-black bg-white text-slate-600 border border-slate-200 hover:bg-slate-50 shadow-sm"
+                                    title="Clear date filters"
+                                >
+                                    Clear
+                                </button>
+                            </div>
                             <div>
                                 <label className="text-[10px] font-bold text-slate-500 uppercase">{t('history.type')}</label>
                                 <select value={filterType} onChange={e => setFilterType(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs">
@@ -1994,13 +3029,19 @@ const canDelete = useCallback((tx: Transaction) => {
                             </div>
                             <div>
                                 <label className="text-[10px] font-bold text-slate-500 uppercase">{t('history.category')}</label>
-                                <select value={filterCategory} onChange={e => setFilterCategory(e.target.value)} className="w-full px-3 py-2 bg-white border border-slate-200 rounded-lg text-xs">
-                                    <option value="ALL">{t('history.allCategories')}</option>
-                                    <option value="Owner Expense">Owner Expense</option>
-                                    {(filterCategory === 'ALL' ? categoryOptions : categoryOptions.filter(c => c === filterCategory)).map(c => (
-                                        c !== 'Owner Expense' && <option key={c} value={c}>{c}</option>
-                                    ))}
-                                </select>
+                                <SearchableSelect
+                                    options={[
+                                        { value: 'ALL', label: t('history.allCategories') },
+                                        { value: 'Owner Expense', label: 'Owner Expense' },
+                                        ...categoryOptions
+                                            .filter(c => c && c !== 'Owner Expense')
+                                            .map(c => ({ value: c, label: c })),
+                                    ]}
+                                    value={filterCategory}
+                                    onChange={val => setFilterCategory(val || 'ALL')}
+                                    placeholder={t('history.allCategories')}
+                                    className="w-full !rounded-xl !shadow-sm !border-slate-200 hover:!border-violet-300 focus:!border-violet-400"
+                                />
                             </div>
                             <div className="relative">
                                 <label className="text-[10px] font-bold text-slate-500 uppercase">{t('history.building')}</label>
@@ -2018,9 +3059,9 @@ const canDelete = useCallback((tx: Transaction) => {
                                       {filterBuildingIds.length === 0
                                         ? t('history.allBuildings')
                                         : filterBuildingIds.length === 1
-                                        ? (buildingOptions.find(b => b.id === filterBuildingIds[0])?.name || '1 selected')
+                                        ? (buildingFilterOptions.find(b => b.id === filterBuildingIds[0])?.name || '1 selected')
                                         : filterBuildingIds.length <= 2
-                                        ? buildingOptions.filter(b => filterBuildingIds.includes(b.id)).map(b => b.name).join(', ')
+                                        ? buildingFilterOptions.filter(b => filterBuildingIds.includes(b.id)).map(b => b.name).join(', ')
                                         : `${filterBuildingIds.length} selected`}
                                     </span>
                                   </span>
@@ -2037,7 +3078,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                       top: Math.min(buildingPickerRect.top + 6, window.innerHeight - 380),
                                       left: Math.max(8, Math.min(buildingPickerRect.left, window.innerWidth - Math.max(buildingPickerRect.width, 280) - 8)),
                                       width: Math.max(buildingPickerRect.width, 280),
-                                      zIndex: 9999,
+                                      zIndex: 60000,
                                     }}
                                     className="rounded-2xl border border-slate-200 bg-white shadow-2xl overflow-hidden animate-slide-up">
                                     <div className="p-2.5 bg-gradient-to-br from-violet-50 to-white border-b border-slate-100 space-y-2">
@@ -2047,7 +3088,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                         </div>
                                         <div className="flex-1 min-w-0">
                                           <div className="text-xs font-black text-slate-800 tracking-tight">{t('history.building')}</div>
-                                          <div className="text-[10px] font-medium text-slate-500">{filterBuildingIds.length} of {buildingOptions.length} selected</div>
+                                          <div className="text-[10px] font-medium text-slate-500">{filterBuildingIds.length} of {buildingFilterOptions.length} selected</div>
                                         </div>
                                         <button
                                           type="button"
@@ -2072,7 +3113,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                       <div className="flex items-center gap-1.5">
                                         <button
                                           type="button"
-                                          onClick={() => setFilterBuildingIds(isAdminOrManager ? buildingOptions.map(b => b.id) : userBuildingIds)}
+                                          onClick={() => setFilterBuildingIds(isAdminOrManager ? buildingFilterOptions.map(b => b.id) : userBuildingIds)}
                                           className="flex-1 px-2 py-1 rounded-lg bg-white border border-violet-200 text-violet-700 text-[10px] font-black uppercase tracking-wide hover:bg-violet-50"
                                         >Select all</button>
                                         <button
@@ -2083,7 +3124,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                       </div>
                                     </div>
                                     <div className="max-h-56 overflow-y-auto overscroll-contain p-1.5">
-                                      {buildingOptions
+                                      {buildingFilterOptions
                                         .filter(b => !buildingPickerSearch || (b.name || '').toLowerCase().includes(buildingPickerSearch.toLowerCase()))
                                         .map(b => {
                                           const checked = filterBuildingIds.includes(b.id);
@@ -2103,10 +3144,13 @@ const canDelete = useCallback((tx: Transaction) => {
                                                 className="sr-only"
                                               />
                                               <span className={`text-xs truncate ${checked ? 'text-violet-800 font-bold' : 'text-slate-700 font-medium'}`}>{b.name}</span>
+                                              {(b as any).isNoSource && (
+                                                <span className="ml-auto shrink-0 rounded-full bg-amber-50 px-1.5 py-0.5 text-[9px] font-black uppercase tracking-wide text-amber-700 border border-amber-200">Missing</span>
+                                              )}
                                             </label>
                                           );
                                         })}
-                                      {buildingOptions.filter(b => !buildingPickerSearch || (b.name || '').toLowerCase().includes(buildingPickerSearch.toLowerCase())).length === 0 && (
+                                      {buildingFilterOptions.filter(b => !buildingPickerSearch || (b.name || '').toLowerCase().includes(buildingPickerSearch.toLowerCase())).length === 0 && (
                                         <div className="py-6 text-center text-[11px] font-medium text-slate-400">No buildings match “{buildingPickerSearch}”</div>
                                       )}
                                     </div>
@@ -2188,8 +3232,8 @@ const canDelete = useCallback((tx: Transaction) => {
                                     {banks.map(b => <option key={b.name} value={b.name}>{b.name}</option>)}
                                 </select>
                             </div>
-                                                        <div className="flex items-end gap-2">
-                                                                <button onClick={clearFilters} className="w-full py-2 bg-slate-100 text-slate-600 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors flex items-center justify-center gap-1">
+                                                        <div className="col-span-1 flex flex-col gap-2 min-[480px]:col-span-2 sm:col-span-2 sm:flex-row sm:items-end md:col-span-2 xl:col-span-2">
+                                                                <button onClick={clearFilters} className="w-full min-h-[44px] py-2.5 sm:py-2 bg-slate-100 text-slate-600 text-xs font-bold rounded-lg hover:bg-slate-200 transition-colors flex items-center justify-center gap-1">
                                                                     <X size={12} /> {t('common.reset')}
                                                                 </button>
                                                                 <SavedFilters
@@ -2206,43 +3250,43 @@ const canDelete = useCallback((tx: Transaction) => {
 
 
                 {/* Mobile Cards (small screens) */}
-                <div className="md:hidden flex-1 overflow-y-auto overscroll-contain p-2 space-y-2 animate-stagger">
-                    {/* Mobile KPI hero — 2×2 grid with cash/bank chip rows */}
-                    <div className="grid grid-cols-2 gap-2 mb-4">
-                        <div className="relative overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50 to-white p-3 shadow-sm">
-                            <div className="text-[9px] font-black uppercase tracking-[0.14em] text-amber-700 mb-1">{t('history.openingTotal')}</div>
-                            <div className="text-base font-black text-amber-900 leading-tight">{summary.openingTotal.toLocaleString()}<span className="text-[9px] font-bold text-amber-500 ml-1">{t('common.sar')}</span></div>
-                            <div className="mt-2 flex flex-wrap gap-1 text-[9px] font-bold">
+                <div className="md:hidden p-2.5 sm:p-2 space-y-2.5 animate-stagger min-w-0">
+                    {/* Mobile KPI — single column on very narrow screens */}
+                    <div className="grid grid-cols-1 min-[400px]:grid-cols-2 gap-2.5 mb-3">
+                        <div className="relative overflow-hidden rounded-2xl border border-amber-200/80 bg-gradient-to-br from-amber-50 to-white p-3.5 shadow-sm min-w-0">
+                            <div className="text-[10px] font-black uppercase tracking-[0.12em] text-amber-700 mb-1">{t('history.openingTotal')}</div>
+                            <div className="text-lg font-black text-amber-900 leading-tight tabular-nums">{summary.openingTotal.toLocaleString()}<span className="text-[10px] font-bold text-amber-600 ml-1">{t('common.sar')}</span></div>
+                            <div className="mt-2 flex flex-col min-[400px]:flex-row min-[400px]:flex-wrap gap-1 text-[10px] font-bold">
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-amber-200 text-amber-700">{t('history.openingCash')} {summary.openingCash.toLocaleString()}</span>
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-amber-200 text-amber-700">{t('history.openingBank')} {summary.openingBank.toLocaleString()}</span>
                             </div>
                         </div>
-                        <div className="relative overflow-hidden rounded-2xl border border-emerald-200/80 bg-gradient-to-br from-emerald-50 to-white p-3 shadow-sm">
-                            <div className="text-[9px] font-black uppercase tracking-[0.14em] text-emerald-700 mb-1">{t('history.totalIn')}</div>
-                            <div className="text-base font-black text-emerald-900 leading-tight">{summary.incomeTotal.toLocaleString()}<span className="text-[9px] font-bold text-emerald-500 ml-1">{t('common.sar')}</span></div>
-                            <div className="mt-2 flex flex-wrap gap-1 text-[9px] font-bold">
+                        <div className="relative overflow-hidden rounded-2xl border border-emerald-200/80 bg-gradient-to-br from-emerald-50 to-white p-3.5 shadow-sm min-w-0">
+                            <div className="text-[10px] font-black uppercase tracking-[0.12em] text-emerald-700 mb-1">{t('history.totalIn')}</div>
+                            <div className="text-lg font-black text-emerald-900 leading-tight tabular-nums">{summary.incomeTotal.toLocaleString()}<span className="text-[10px] font-bold text-emerald-600 ml-1">{t('common.sar')}</span></div>
+                            <div className="mt-2 flex flex-col min-[400px]:flex-row min-[400px]:flex-wrap gap-1 text-[10px] font-bold">
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-emerald-200 text-emerald-700">{t('history.cashIn')} {summary.cashIncome.toLocaleString()}</span>
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-emerald-200 text-emerald-700">{t('history.bankIn')} {summary.bankIncome.toLocaleString()}</span>
                             </div>
                         </div>
-                        <div className="relative overflow-hidden rounded-2xl border border-rose-200/80 bg-gradient-to-br from-rose-50 to-white p-3 shadow-sm">
-                            <div className="text-[9px] font-black uppercase tracking-[0.14em] text-rose-700 mb-1">{t('history.totalOut')}</div>
-                            <div className="text-base font-black text-rose-900 leading-tight">{summary.expenseTotal.toLocaleString()}<span className="text-[9px] font-bold text-rose-500 ml-1">{t('common.sar')}</span></div>
-                            <div className="mt-2 flex flex-wrap gap-1 text-[9px] font-bold">
+                        <div className="relative overflow-hidden rounded-2xl border border-rose-200/80 bg-gradient-to-br from-rose-50 to-white p-3.5 shadow-sm min-w-0">
+                            <div className="text-[10px] font-black uppercase tracking-[0.12em] text-rose-700 mb-1">{t('history.totalOut')}</div>
+                            <div className="text-lg font-black text-rose-900 leading-tight tabular-nums">{summary.expenseTotal.toLocaleString()}<span className="text-[10px] font-bold text-rose-600 ml-1">{t('common.sar')}</span></div>
+                            <div className="mt-2 flex flex-col min-[400px]:flex-row min-[400px]:flex-wrap gap-1 text-[10px] font-bold">
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-rose-200 text-rose-700">{t('history.cashOut')} {summary.cashExpense.toLocaleString()}</span>
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-rose-200 text-rose-700">{t('history.bankOut')} {summary.bankExpense.toLocaleString()}</span>
                             </div>
                         </div>
-                        <div className={`relative overflow-hidden rounded-2xl border p-3 shadow-sm ${summary.totalNet >= 0 ? 'border-indigo-200/80 bg-gradient-to-br from-indigo-50 to-white' : 'border-rose-300/80 bg-gradient-to-br from-rose-50 to-white'}`}>
-                            <div className={`text-[9px] font-black uppercase tracking-[0.14em] mb-1 ${summary.totalNet >= 0 ? 'text-indigo-700' : 'text-rose-700'}`}>{t('history.netBal')}</div>
-                            <div className={`text-base font-black leading-tight ${summary.totalNet >= 0 ? 'text-indigo-900' : 'text-rose-900'}`}>{summary.totalNet.toLocaleString()}<span className={`text-[9px] font-bold ml-1 ${summary.totalNet >= 0 ? 'text-indigo-500' : 'text-rose-500'}`}>{t('common.sar')}</span></div>
-                            <div className="mt-2 flex flex-wrap gap-1 text-[9px] font-bold">
+                        <div className={`relative overflow-hidden rounded-2xl border p-3.5 shadow-sm min-w-0 ${summary.totalNet >= 0 ? 'border-indigo-200/80 bg-gradient-to-br from-indigo-50 to-white' : 'border-rose-300/80 bg-gradient-to-br from-rose-50 to-white'}`}>
+                            <div className={`text-[10px] font-black uppercase tracking-[0.12em] mb-1 ${summary.totalNet >= 0 ? 'text-indigo-700' : 'text-rose-700'}`}>{t('history.netBal')}</div>
+                            <div className={`text-lg font-black leading-tight tabular-nums ${summary.totalNet >= 0 ? 'text-indigo-900' : 'text-rose-900'}`}>{summary.totalNet.toLocaleString()}<span className={`text-[10px] font-bold ml-1 ${summary.totalNet >= 0 ? 'text-indigo-600' : 'text-rose-600'}`}>{t('common.sar')}</span></div>
+                            <div className="mt-2 flex flex-col min-[400px]:flex-row min-[400px]:flex-wrap gap-1 text-[10px] font-bold">
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-emerald-200 text-emerald-700">{t('history.cashBal')} {summary.cashBalance.toLocaleString()}</span>
                                 <span className="px-1.5 py-0.5 rounded-full bg-white border border-cyan-200 text-cyan-700">{t('history.bankBal')} {summary.bankBalance.toLocaleString()}</span>
                             </div>
                         </div>
                         {summary.ownerExpenseTotal > 0 && (
-                            <div className="col-span-2 rounded-xl border border-orange-200/80 bg-gradient-to-r from-orange-50 via-white to-orange-50 px-3 py-2 flex items-center justify-between shadow-sm">
+                            <div className="col-span-1 min-[400px]:col-span-2 rounded-xl border border-orange-200/80 bg-gradient-to-r from-orange-50 via-white to-orange-50 px-3 py-2.5 flex flex-col min-[400px]:flex-row min-[400px]:items-center min-[400px]:justify-between gap-1 shadow-sm min-w-0">
                                 <span className="text-[10px] font-black uppercase tracking-[0.14em] text-orange-700">{t('history.ownerExpenses')}</span>
                                 <span className="text-sm font-black text-orange-800">{summary.ownerExpenseTotal.toLocaleString()} <span className="text-[9px] font-bold text-orange-500">{t('common.sar')}</span></span>
                             </div>
@@ -2267,26 +3311,36 @@ const canDelete = useCallback((tx: Transaction) => {
                         })();
                         const accent = row.type === TransactionType.INCOME ? 'before:bg-emerald-400' : row.type === TransactionType.EXPENSE ? 'before:bg-rose-400' : 'before:bg-slate-300';
                         return (
-                            <div key={row.id} className={`relative overflow-hidden bg-white rounded-2xl p-3 pl-4 space-y-1.5 border border-slate-100 shadow-sm hover:shadow-md transition-shadow before:content-[''] before:absolute before:inset-y-0 before:left-0 before:w-1 ${accent} ${showDeleted ? 'opacity-70' : ''}`}>
-                                <div className="flex items-center justify-between gap-2">
-                                    <div className="flex items-center gap-1.5">
-                                        <span className={`px-1.5 py-0.5 rounded text-[9px] font-black uppercase tracking-wide border ${
+                            <div
+                                key={row.id}
+                                onClick={(e) => {
+                                    const target = e.target as HTMLElement;
+                                    if (target.closest('button, a, input, select, textarea, label')) return;
+                                    openView(row);
+                                    emitHaptic('medium');
+                                }}
+                                className={`relative overflow-hidden bg-white rounded-2xl p-3.5 pl-4 space-y-2 border shadow-sm hover:shadow-md transition-shadow cursor-pointer active:scale-[0.995] before:content-[''] before:absolute before:inset-y-0 before:left-0 before:w-1 ${accent} ${showDeleted ? 'opacity-70' : ''} ${duplicateGroupMap.has(row.id) ? (duplicateGroupMap.get(row.id) + ' ring-1') : 'border-slate-100'}`}
+                            >
+                                <div className="flex flex-col gap-2 min-w-0">
+                                    <div className="flex flex-wrap items-center gap-1.5 min-w-0">
+                                        <span className={`px-1.5 py-0.5 rounded text-[10px] font-black uppercase tracking-wide border shrink-0 ${
                                             row.type === TransactionType.INCOME
                                                 ? 'bg-emerald-50 text-emerald-600 border-emerald-100'
                                                 : row.type === TransactionType.EXPENSE
                                                 ? 'bg-rose-50 text-rose-600 border-rose-100'
                                                 : 'bg-slate-100 text-slate-600 border-slate-200'
                                         }`}>{row.type}</span>
-                                        <span className="text-[9px] font-mono text-slate-500">{fmtDate(row.date)}</span>
-                                        {showDeleted && <span className="text-[9px] font-bold bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded">{t('history.deleted')}</span>}
+                                        <span className="text-[10px] font-mono text-slate-500 shrink-0">{fmtDate(row.date)}</span>
+                                        {showDeleted && <span className="text-[10px] font-bold bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded shrink-0">{t('history.deleted')}</span>}
+                                        {duplicateIds.has(row.id) && <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded shrink-0 border border-amber-200">{t('history.duplicate') || 'Duplicate'}</span>}
                                     </div>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex justify-end w-full min-w-0">
                                         {row.type === TransactionType.INCOME ? (
-                                            <div className={`amount-pill amount-income ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                            <div className={`amount-pill amount-income text-[0.9rem] sm:text-sm ${showDeleted ? 'line-through' : ''}`}><span className="amt-value tabular-nums">{displayAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                         ) : row.type === TransactionType.EXPENSE ? (
-                                            <div className={`amount-pill amount-expense ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                            <div className={`amount-pill amount-expense text-[0.9rem] sm:text-sm ${showDeleted ? 'line-through' : ''}`}><span className="amt-value tabular-nums">{displayAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                         ) : (
-                                            <div className="amount-pill amount-neutral"><span className="amt-value">-</span></div>
+                                            <div className="amount-pill amount-neutral text-[0.9rem] sm:text-sm"><span className="amt-value">-</span></div>
                                         )}
                                     </div>
                                 </div>
@@ -2309,12 +3363,17 @@ const canDelete = useCallback((tx: Transaction) => {
                                     )}
                                 </div>
 
-                                <div className="flex items-center justify-end gap-1 pt-1">
+                                <div className="flex items-center justify-end flex-wrap gap-1.5 pt-1.5 mt-1 border-t border-slate-100/70">
                                     {!(row as any).isOpeningBalance && row.type === TransactionType.INCOME && (
                                         <>
                                             <button onClick={() => handlePrintReceipt(row)} className="p-1.5 text-slate-400 hover:text-slate-800 bg-slate-50 rounded-md hover:bg-slate-200" title={t('common.print')}><Printer size={14}/></button>
                                             <button onClick={() => handleWhatsApp(row)} className="p-1.5 text-emerald-400 hover:text-emerald-600 bg-emerald-50 rounded-md hover:bg-emerald-100" title={t('nav.whatsapp')}><MessageCircle size={14}/></button>
                                         </>
+                                    )}
+                                    {!(row as any).isOpeningBalance && (
+                                        <button onClick={() => handlePrintPaymentVoucher(row)} className="p-1.5 text-teal-500 hover:text-teal-700 bg-teal-50 rounded-md hover:bg-teal-100 border border-teal-100" title="Payment Voucher">
+                                            <FileText size={14}/>
+                                        </button>
                                     )}
                                     {/* Edit Payment Method Button (mobile) */}
                                     {!(row as any).isOpeningBalance && (
@@ -2322,17 +3381,15 @@ const canDelete = useCallback((tx: Transaction) => {
                                             <Pencil size={14}/>
                                         </button>
                                     )}
-                                    {/* Convert to VAT (mobile) */}
-                                    {!(row as any).isOpeningBalance && !row.isVATApplicable && !showDeleted && (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) && (row.status !== TransactionStatus.REJECTED) && (
-                                        <button onClick={() => openVatModal(row)} className="p-1.5 text-violet-500 hover:text-violet-700 bg-violet-50 hover:bg-violet-100 rounded-md" title={row.type === TransactionType.INCOME ? 'Convert to VAT Sales (ZATCA)' : 'Convert to VAT Purchase'}>
-                                            <span className="text-[9px] font-black px-0.5">{t('history.vat')}</span>
+                                    {/* Admin, or staff for current-month tx on assigned building: full edit */}
+                                    {canOpenFullEntryEdit(row) && (
+                                        <button
+                                            onClick={() => handleFullEntryEditTransaction(row)}
+                                            className="p-1.5 text-violet-500 hover:text-violet-700 bg-violet-50 rounded-md hover:bg-violet-100 border border-violet-100"
+                                            title={canOpenAdminEdit(row) ? 'Admin: Edit all fields' : 'Edit all fields (current month)'}
+                                        >
+                                            <PenLine size={14}/>
                                         </button>
-                                    )}
-                                    {!(row as any).isOpeningBalance && row.isVATApplicable && row.vatInvoiceNumber && (
-                                        <button onClick={() => window.location.hash = `/invoice/${row.vatInvoiceNumber}`} className="p-1.5 text-blue-400 hover:text-blue-600 bg-blue-50 rounded-md hover:bg-blue-100" title={t('history.viewInvoice')}><FileText size={14}/></button>
-                                    )}
-                                    {!(row as any).isOpeningBalance && (
-                                        <button onClick={() => openView(row)} className="p-1.5 text-slate-400 hover:text-slate-800 bg-slate-50 rounded-md hover:bg-slate-200" title={t('history.viewMore')}><Eye size={14}/></button>
                                     )}
                                     {showDeleted ? (
                                         <>
@@ -2343,29 +3400,32 @@ const canDelete = useCallback((tx: Transaction) => {
                                         canDelete(row) ? (
                                             <button onClick={() => handleDeleteStart(row)} className="p-1.5 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-md transition-colors" title={row.isVATApplicable && row.type === TransactionType.INCOME ? 'Create Credit Note' : 'Move to Trash'}><Trash2 size={14}/></button>
                                         ) : (
-                                            <span className="p-1.5 text-slate-300" title={t('history.cannotDelete')}><AlertOctagon size={14} /></span>
+                                            <span className="p-1.5 text-slate-300 bg-slate-50 rounded-md border border-slate-200/70" title={t('history.cannotDelete')}><AlertOctagon size={14} /></span>
                                         )
                                     )}
                                 </div>
                             </div>
                         );
                     })}
-                    {listData.length === 0 && (
+                    {effectiveList.length === 0 && (
                         <div className="px-3 py-10 text-center">
                             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-slate-100 text-slate-400 mb-3"><FileText size={26}/></div>
-                            <div className="text-sm font-bold text-slate-500">{t('history.noTransactions')}</div>
-                            <div className="text-[11px] text-slate-400 mt-1">Try adjusting your filters</div>
+                            <div className="text-sm font-bold text-slate-500">{showDuplicatesOnly ? (t('history.noDuplicates') || 'No duplicates found') : t('history.noTransactions')}</div>
+                            <div className="text-[11px] text-slate-400 mt-1">{showDuplicatesOnly ? '' : 'Try adjusting your filters'}</div>
                         </div>
                     )}
                     {hasMore && (
                         <button onClick={() => setVisibleCount(c => c + PAGE_SIZE)} className="w-full py-3 text-center text-xs font-bold text-violet-700 bg-gradient-to-r from-violet-50 to-indigo-50 hover:from-violet-100 hover:to-indigo-100 rounded-2xl border border-violet-200 shadow-sm transition-all mt-2 flex items-center justify-center gap-2">
-                            <ChevronDown size={14} /> {t('history.loadMore')} <span className="text-violet-500">· {listData.length - visibleCount}</span>
+                            <ChevronDown size={14} /> {t('history.loadMore')} <span className="text-violet-500">· {effectiveList.length - visibleCount}</span>
                         </button>
                     )}
                 </div>
 
                 {/* Desktop Summary + Table */}
-                <div className="hidden md:block flex-1 overflow-y-auto overscroll-contain">
+                <div
+                    className="hidden md:block flex-1 overflow-y-auto overscroll-contain"
+                    style={{ WebkitOverflowScrolling: 'touch', touchAction: 'pan-y', overscrollBehavior: 'contain' }}
+                >
                 <div className="mb-6 px-3 pt-4">
                     {/* Hero KPI strip — 4 primary cards, each with a cash/bank split chip row */}
                     <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-3">
@@ -2463,7 +3523,17 @@ const canDelete = useCallback((tx: Transaction) => {
                                         : 'border-l-4 border-l-slate-200';
 
                                 return (
-                                    <tr key={row.id} className={`${leftAccent} hover:bg-violet-50/40 transition-colors group ${showDeleted ? 'bg-rose-50/40 text-slate-500' : ''}`} style={{verticalAlign:'middle'}}>
+                                    <tr
+                                        key={row.id}
+                                        onClick={(e) => {
+                                            const target = e.target as HTMLElement;
+                                            if (target.closest('button, a, input, select, textarea, label')) return;
+                                            openView(row);
+                                            emitHaptic('medium');
+                                        }}
+                                        className={`${leftAccent} hover:bg-violet-50/40 transition-colors group cursor-pointer ${showDeleted ? 'bg-rose-50/40 text-slate-500' : ''} ${duplicateGroupMap.has(row.id) ? duplicateGroupMap.get(row.id) : ''}`}
+                                        style={{verticalAlign:'middle'}}
+                                    >
                                         <td className="px-4 py-3 text-sm text-slate-600 font-mono text-center align-middle">{fmtDate(row.date)}</td>
                                         <td className="px-4 py-3 text-center align-middle">
                                             <span className={`px-2 py-1 rounded-md text-[10px] font-black uppercase tracking-wide border ${
@@ -2477,6 +3547,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                             </span>
                                             {isPending && <div className={`mt-1 text-[9px] font-bold uppercase ${(row as any).isAutoPayment ? 'text-blue-500' : 'text-amber-500'}`}>{(row as any).isAutoPayment ? t('history.pendingBankConfirmation') : 'Pending Approval'}</div>}
                                             {row.status === 'REJECTED' && <div className="mt-1 text-[9px] font-bold text-rose-500 uppercase">{t('common.rejected')}</div>}
+                                            {duplicateIds.has(row.id) && <div className="mt-1 text-[9px] font-bold text-amber-600 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200 inline-block">{t('history.duplicate') || 'Duplicate'}</div>}
                                         </td>
                                         <td className="px-4 py-3 text-sm text-slate-700 text-left align-middle">
                                             {row.unitNumber && (
@@ -2526,7 +3597,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                         <td className="px-4 py-3 text-sm text-slate-500 text-right align-middle">
                                             <div className="text-right">
                                                 {row.type === TransactionType.INCOME ? (
-                                                    <div className={`amount-pill amount-income amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                                    <div className={`amount-pill amount-income amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{displayAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                                 ) : (
                                                     <div className="amount-pill amount-neutral amount-pill-right"><span className="amt-value">-</span></div>
                                                 )}
@@ -2540,63 +3611,67 @@ const canDelete = useCallback((tx: Transaction) => {
                                         <td className="px-4 py-3 text-right text-sm text-slate-500 align-middle">
                                             <div className="text-right">
                                                 {row.type === TransactionType.EXPENSE ? (
-                                                    <div className={`amount-pill amount-expense amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                                    <div className={`amount-pill amount-expense amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{displayAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                                 ) : (
                                                     <div className="amount-pill amount-neutral amount-pill-right"><span className="amt-value">-</span></div>
                                                 )}
                                             </div>
                                          </td>
-                                        <td className="px-4 py-3 text-center flex justify-center gap-2 align-middle">
+                                        <td className="px-4 py-3 text-center align-middle">
+                                            <div className="flex items-center justify-center flex-wrap gap-1.5 rounded-xl border border-slate-100 bg-slate-50/70 px-2 py-1.5">
                                              {!(row as any).isOpeningBalance && row.type === TransactionType.INCOME && (
                                                 <>
-                                                    <button onClick={() => handlePrintReceipt(row)} className="p-2 text-slate-400 hover:text-slate-800 bg-slate-50 rounded-lg hover:bg-slate-200" title={t('common.print')}><Printer size={16}/></button>
-                                                    <button onClick={() => handleWhatsApp(row)} className="p-2 text-emerald-400 hover:text-emerald-600 bg-emerald-50 rounded-lg hover:bg-emerald-100" title={t('nav.whatsapp')}><MessageCircle size={16}/></button>
+                                                    <button onClick={() => handlePrintReceipt(row)} className="p-2 text-slate-400 hover:text-slate-800 bg-white rounded-lg hover:bg-slate-100 border border-slate-200/80" title={t('common.print')}><Printer size={16}/></button>
+                                                    <button onClick={() => handleWhatsApp(row)} className="p-2 text-emerald-400 hover:text-emerald-600 bg-emerald-50 rounded-lg hover:bg-emerald-100 border border-emerald-100" title={t('nav.whatsapp')}><MessageCircle size={16}/></button>
                                                 </>
                                              )}
-                                             {!(row as any).isOpeningBalance && row.isVATApplicable && row.vatInvoiceNumber && (
-                                                <button 
-                                                    onClick={() => window.location.hash = `/invoice/${row.vatInvoiceNumber}`} 
-                                                    className="p-2 text-blue-400 hover:text-blue-600 bg-blue-50 rounded-lg hover:bg-blue-100" 
-                                                    title={t('history.viewInvoice')}
-                                                >
+                                             {!(row as any).isOpeningBalance && (
+                                                <button onClick={() => handlePrintPaymentVoucher(row)} className="p-2 text-teal-500 hover:text-teal-700 bg-teal-50 rounded-lg hover:bg-teal-100 border border-teal-100" title="Payment Voucher">
                                                     <FileText size={16}/>
                                                 </button>
                                              )}
-                                             <div className="flex items-center gap-2">
+                                             <div className="flex items-center gap-1.5">
                                                  {/* Edit Payment Method Button (desktop) */}
                                                  {!(row as any).isOpeningBalance && (
-                                                     <button onClick={() => { setEditPaymentTx(row); setShowEditPaymentModal(true); }} className="p-2 text-blue-400 hover:text-blue-700 bg-blue-50 rounded-lg hover:bg-blue-100" title="Edit Payment Method">
+                                                     <button onClick={() => { setEditPaymentTx(row); setShowEditPaymentModal(true); }} className="p-2 text-blue-400 hover:text-blue-700 bg-blue-50 rounded-lg hover:bg-blue-100 border border-blue-100" title="Edit Payment Method">
                                                          <Pencil size={16}/>
                                                      </button>
                                                  )}
-                                                 {/* Convert to VAT (desktop) */}
-                                                 {!(row as any).isOpeningBalance && !row.isVATApplicable && !showDeleted && (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) && (row.status !== TransactionStatus.REJECTED) && (
-                                                     <button onClick={() => openVatModal(row)} className="px-2.5 py-2 text-[10px] font-black text-violet-600 hover:text-violet-800 bg-violet-50 hover:bg-violet-100 rounded-lg border border-violet-200 transition-all" title={row.type === TransactionType.INCOME ? 'Convert to VAT Sales (ZATCA)' : 'Convert to VAT Purchase'}>{t('history.vat')}</button>
+                                                 {canOpenFullEntryEdit(row) && (
+                                                     <button
+                                                         type="button"
+                                                         onClick={() => handleFullEntryEditTransaction(row)}
+                                                         className="p-2 text-violet-600 hover:text-violet-800 bg-violet-50 rounded-lg hover:bg-violet-100 border border-violet-200"
+                                                         title={canOpenAdminEdit(row) ? 'Admin: Edit all fields' : 'Edit all fields (current month)'}
+                                                     >
+                                                         <PenLine size={16}/>
+                                                     </button>
                                                  )}
                                                  {showDeleted ? (
                                                      <>
-                                                         <button onClick={() => handleRestore(row)} className="p-2 text-emerald-400 hover:text-emerald-600 bg-emerald-50 rounded-lg hover:bg-emerald-100" title={t('history.restore')}><RotateCcw size={16}/></button>
-                                                         <button onClick={() => handlePermanentDelete(row)} className="p-2 text-rose-400 hover:text-rose-600 bg-rose-50 rounded-lg hover:bg-rose-100" title={t('history.deletePermanently')}><X size={16}/></button>
+                                                         <button onClick={() => handleRestore(row)} className="p-2 text-emerald-400 hover:text-emerald-600 bg-emerald-50 rounded-lg hover:bg-emerald-100 border border-emerald-100" title={t('history.restore')}><RotateCcw size={16}/></button>
+                                                         <button onClick={() => handlePermanentDelete(row)} className="p-2 text-rose-400 hover:text-rose-600 bg-rose-50 rounded-lg hover:bg-rose-100 border border-rose-100" title={t('history.deletePermanently')}><X size={16}/></button>
                                                      </>
                                                  ) : (
                                                      canDelete(row) ? (
-                                                         <button onClick={() => handleDeleteStart(row)} className="p-2 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors" title={row.isVATApplicable && row.type === TransactionType.INCOME ? "Create Credit Note" : "Move to Trash"}><Trash2 size={16}/></button>
+                                                         <button onClick={() => handleDeleteStart(row)} className="p-2 text-slate-300 hover:text-rose-600 hover:bg-rose-50 rounded-lg transition-colors border border-slate-200/80" title={row.isVATApplicable && row.type === TransactionType.INCOME ? "Create Credit Note" : "Move to Trash"}><Trash2 size={16}/></button>
                                                      ) : (
-                                                         <span className="p-2 text-slate-300" title={t('history.cannotDelete')}><AlertOctagon size={16} /></span>
+                                                         <span className="p-2 text-slate-300 bg-white rounded-lg border border-slate-200/80" title={t('history.cannotDelete')}><AlertOctagon size={16} /></span>
                                                      )
                                                  )}
                                              </div>
+                                            </div>
                                         </td>
                                     </tr>
                                 );
                             })}
-                            {listData.length === 0 && (
+                            {effectiveList.length === 0 && (
                                 <tr>
                                     <td colSpan={7} className="px-5 py-12">
                                         <div className="flex flex-col items-center justify-center text-center">
                                             <div className="w-16 h-16 rounded-2xl bg-slate-100 text-slate-400 flex items-center justify-center mb-3"><FileText size={28}/></div>
-                                            <div className="text-sm font-bold text-slate-500">{t('history.noTransactions')}</div>
-                                            <div className="text-[11px] text-slate-400 mt-1">Try adjusting your filters</div>
+                                            <div className="text-sm font-bold text-slate-500">{showDuplicatesOnly ? (t('history.noDuplicates') || 'No duplicates found') : t('history.noTransactions')}</div>
+                                            <div className="text-[11px] text-slate-400 mt-1">{showDuplicatesOnly ? '' : 'Try adjusting your filters'}</div>
                                         </div>
                                     </td>
                                 </tr>
@@ -2606,7 +3681,7 @@ const canDelete = useCallback((tx: Transaction) => {
                     {hasMore && (
                         <div className="py-4 text-center">
                             <button onClick={() => setVisibleCount(c => c + PAGE_SIZE)} className="inline-flex items-center gap-2 px-5 py-2.5 text-xs font-bold text-violet-700 bg-gradient-to-r from-violet-50 to-indigo-50 hover:from-violet-100 hover:to-indigo-100 rounded-full border border-violet-200 shadow-sm transition-all">
-                                <ChevronDown size={14} /> {t('history.loadMore')} <span className="text-violet-500">· {listData.length - visibleCount} {t('history.remaining') || 'remaining'}</span>
+                                <ChevronDown size={14} /> {t('history.loadMore')} <span className="text-violet-500">· {effectiveList.length - visibleCount} {t('history.remaining') || 'remaining'}</span>
                             </button>
                         </div>
                     )}
@@ -2805,10 +3880,9 @@ const canDelete = useCallback((tx: Transaction) => {
                                                 className="w-full px-3 py-2.5 border border-slate-200 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-orange-400 focus:border-orange-400 bg-white"
                                             />
                                             {vatVendorDropdownOpen && vatVendorSearch && (() => {
-                                                const filtered = vendors.filter(v =>
-                                                    (v.nameEn || v.name || '').toLowerCase().includes(vatVendorSearch.toLowerCase()) ||
-                                                    (v.name || '').toLowerCase().includes(vatVendorSearch.toLowerCase())
-                                                ).slice(0, 8);
+                                                const filtered = vendors
+                                                    .filter((v) => matchesAdvancedSearch(vatVendorSearch, buildVendorSearchHaystack(v)))
+                                                    .slice(0, 8);
                                                 if (filtered.length === 0) return null;
                                                 return (
                                                     <div className="absolute z-50 top-full mt-1 left-0 right-0 bg-white border border-orange-200 rounded-xl shadow-xl overflow-hidden">
@@ -3048,9 +4122,28 @@ const canDelete = useCallback((tx: Transaction) => {
                 {showViewModal && selectedTx && (
                     <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-start justify-center pt-[12vh] p-4">
                         <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full max-h-[90vh] flex flex-col animate-slide-up">
-                            <div className="flex items-center justify-between p-6 border-b border-slate-100 sticky top-0 bg-white rounded-t-2xl">
-                                <h3 className="text-lg font-bold text-slate-800">{t('history.transactionDetails')}</h3>
-                                <button onClick={closeView} className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg"><X size={16}/></button>
+                            <div className="flex items-center justify-between p-6 border-b border-slate-100 sticky top-0 bg-gradient-to-r from-violet-50 to-indigo-50 rounded-t-2xl">
+                                <div>
+                                    <h3 className="text-lg font-black text-slate-800">{t('history.transactionDetails')}</h3>
+                                    <p className="text-[11px] text-slate-500 font-semibold mt-0.5">{t('history.detailSubtitle')}</p>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    {(currentUser?.role === UserRole.ADMIN || currentUser?.role === UserRole.MANAGER) && (
+                                        <button
+                                            type="button"
+                                            onClick={() => setDebugAmounts(v => !v)}
+                                            className={`px-3 py-1.5 rounded-lg text-[10px] font-black uppercase tracking-widest border transition ${
+                                                debugAmounts
+                                                    ? 'bg-slate-900 text-white border-slate-900'
+                                                    : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                                            }`}
+                                            title="Toggle amount debug info"
+                                        >
+                                            Debug amounts
+                                        </button>
+                                    )}
+                                    <button onClick={closeView} className="p-2 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg"><X size={16}/></button>
+                                </div>
                             </div>
                             <div className="overflow-y-auto custom-scrollbar flex-1 p-6">
                             <div className="flex items-center gap-2 mb-3">
@@ -3079,18 +4172,64 @@ const canDelete = useCallback((tx: Transaction) => {
                                     {selectedTx.chequeDueDate && <div className="text-[11px] text-indigo-700">Due: {fmtDate(selectedTx.chequeDueDate)}</div>}
                                 </div>
                                 <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-200">
-                                    <div className="text-[11px] text-emerald-800 font-bold">{t('common.amount')}</div>
-                                    <div className="text-xl font-black text-emerald-900">{Number(selectedTx.amountIncludingVAT || selectedTx.totalWithVat || selectedTx.amount || 0).toLocaleString()} SAR</div>
-                                    {selectedTx.isVATApplicable && selectedTx.vatAmount && selectedTx.vatAmount > 0 && (
-                                        <div className="text-[11px] text-emerald-700 mt-1">incl. VAT {Number(selectedTx.vatAmount).toLocaleString()} SAR</div>
-                                    )}
-                                    {selectedTx.vatInvoiceNumber && <div className="text-[11px] text-emerald-700">{t('history.invoice')}: {selectedTx.vatInvoiceNumber}</div>}
-                                    {selectedTx.type === TransactionType.EXPENSE && <div className="text-[11px] text-emerald-700">{t('history.expense')}</div>}
+                                    {(() => {
+                                        const tx = selectedTx;
+                                        const fees = !!(tx as any).feesEntry;
+                                        const excl = Number(tx.amountExcludingVAT ?? tx.amount ?? 0);
+                                        const vatAmt = Number(tx.vatAmount || 0);
+                                        const incl = Number(tx.amountIncludingVAT ?? tx.totalWithVat ?? tx.amount ?? 0);
+                                        const rate = Number(tx.vatRate) || 15;
+                                        const showVat =
+                                            !!tx.isVATApplicable &&
+                                            !fees &&
+                                            (vatAmt > 0 || (tx.amountExcludingVAT != null && tx.amountIncludingVAT != null));
+                                        if (fees) {
+                                            return (
+                                                <>
+                                                    <div className="text-[11px] text-emerald-800 font-bold">{t('history.amountNoVat')}</div>
+                                                    <div className="text-xl font-black text-emerald-900">{Number(tx.amount || 0).toLocaleString()} {t('common.sar')}</div>
+                                                </>
+                                            );
+                                        }
+                                        if (showVat) {
+                                            return (
+                                                <>
+                                                    <div className="text-[11px] text-emerald-800 font-bold">{t('history.amountInclVat')}</div>
+                                                    <div className="text-xl font-black text-emerald-900">{incl.toLocaleString()} {t('common.sar')}</div>
+                                                    <div className="text-[11px] text-emerald-700 mt-1 space-y-0.5">
+                                                        <div>{t('history.amountExclVat')}: {excl.toLocaleString()} {t('common.sar')}</div>
+                                                        <div>{t('history.vatAtRate', { rate: String(rate) })}: {vatAmt.toLocaleString()} {t('common.sar')}</div>
+                                                    </div>
+                                                    {tx.vatInvoiceNumber && (
+                                                        <div className="text-[11px] text-emerald-700 mt-1">{t('history.invoice')}: {tx.vatInvoiceNumber}</div>
+                                                    )}
+                                                    {tx.type === TransactionType.EXPENSE && (
+                                                        <div className="text-[11px] text-emerald-700">{t('history.expense')}</div>
+                                                    )}
+                                                </>
+                                            );
+                                        }
+                                        return (
+                                            <>
+                                                <div className="text-[11px] text-emerald-800 font-bold">{t('common.amount')}</div>
+                                                <div className="text-xl font-black text-emerald-900">{incl.toLocaleString()} {t('common.sar')}</div>
+                                                {tx.vatInvoiceNumber && (
+                                                    <div className="text-[11px] text-emerald-700 mt-1">{t('history.invoice')}: {tx.vatInvoiceNumber}</div>
+                                                )}
+                                                {tx.type === TransactionType.EXPENSE && (
+                                                    <div className="text-[11px] text-emerald-700">{t('history.expense')}</div>
+                                                )}
+                                            </>
+                                        );
+                                    })()}
                                 </div>
                                 <div className="p-3 bg-white rounded-lg border">
                                     <div className="text-[11px] text-slate-500 font-bold">{t('history.building')}</div>
                                     <div className="text-sm font-bold text-slate-800">{getBuildingName(selectedTx.buildingId || (selectedTx as any).building) || selectedTx.buildingName || '-'}</div>
-                                    {selectedTx.unitNumber && <div className="text-[11px] text-slate-700">{t('history.unit')}: {selectedTx.unitNumber}</div>}
+                                    {selectedTx.unitNumber && <div className="text-[11px] text-slate-700">{t('history.unitNo')}: {selectedTx.unitNumber}</div>}
+                                    {linkedContractForView && (
+                                        <div className="text-[11px] text-slate-600 mt-1">{t('history.linkedContract')}: {linkedContractForView}</div>
+                                    )}
                                 </div>
                                 <div className="p-3 bg-white rounded-lg border">
                                     <div className="text-[11px] text-slate-500 font-bold">{t('history.category')}</div>
@@ -3113,13 +4252,66 @@ const canDelete = useCallback((tx: Transaction) => {
                                 )}
                                 <div className="p-3 bg-white rounded-lg border">
                                     <div className="text-[11px] text-slate-500 font-bold">{t('history.metadata')}</div>
-                                    <div className="text-[11px] text-slate-700">{t('history.createdBy')}: {selectedTx.createdByName}</div>
-                                    <div className="text-[11px] text-slate-700">{t('history.createdAt')}: {selectedTx.createdAt ? fmtDateTime(selectedTx.createdAt) : '-'}</div>
-                                    <div className="text-[11px] text-slate-700">{t('history.id')}: {selectedTx.id}</div>
+                                    <div className="text-[11px] text-slate-700">{t('history.createdBy')} {selectedTx.createdByName}</div>
+                                    <div className="text-[11px] text-slate-700">{t('history.createdAt')} {selectedTx.createdAt ? fmtDateTime(selectedTx.createdAt) : '-'}</div>
                                 </div>
                             </div>
+
+                            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50/70">
+                                <div className="px-4 py-2.5 border-b border-slate-200">
+                                    <h4 className="text-xs font-black uppercase tracking-[0.16em] text-slate-600">{t('history.additionalDetails')}</h4>
+                                </div>
+                                <div className="p-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+                                    {buildDetailItems(selectedTx).map((item, idx) => (
+                                        <div key={`${item.label}-${idx}`} className="rounded-lg border border-slate-200 bg-white px-3 py-2">
+                                            <div className="text-[10px] font-bold uppercase tracking-[0.12em] text-slate-500">{item.label}</div>
+                                            <div className="text-xs font-bold text-slate-800 break-words mt-0.5">{item.value}</div>
+                                        </div>
+                                    ))}
+                                </div>
                             </div>
-                            <div className="flex gap-2 justify-end p-6 border-t border-slate-100 sticky bottom-0 bg-white rounded-b-2xl">
+
+                            {debugAmounts && (
+                                <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50">
+                                    <div className="px-4 py-2.5 border-b border-amber-200 flex items-center justify-between">
+                                        <h4 className="text-xs font-black uppercase tracking-[0.16em] text-amber-800">Amount debug</h4>
+                                        <div className="text-[10px] font-bold text-amber-700">Shown amount: {displayAmount(selectedTx).toLocaleString()} {t('common.sar')}</div>
+                                    </div>
+                                    <div className="p-4">
+                                        <pre className="text-[11px] leading-relaxed font-mono text-amber-900 whitespace-pre-wrap break-words">
+{JSON.stringify({
+  id: selectedTx.id,
+  type: selectedTx.type,
+  date: selectedTx.date,
+  amount: selectedTx.amount,
+  vatAmount: (selectedTx as any).vatAmount,
+  amountExcludingVAT: (selectedTx as any).amountExcludingVAT,
+  amountIncludingVAT: (selectedTx as any).amountIncludingVAT,
+  totalWithVat: (selectedTx as any).totalWithVat,
+  isVATApplicable: (selectedTx as any).isVATApplicable,
+  vatReportOnly: (selectedTx as any).vatReportOnly,
+  computedDisplayAmount: displayAmount(selectedTx),
+}, null, 2)}
+                                        </pre>
+                                    </div>
+                                </div>
+                            )}
+                            </div>
+                            <div className="flex flex-wrap gap-2 justify-end p-6 border-t border-slate-100 sticky bottom-0 bg-white rounded-b-2xl">
+                                {canOpenFullEntryEdit(selectedTx) && (
+                                    <button
+                                        type="button"
+                                        onClick={() => { handleFullEntryEditTransaction(selectedTx); closeView(); }}
+                                        className="px-3 py-2 text-violet-800 bg-violet-100 border border-violet-200 rounded-lg hover:bg-violet-200 font-bold text-xs flex items-center gap-1.5"
+                                    >
+                                        <PenLine size={14} />{canOpenAdminEdit(selectedTx) ? 'Admin: Edit all fields' : 'Edit all fields (current month)'}
+                                    </button>
+                                )}
+                                {!(selectedTx as any).isOpeningBalance && (
+                                    <button onClick={() => handlePrintPaymentVoucher(selectedTx)} className="px-3 py-2 text-teal-700 bg-teal-100 rounded-lg hover:bg-teal-200 font-bold text-xs flex items-center gap-1">
+                                        <FileText size={14}/> Payment Voucher
+                                    </button>
+                                )}
                                 {selectedTx.type === TransactionType.INCOME && (
                                     <>
                                         <button onClick={() => handlePrintReceipt(selectedTx)} className="px-3 py-2 text-slate-600 bg-slate-100 rounded-lg hover:bg-slate-200 font-bold text-xs flex items-center gap-1"><Printer size={14}/>{t('common.print')}</button>
@@ -3136,4 +4328,3 @@ const canDelete = useCallback((tx: Transaction) => {
 };
 
 export default TransactionHistory;
-

@@ -1,11 +1,22 @@
 {
-  "name": "Amlak Premium Manager",
-  "short_name": "Amlak",
-  "start_url": "/",
+  "name": "Amlak Sheets",
+  "short_name": "Amlak Sheets",
+  "description": "Standalone Amlak spreadsheet workspace for building income, expenses, VAT, and owner sheets.",
+  "id": "/#/amlak-sheets",
+  "start_url": "/#/amlak-sheets",
+  "scope": "/",
   "display": "standalone",
+  "display_override": ["window-controls-overlay", "standalone", "minimal-ui"],
   "background_color": "#ecfdf5",
-  "theme_color": "#10b981",
+  "theme_color": "#047857",
+  "categories": ["business", "finance", "productivity"],
   "icons": [
+    {
+      "src": "/images/amlak-sheets-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    },
     {
       "src": "/images/logo-192.png",
       "sizes": "192x192",

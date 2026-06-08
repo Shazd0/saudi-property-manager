@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Transaction, TransactionType, PaymentMethod, ExpenseCategory, Building, Customer, Vendor } from '../types';
+import { Transaction, TransactionType, PaymentMethod, ExpenseCategory, Building, Customer, Vendor, Bank } from '../types';
 import {
   saveTransaction,
   getBuildings,
@@ -7,7 +7,10 @@ import {
   getActiveContract,
   getContracts,
   getVendors,
+  getBanks,
   getTransactions,
+  getCustomExpenseCategories,
+  saveCustomExpenseCategories,
 } from '../services/firestoreService';
 import { isValidSaudiVAT } from '../utils/validators';
 import { auth } from '../firebase';
@@ -28,6 +31,11 @@ import {
 import { fmtDate, dateToLocalStr } from '../utils/dateFormat';
 import { formatNameWithRoom } from '../utils/customerDisplay';
 import { getInstallmentRange } from '../utils/installmentSchedule';
+import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { useLanguage } from '../i18n';
+import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
+import { computeInstallmentProgress } from '../utils/installmentPaymentProgress';
+import { getNonResFeePeriodContext, getNonResFeeBreakdownLines } from '../utils/nonResidentialFeeSchedule';
 
 export type VATQuickEntryType = 'SALES' | 'EXPENSE' | 'FEES';
 
@@ -53,25 +61,47 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
   defaultType = 'SALES',
   allowedTypes = ['SALES', 'EXPENSE', 'FEES'],
 }) => {
+  const { t } = useLanguage();
   const [qeType, setQeType] = useState<VATQuickEntryType>(defaultType);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [vendors, setVendors] = useState<Vendor[]>([]);
+  const [banks, setBanks] = useState<Bank[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
 
   const [qeDate, setQeDate] = useState(new Date().toISOString().split('T')[0]);
   const [qeAmount, setQeAmount] = useState('');
+  const [qeDiscount, setQeDiscount] = useState('');
   const [qeDetails, setQeDetails] = useState('');
   const [qePaymentMethod, setQePaymentMethod] = useState<PaymentMethod>(PaymentMethod.BANK);
+  const [qeBankName, setQeBankName] = useState('');
   const [qeBuildingId, setQeBuildingId] = useState('');
   const [qeUnitNumber, setQeUnitNumber] = useState('');
   const [qeCustomerVAT, setQeCustomerVAT] = useState('');
   const [qeVendorName, setQeVendorName] = useState('');
   const [qeVendorVAT, setQeVendorVAT] = useState('');
-  const [qeCategory, setQeCategory] = useState<ExpenseCategory>(ExpenseCategory.VENDOR_PAYMENT);
+  const [qeCategory, setQeCategory] = useState<string>(ExpenseCategory.VENDOR_PAYMENT);
   const [qeSubCategory, setQeSubCategory] = useState('');
+  const [qeExpenseCustomCategories, setQeExpenseCustomCategories] = useState<string[]>([]);
+  const [qeNewExpenseCategoryInput, setQeNewExpenseCategoryInput] = useState('');
+  const [qeExpenseCustomSubCategories, setQeExpenseCustomSubCategories] = useState<Record<string, string[]>>({});
+  const [qeNewExpenseSubCategoryInput, setQeNewExpenseSubCategoryInput] = useState('');
   const [qeSaving, setQeSaving] = useState(false);
-  const [qeErrors, setQeErrors] = useState<{ customerVAT?: string; vendorVAT?: string; vendorName?: string; amount?: string }>({});
+  const [qeErrors, setQeErrors] = useState<{
+    date?: string;
+    details?: string;
+    customerVAT?: string;
+    vendorVAT?: string;
+    vendorName?: string;
+    vendorRefNo?: string;
+    amount?: string;
+    bankName?: string;
+    category?: string;
+    subCategory?: string;
+    property?: string;
+    unit?: string;
+    purchaseProperty?: string;
+  }>({});
   const [qeContractCustomer, setQeContractCustomer] = useState<Customer | null>(null);
   const [qeVatAutoFilled, setQeVatAutoFilled] = useState(false);
   const [qeContractLookupLoading, setQeContractLookupLoading] = useState(false);
@@ -80,25 +110,46 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
   const [qeContractStats, setQeContractStats] = useState({ paid: 0, remaining: 0, installmentNo: 1 });
   const [qeNonVatFeesPerInst, setQeNonVatFeesPerInst] = useState(0);
   const [qeFeesPaidThisInst, setQeFeesPaidThisInst] = useState(0);
+  /** Which fee calendar period is due (1-based); null when every period is paid. */
+  const [qeFeePeriodInstallment, setQeFeePeriodInstallment] = useState<number | null>(null);
+  const [qeFeesAllPeriodsPaid, setQeFeesAllPeriodsPaid] = useState(false);
   const [qeFeesGenerateInvoice, setQeFeesGenerateInvoice] = useState(false);
   const [qeVendorAutoFilled, setQeVendorAutoFilled] = useState(false);
   const [showAddVendor, setShowAddVendor] = useState(false);
   const [qeVendorRefNo, setQeVendorRefNo] = useState('');
-  const [qePurchaseBuildingId, setQePurchaseBuildingId] = useState('');
+  // Purchase (expense) must not default to "General Expense" — force an explicit choice.
+  const [qePurchaseBuildingId, setQePurchaseBuildingId] = useState<'__SELECT__' | '__GENERAL__' | string>('__SELECT__');
 
   // Load data when modal opens
   useEffect(() => {
     if (!open) return;
     let active = true;
-    Promise.all([getBuildings(), getCustomers(), getVendors(), getTransactions()]).then(
-      ([b, c, v, txs]) => {
-        if (!active) return;
-        setBuildings(b || []);
-        setCustomers(c || []);
-        setVendors((v || []).filter((vn: Vendor) => (vn as any).status !== 'Inactive'));
-        setTransactions(txs || []);
-      },
-    );
+    Promise.all([
+      getBuildings(),
+      getCustomers(),
+      getVendors(),
+      getBanks(),
+      getTransactions(),
+      getCustomExpenseCategories().catch(() => [] as string[]),
+    ]).then(([b, c, v, bks, txs, cloudCats]) => {
+      if (!active) return;
+      setBuildings(b || []);
+      setCustomers(c || []);
+      setVendors((v || []).filter((vn: Vendor) => (vn as any).status !== 'Inactive'));
+      setBanks((bks || []).filter((bk: Bank) => !!bk?.name));
+      setTransactions(txs || []);
+      setQeExpenseCustomCategories(Array.isArray(cloudCats) ? cloudCats : []);
+    });
+    // Local sub-category customizations (client-side only)
+    try {
+      const raw = localStorage.getItem('qeExpenseSubCategories');
+      const parsed = raw ? JSON.parse(raw) : {};
+      if (parsed && typeof parsed === 'object') {
+        setQeExpenseCustomSubCategories(parsed as Record<string, string[]>);
+      }
+    } catch {
+      setQeExpenseCustomSubCategories({});
+    }
     return () => {
       active = false;
     };
@@ -116,6 +167,127 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
       ),
     [buildings],
   );
+  /** Non-VAT fees entry: only true non-residential properties (not VAT-only residential). */
+  const feesEligibleBuildings = useMemo(
+    () => buildings.filter((b) => b.propertyType === 'NON_RESIDENTIAL'),
+    [buildings],
+  );
+
+  const EXPENSE_SUBCATEGORIES: Record<string, string[]> = {
+    'General Expense': ['Office Supplies', 'Travel & Transport', 'Printing & Stationery', 'Bank Charges', 'Cleaning', 'Advertisement', 'Miscellaneous'],
+    'Head Office': ['Rent', 'Admin Costs', 'IT Equipment', 'Communications', 'Furniture & Fixtures'],
+    Salary: ['Basic Salary', 'Housing Allowance', 'Transport Allowance', 'Overtime', 'GOSI Contribution', 'End of Service', 'Bonus'],
+    Borrowing: ['Personal Loan', 'Business Loan', 'Repayment', 'Opening Balance'],
+    'Owner Expense': ['Personal Drawings', 'Owner Investment', 'Owner Settlement'],
+    Maintenance: ['Plumbing', 'Electrical', 'AC / HVAC', 'Painting', 'Civil Works', 'Pest Control', 'Elevator', 'General Repairs'],
+    Utilities: ['Electricity', 'Water', 'Internet / Fiber', 'Gas', 'Telephone / Mobile'],
+    'Vendor Payment': ['Materials Supply', 'Labor', 'Equipment Rental', 'Subcontractor', 'Services'],
+    'Property Rent': ['Monthly Rent', 'Annual Rent', 'Security Deposit', 'Advance Rent'],
+    'Service Agreement': ['Annual Contract', 'Quarterly Installment', 'Monthly Installment', 'AMC'],
+  };
+
+  const qeExpenseCategoryOptions = useMemo(() => {
+    const defaults = Object.values(ExpenseCategory) as string[];
+    return Array.from(new Set([...defaults, ...qeExpenseCustomCategories])).sort((a, b) => a.localeCompare(b));
+  }, [qeExpenseCustomCategories]);
+
+  const persistQeCustomExpenseCategories = useCallback((customOnlyFromMerged: string[]) => {
+    const defaults = Object.values(ExpenseCategory);
+    const customOnly = customOnlyFromMerged.filter((x) => !defaults.includes(x as ExpenseCategory));
+    saveCustomExpenseCategories(customOnly).catch(() => {});
+  }, []);
+
+  const persistQeCustomExpenseSubCategories = useCallback((next: Record<string, string[]>) => {
+    try {
+      localStorage.setItem('qeExpenseSubCategories', JSON.stringify(next || {}));
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const addQeExpenseCategory = () => {
+    const name = qeNewExpenseCategoryInput.trim();
+    if (!name) return;
+    const defaults = Object.values(ExpenseCategory) as string[];
+    if (defaults.includes(name) || qeExpenseCustomCategories.includes(name)) {
+      setQeCategory(name);
+      setQeNewExpenseCategoryInput('');
+      return;
+    }
+    const nextCustom = [name, ...qeExpenseCustomCategories.filter((x) => x !== name)];
+    setQeExpenseCustomCategories(nextCustom);
+    setQeCategory(name);
+    setQeSubCategory('');
+    setQeNewExpenseCategoryInput('');
+    persistQeCustomExpenseCategories(nextCustom);
+  };
+
+  const deleteQeExpenseCategory = useCallback(() => {
+    const defaults = Object.values(ExpenseCategory) as string[];
+    if (!qeCategory || qeCategory === 'ALL') return;
+    if (defaults.includes(qeCategory)) return; // don't delete built-ins
+    const ok = window.confirm(`Delete expense category "${qeCategory}"? This cannot be undone.`);
+    if (!ok) return;
+    const nextCustom = qeExpenseCustomCategories.filter((c) => c !== qeCategory);
+    setQeExpenseCustomCategories(nextCustom);
+    setQeCategory(defaults[0] || '');
+    setQeSubCategory('');
+    persistQeCustomExpenseCategories(nextCustom);
+  }, [qeCategory, qeExpenseCustomCategories, persistQeCustomExpenseCategories]);
+
+  const addQeExpenseSubCategory = useCallback(() => {
+    const name = qeNewExpenseSubCategoryInput.trim();
+    if (!qeCategory || !name) return;
+    const builtIn = EXPENSE_SUBCATEGORIES[qeCategory] || [];
+    const existingCustom = qeExpenseCustomSubCategories[qeCategory] || [];
+    if (builtIn.includes(name) || existingCustom.includes(name)) {
+      setQeSubCategory(name);
+      setQeNewExpenseSubCategoryInput('');
+      return;
+    }
+    const next = {
+      ...qeExpenseCustomSubCategories,
+      [qeCategory]: [name, ...existingCustom],
+    };
+    setQeExpenseCustomSubCategories(next);
+    setQeSubCategory(name);
+    setQeNewExpenseSubCategoryInput('');
+    persistQeCustomExpenseSubCategories(next);
+  }, [qeCategory, qeNewExpenseSubCategoryInput, qeExpenseCustomSubCategories, persistQeCustomExpenseSubCategories, EXPENSE_SUBCATEGORIES]);
+
+  const deleteQeExpenseSubCategory = useCallback(() => {
+    if (!qeCategory || !qeSubCategory) return;
+    const builtIn = EXPENSE_SUBCATEGORIES[qeCategory] || [];
+    if (builtIn.includes(qeSubCategory)) return; // don't delete built-ins
+    const ok = window.confirm(`Delete sub-category "${qeSubCategory}" from "${qeCategory}"?`);
+    if (!ok) return;
+    const existingCustom = qeExpenseCustomSubCategories[qeCategory] || [];
+    const nextList = existingCustom.filter((s) => s !== qeSubCategory);
+    const next = { ...qeExpenseCustomSubCategories, [qeCategory]: nextList };
+    setQeExpenseCustomSubCategories(next);
+    setQeSubCategory('');
+    persistQeCustomExpenseSubCategories(next);
+  }, [qeCategory, qeSubCategory, qeExpenseCustomSubCategories, persistQeCustomExpenseSubCategories, EXPENSE_SUBCATEGORIES]);
+
+  useEffect(() => {
+    const subs = [...(EXPENSE_SUBCATEGORIES[qeCategory] || []), ...(qeExpenseCustomSubCategories[qeCategory] || [])];
+    setQeSubCategory((prev) => (subs.length > 0 && prev && !subs.includes(prev) ? '' : prev));
+  }, [qeCategory]);
+
+  useEffect(() => {
+    if (!open || qeType !== 'FEES' || !qeBuildingId) return;
+    if (!feesEligibleBuildings.some((b) => b.id === qeBuildingId)) {
+      setQeBuildingId('');
+      setQeUnitNumber('');
+      setQeActiveContract(undefined);
+      setQeNonVatFeesPerInst(0);
+      setQeFeesPaidThisInst(0);
+      setQeFeePeriodInstallment(null);
+      setQeFeesAllPeriodsPaid(false);
+      setQeContractCustomer(null);
+    }
+  }, [open, qeType, qeBuildingId, feesEligibleBuildings]);
+
   const selectedQEBuilding = buildings.find((b) => b.id === qeBuildingId);
   const qeBuildingUnits = useMemo(() => {
     if (!selectedQEBuilding) return [];
@@ -123,18 +295,55 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
   }, [selectedQEBuilding]);
 
   const isCurrentVatEntry = qeType === 'FEES' ? false : qeType === 'EXPENSE' || (qeType === 'SALES' && !!qeCustomerVAT);
+  const getBanksForBuildingId = useCallback(
+    (buildingId: string | undefined) => {
+      const list = (banks || []).filter((b) => !!b?.name);
+      if (!buildingId) return list;
+      const bld = buildings.find((x) => x.id === buildingId);
+      const byDoc = list.filter((bk) => {
+        const bid = (bk as any).buildingId ?? (bk as any).building;
+        const bids = (bk as any).buildingIds;
+        if (bid) return bid === buildingId;
+        if (Array.isArray(bids)) return bids.includes(buildingId);
+        return false;
+      });
+      if (byDoc.length > 0) return byDoc;
+      if (bld?.bankName) {
+        const preferred = list.find((bk) => bk.name === bld.bankName);
+        if (preferred) return [preferred, ...list.filter((bk) => bk.name !== preferred.name)];
+      }
+      return list;
+    },
+    [banks, buildings],
+  );
+  const qeContextBuildingId = useMemo(
+    () => {
+      if (qeType === 'EXPENSE') {
+        const v = String(qePurchaseBuildingId || '');
+        if (!v || v.startsWith('__')) return undefined;
+        return v;
+      }
+      return qeBuildingId || undefined;
+    },
+    [qeType, qePurchaseBuildingId, qeBuildingId],
+  );
+  const qeBankOptions = useMemo(() => getBanksForBuildingId(qeContextBuildingId), [getBanksForBuildingId, qeContextBuildingId]);
 
   const resetQE = () => {
     setQeAmount('');
+    setQeDiscount('');
     setQeDetails('');
+    setQeBankName('');
     setQeCustomerVAT('');
     setQeVendorName('');
     setQeVendorVAT('');
     setQeVendorId('');
     setQeVendorAutoFilled(false);
     setQeVendorRefNo('');
-    setQePurchaseBuildingId('');
+    setQePurchaseBuildingId('__SELECT__');
+    setQeCategory(ExpenseCategory.VENDOR_PAYMENT);
     setQeSubCategory('');
+    setQeNewExpenseCategoryInput('');
     setQeUnitNumber('');
     setQeBuildingId('');
     setQeContractCustomer(null);
@@ -142,6 +351,8 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
     setQeActiveContract(undefined);
     setQeNonVatFeesPerInst(0);
     setQeFeesPaidThisInst(0);
+    setQeFeePeriodInstallment(null);
+    setQeFeesAllPeriodsPaid(false);
     setQeFeesGenerateInvoice(false);
     setQeErrors({});
   };
@@ -160,7 +371,22 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
     setQeActiveContract(undefined);
     setQeNonVatFeesPerInst(0);
     setQeFeesPaidThisInst(0);
+    setQeFeePeriodInstallment(null);
+    setQeFeesAllPeriodsPaid(false);
   };
+  const handleQePurchaseBuildingChange = (id: string) => {
+    setQePurchaseBuildingId(id);
+    setQeErrors((p) => ({ ...p, purchaseProperty: undefined }));
+  };
+
+  useEffect(() => {
+    if (qePaymentMethod !== PaymentMethod.BANK) return;
+    if (qeBankName && qeBankOptions.some((b) => b.name === qeBankName)) return;
+    // Don't default bank to the first global bank (e.g., Al Rajhi) unless a building is selected.
+    if (!qeContextBuildingId) return;
+    const defaultBank = qeBankOptions[0]?.name || '';
+    if (defaultBank) setQeBankName(defaultBank);
+  }, [qePaymentMethod, qeBankName, qeBankOptions, qeContextBuildingId]);
 
   const handleQEUnitChange = useCallback(
     async (unit: string) => {
@@ -171,33 +397,30 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
       if (!unit || !qeBuildingId) return;
       setQeContractLookupLoading(true);
       try {
+        const catalog = ((await getContracts()) || []).filter((c: any) => !c.deleted);
         let contract = await getActiveContract(qeBuildingId, unit);
         if (!contract) {
-          const allContracts = await getContracts();
-          const unitContracts = (allContracts || []).filter(
-            (c: any) => c.buildingId === qeBuildingId && c.unitName === unit && !c.deleted,
+          const unitContracts = catalog.filter(
+            (c: any) => c.buildingId === qeBuildingId && c.unitName === unit,
           );
           unitContracts.sort((a: any, b: any) => (a.status === 'Active' ? -1 : b.status === 'Active' ? 1 : 0));
           contract = unitContracts[0] || null;
         }
         if (contract) {
           setQeActiveContract(contract);
-          const contractId = (contract as any).id;
           const prevPayments = transactions.filter((t) => {
             if (t.status !== 'APPROVED' && t.status) return false;
-            if (contractId && t.contractId === contractId) return true;
-            if (!t.contractId && t.buildingId === qeBuildingId && t.unitNumber === unit && t.type !== TransactionType.EXPENSE) return true;
-            return false;
+            if (t.type === TransactionType.EXPENSE) return false;
+            return transactionAppliesToContract(t, contract as any, catalog);
           });
           const upfrontPaidAmount = Number((contract as any).upfrontPaid || 0);
           const totalInst = contract.installmentCount || 1;
           const rentValue = Number((contract as any).rentValue || 0);
-          const rentPerInstIncl = totalInst > 0 ? rentValue / totalInst : 0;
-          const firstInstAmt = Math.round(rentPerInstIncl);
-          const otherInstAmt = Math.round(rentPerInstIncl);
-          const effectiveTotalIncl = rentValue;
 
-          const rentPayments = prevPayments.filter((t) => !(t as any).feesEntry);
+          const nonResQe = isNonResidentialBuildingForContract(buildings, contract as any);
+          const rentPayments = nonResQe
+            ? prevPayments.filter((t) => !(t as any).feesEntry)
+            : prevPayments;
           const totalPaidIncl = rentPayments.reduce(
             (sum, t) =>
               sum +
@@ -207,49 +430,99 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           );
           const totalPaidEffective = totalPaidIncl + upfrontPaidAmount;
 
+          // IMPORTANT: For non-residential units, VAT Sales/Rent should NOT include non‑VAT fees.
+          // So we compute installment progress from rent-only value (VAT), excluding any fees schedule.
           let currentInstallment = 1;
-          let cumulated = firstInstAmt;
-          while (totalPaidEffective >= Math.round(cumulated * 100) / 100 && currentInstallment < totalInst) {
-            currentInstallment++;
-            cumulated += otherInstAmt > 0 ? otherInstAmt : firstInstAmt;
+          let currentInstAmt = 0;
+          let paidTowardCurrent = 0;
+          let rentAutoFill = 0;
+
+          if (nonResQe) {
+            const count = Math.max(1, Number(contract.installmentCount) || 1);
+            // ContractForm treats VAT-building rentValue as FINAL price (inclusive of VAT),
+            // and VAT transactions store amountIncludingVAT / totalWithVat as the money collected.
+            const rentTotalIncl = Number((contract as any).rentValue || 0);
+            const rentPerInstIncl = count > 0 ? rentTotalIncl / count : 0;
+            const firstInstIncl = rentPerInstIncl + upfrontPaidAmount;
+            const otherInstIncl = rentPerInstIncl;
+
+            const schedulePaidIncl =
+              rentPayments.reduce(
+                (sum, t) =>
+                  sum +
+                  (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) +
+                  (Number((t as any).discountAmount) || 0),
+                0,
+              ) + upfrontPaidAmount;
+
+            let cumulative = 0;
+            let found = false;
+            for (let i = 1; i <= count; i++) {
+              const instIncl = i === 1 ? firstInstIncl : otherInstIncl;
+              const prevCum = cumulative;
+              cumulative += instIncl;
+              if (schedulePaidIncl < cumulative - 0.01) {
+                currentInstallment = i;
+                currentInstAmt = instIncl;
+                paidTowardCurrent = Math.max(0, schedulePaidIncl - prevCum);
+                rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
+                found = true;
+                break;
+              }
+            }
+            if (!found) {
+              currentInstallment = count;
+              currentInstAmt = otherInstIncl;
+              paidTowardCurrent = currentInstAmt;
+              rentAutoFill = 0;
+            }
+
+            const effectiveTotalIncl = rentTotalIncl + upfrontPaidAmount;
+            const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
+            setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
+          } else {
+            const progress = computeInstallmentProgress({
+              contract,
+              payments: prevPayments,
+              excludeFeesEntry: nonResQe,
+            });
+            currentInstallment = progress.installmentNo;
+
+            const effectiveTotalIncl = rentValue;
+            const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
+            setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
+
+            currentInstAmt =
+              currentInstallment === 1
+                ? progress.firstInstAmt
+                : progress.otherInstAmt > 0
+                  ? progress.otherInstAmt
+                  : progress.firstInstAmt;
+            const prevCumulative =
+              currentInstallment === 1 ? 0 : progress.firstInstAmt + (currentInstallment - 2) * progress.otherInstAmt;
+            paidTowardCurrent = Math.max(0, progress.schedulePaid - prevCumulative);
+            rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
           }
 
-          const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
-          setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
+          let feeCtx: ReturnType<typeof getNonResFeePeriodContext> | null = null;
+          if (contract && nonResQe) {
+            feeCtx = getNonResFeePeriodContext(contract, prevPayments);
+            setQeNonVatFeesPerInst(feeCtx.nonVatPerInst);
+            setQeFeesPaidThisInst(feeCtx.feesPaidThisInst);
+            setQeFeePeriodInstallment(feeCtx.activeInstallment);
+            setQeFeesAllPeriodsPaid(feeCtx.allPeriodsPaid);
+          } else {
+            setQeNonVatFeesPerInst(0);
+            setQeFeesPaidThisInst(0);
+            setQeFeePeriodInstallment(null);
+            setQeFeesAllPeriodsPaid(false);
+          }
 
-          const currentInstAmt = currentInstallment === 1 ? firstInstAmt : otherInstAmt > 0 ? otherInstAmt : firstInstAmt;
-          const thresholdBefore = Math.max(0, cumulated - currentInstAmt);
-          const paidTowardCurrent = Math.max(0, totalPaidEffective - thresholdBefore);
-          const rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
-
-          const periodicFees =
-            (Number((contract as any).waterFee) || 0) +
-            (Number((contract as any).internetFee) || 0) +
-            (Number((contract as any).parkingFee) || 0) +
-            (Number((contract as any).managementFee) || 0);
-          const oneTimeFees =
-            (Number((contract as any).insuranceFee) || 0) +
-            (Number((contract as any).serviceFee) || 0) +
-            (Number((contract as any).officeFeeAmount) || 0) +
-            (Number((contract as any).otherAmount) || 0) -
-            (Number((contract as any).otherDeduction) || 0);
-          const periodicPerInst = totalInst > 0 ? periodicFees / totalInst : 0;
-          const feesForThisInst = currentInstallment === 1 ? periodicPerInst + oneTimeFees : periodicPerInst;
-          const nonVatPerInst = Math.round(feesForThisInst);
-          setQeNonVatFeesPerInst(nonVatPerInst);
-
-          const { startDate: feeStart, endDate: feeEnd } = getInstallmentRange(contract, currentInstallment);
-          const feeStartStr = dateToLocalStr(feeStart);
-          const feeEndStr = dateToLocalStr(feeEnd);
-          const feesPaidThisInstLocal = prevPayments
-            .filter((t) => (t as any).feesEntry === true && t.date >= feeStartStr && t.date <= feeEndStr)
-            .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
-          setQeFeesPaidThisInst(feesPaidThisInstLocal);
-          const feesRemaining = Math.max(0, nonVatPerInst - feesPaidThisInstLocal);
-
-          if (qeType === 'FEES') {
-            if (feesRemaining > 0) setQeAmount(feesRemaining.toString());
-            else if (nonVatPerInst > 0) setQeAmount(nonVatPerInst.toString());
+          if (qeType === 'FEES' && feeCtx) {
+            if (feeCtx.feesRemaining > 0.02) setQeAmount(String(Math.round(feeCtx.feesRemaining * 100) / 100));
+            else if (feeCtx.allPeriodsPaid) setQeAmount('');
+            else if (feeCtx.nonVatPerInst > 0) setQeAmount(String(feeCtx.nonVatPerInst));
+            else setQeAmount('');
           } else if (rentAutoFill > 0) {
             setQeAmount(rentAutoFill.toString());
           }
@@ -265,19 +538,31 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
               ? `Fees Installment ${currentInstallment} of ${totalInst}`
               : `Rent Installment ${currentInstallment} of ${totalInst}`;
           const isPartial =
-            totalPaidEffective > Math.round((cumulated - (currentInstallment === 1 ? firstInstAmt : otherInstAmt)) * 100) / 100 &&
-            totalPaidEffective < Math.round(cumulated * 100) / 100;
-          const isFeesPartial = qeType === 'FEES' && feesPaidThisInstLocal > 0 && feesPaidThisInstLocal < nonVatPerInst;
+            paidTowardCurrent > 0.01 && paidTowardCurrent < currentInstAmt - 0.01;
           const contractCust =
             customers.find((c) => c.id === contract.customerId) ||
             customers.find((c) => (c.nameEn || c.nameAr) === contract.customerName);
           const contractCustLabel = formatNameWithRoom(contract.customerName, contractCust?.roomNumber);
-          if (qeType === 'FEES') {
-            setQeDetails(
-              isFeesPartial
-                ? `Balance Fees Payment - Installment ${currentInstallment} - ${periodText} - ${contractCustLabel}`
-                : `${instText} - ${periodText} - ${contractCustLabel}`,
-            );
+          if (qeType === 'FEES' && feeCtx) {
+            if (feeCtx.allPeriodsPaid) {
+              setQeDetails(t('vat.feesAllPeriodsPaidDetail', { customer: contractCustLabel }));
+            } else if (feeCtx.activeInstallment != null) {
+              const fi = feeCtx.activeInstallment;
+              // Use the exact fee window computed by feeCtx to avoid any drift / mismatch.
+              const feePeriodText = feeCtx.feeStartStr && feeCtx.feeEndStr
+                ? `[${fmtDate(feeCtx.feeStartStr)} to ${fmtDate(feeCtx.feeEndStr)}]`
+                : '';
+              const feeInstText =
+                fi === 1 ? `1st Fees Payment` : `Fees Installment ${fi} of ${totalInst}`;
+              const isFeesPartial = feeCtx.feesPaidThisInst > 0.02 && feeCtx.feesRemaining > 0.02;
+              setQeDetails(
+                isFeesPartial
+                  ? `Balance Fees Payment - Installment ${fi}${feePeriodText ? ` - ${feePeriodText}` : ''} - ${contractCustLabel}`
+                  : `${feeInstText}${feePeriodText ? ` - ${feePeriodText}` : ''} - ${contractCustLabel}`,
+              );
+            } else {
+              setQeDetails(`Non-VAT Fees - ${contractCustLabel}`);
+            }
           } else {
             setQeDetails(
               isPartial
@@ -299,21 +584,45 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
         setQeContractLookupLoading(false);
       }
     },
-    [qeBuildingId, customers, transactions, qeType],
+    [qeBuildingId, customers, transactions, qeType, buildings],
   );
 
   const handleSave = async () => {
     const amt = parseFloat(qeAmount);
+    const discount = Math.max(0, parseFloat(qeDiscount || '0') || 0);
+    const netAmount = Math.max(0, amt - discount);
     const errors: any = {};
+    if (!qeDate) errors.date = 'Required';
+    if (!qeDetails || !qeDetails.trim()) errors.details = 'Required';
     if (qeType === 'SALES') {
       if (!qeCustomerVAT) errors.customerVAT = 'Customer VAT number is required';
       else if (!isValidSaudiVAT(qeCustomerVAT)) errors.customerVAT = 'Invalid Saudi VAT number';
+      if (!qeBuildingId) errors.property = 'Select property';
+      if (!String(qeUnitNumber || '').trim()) errors.unit = 'Select a unit';
     }
     if (qeType === 'EXPENSE') {
       if (!qeVendorName) errors.vendorName = 'Required';
-      if (qeVendorVAT && !isValidSaudiVAT(qeVendorVAT)) errors.vendorVAT = 'Invalid VAT';
+      if (!qeVendorVAT) errors.vendorVAT = 'Required';
+      else if (!isValidSaudiVAT(qeVendorVAT)) errors.vendorVAT = 'Invalid VAT';
+      if (!qeVendorRefNo || !qeVendorRefNo.trim()) errors.vendorRefNo = 'Required';
+      if (!qeCategory || !qeCategory.trim()) errors.category = 'Required';
+      if (!qeSubCategory || !qeSubCategory.trim()) errors.subCategory = 'Required';
+      // Purchase entry must be linked to a property choice (either a building or "General Expense")
+      if (!qePurchaseBuildingId || qePurchaseBuildingId === '__SELECT__') errors.purchaseProperty = 'Select related property';
     }
-    if (!amt || amt <= 0) errors.amount = 'Required';
+    if (qeType === 'FEES' && qeFeesAllPeriodsPaid) {
+      errors.feesComplete = t('vat.feesNoNextPeriodBanner');
+    } else if (!amt || amt <= 0) {
+      errors.amount = 'Required';
+    }
+    if (qeType === 'FEES' && discount > amt) errors.amount = 'Discount cannot exceed amount';
+    if (qeType === 'FEES') {
+      if (!qeBuildingId || !feesEligibleBuildings.some((b) => b.id === qeBuildingId)) {
+        errors.property = 'Select a non-residential property';
+      }
+      if (!String(qeUnitNumber || '').trim()) errors.unit = 'Select a unit';
+    }
+    if (qePaymentMethod === PaymentMethod.BANK && !qeBankName.trim()) errors.bankName = 'Select bank account';
     if (Object.keys(errors).length > 0) {
       setQeErrors(errors);
       return;
@@ -331,9 +640,11 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           id: crypto.randomUUID(),
           type: TransactionType.INCOME,
           date: qeDate,
-          amount: Math.round(amt * 100) / 100,
+          amount: Math.round(netAmount * 100) / 100,
+          discountAmount: discount > 0 ? Math.round(discount * 100) / 100 : undefined,
           isVATApplicable: false,
           paymentMethod: qePaymentMethod,
+          bankName: qePaymentMethod === PaymentMethod.BANK ? qeBankName : undefined,
           details:
             qeDetails ||
             `Non-VAT Fees${
@@ -364,15 +675,29 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           amountIncludingVAT: Math.round(amountIncl * 100) / 100,
           totalWithVat: Math.round(amountIncl * 100) / 100,
           vatRate: 15,
-          vatInvoiceNumber: `INV-${Date.now().toString(36).toUpperCase()}`,
+          vatInvoiceNumber: qeType === 'SALES'
+            ? getNextVatInvoiceNumber(
+                transactions.filter((t) => t.type === TransactionType.INCOME && !t.isCreditNote),
+                qeDate,
+              )
+            : (qeVendorRefNo.trim() || getNextVatInvoiceNumber(transactions, qeDate)),
           isVATApplicable: true,
           paymentMethod: qePaymentMethod,
+          bankName: qePaymentMethod === PaymentMethod.BANK ? qeBankName : undefined,
           details: qeDetails,
           userId: uid,
-          buildingId: qeType === 'SALES' ? qeBuildingId : qePurchaseBuildingId,
+          buildingId:
+            qeType === 'SALES'
+              ? qeBuildingId
+              : (qePurchaseBuildingId === '__GENERAL__' ? '' : qePurchaseBuildingId),
           buildingName:
-            buildings.find((b) => b.id === (qeType === 'SALES' ? qeBuildingId : qePurchaseBuildingId))?.name || '',
+            buildings.find((b) =>
+              b.id === (qeType === 'SALES' ? qeBuildingId : (qePurchaseBuildingId === '__GENERAL__' ? '' : qePurchaseBuildingId))
+            )?.name || '',
           unitNumber: qeType === 'SALES' ? qeUnitNumber : undefined,
+          customerName: qeType === 'SALES'
+            ? formatNameWithRoom(qeContractCustomer?.nameEn || qeActiveContract?.customerName || '', qeContractCustomer?.roomNumber)
+            : undefined,
           customerVATNumber: qeType === 'SALES' ? qeCustomerVAT : undefined,
           vendorName: qeType === 'EXPENSE' ? qeVendorName : undefined,
           vendorVATNumber: qeType === 'EXPENSE' ? qeVendorVAT : undefined,
@@ -392,6 +717,7 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           amount: amt,
           isVATApplicable: false,
           paymentMethod: qePaymentMethod,
+          bankName: qePaymentMethod === PaymentMethod.BANK ? qeBankName : undefined,
           details: qeDetails,
           userId: uid,
           buildingId: qeBuildingId,
@@ -408,12 +734,11 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
         const invNo = tx.feeInvoiceNo;
         const w = window.open('', '_blank');
         if (w) {
-          const feeRows = [
-            { label: 'Water Fee', val: Number((qeActiveContract as any)?.waterFee) || 0 },
-            { label: 'Internet Fee', val: Number((qeActiveContract as any)?.internetFee) || 0 },
-            { label: 'Parking Fee', val: Number((qeActiveContract as any)?.parkingFee) || 0 },
-            { label: 'Management Fee', val: Number((qeActiveContract as any)?.managementFee) || 0 },
-          ].filter((f) => f.val > 0);
+          const feeRows = getNonResFeeBreakdownLines(qeActiveContract as any).map((line) => ({
+            label: t(line.labelKey),
+            val: line.val,
+            firstInstallmentOnly: line.firstInstallmentOnly,
+          }));
           const instCount = qeActiveContract?.installmentCount || 1;
           w.document.write(`<!DOCTYPE html><html><head><meta charset="utf-8" /><title>Fee Invoice ${invNo}</title>
           <style>
@@ -454,8 +779,18 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           <table>
             <thead><tr><th>Description</th><th>Annual Total</th><th>Per Installment</th></tr></thead>
             <tbody>
-              ${feeRows.map((f) => `<tr><td>${f.label}</td><td>${f.val.toLocaleString()} SAR</td><td>${Math.round(f.val / instCount).toLocaleString()} SAR</td></tr>`).join('')}
-              <tr class="total-row"><td>Total</td><td></td><td>${tx.amount.toLocaleString()} SAR</td></tr>
+              ${feeRows
+                .map((f) => {
+                  const perInst = (f as any).firstInstallmentOnly
+                    ? qeFeePeriodInstallment === 1
+                      ? f.val
+                      : 0
+                    : Math.round(f.val / instCount);
+                  return `<tr><td>${f.label}</td><td>${f.val.toLocaleString()} SAR</td><td>${perInst.toLocaleString()} SAR</td></tr>`;
+                })
+                .join('')}
+              ${tx.discountAmount ? `<tr><td>Discount</td><td></td><td>- ${Number(tx.discountAmount).toLocaleString()} SAR</td></tr>` : ''}
+              <tr class="total-row"><td>Net Total</td><td></td><td>${tx.amount.toLocaleString()} SAR</td></tr>
             </tbody>
           </table>
           <p style="margin-top:32px;font-size:11px;color:#94a3b8;text-align:center">This invoice does not include VAT. Fees are charged as-is per lease agreement.</p>
@@ -585,13 +920,53 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
             <div className="grid grid-cols-2 gap-4">
               <div className="space-y-1.5">
                 <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1"><Calendar size={10} /> Date</label>
-                <input type="date" value={qeDate} onChange={(e) => setQeDate(e.target.value)} className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold focus:ring-2 focus:ring-blue-200 focus:border-blue-300 outline-none transition-all" />
+                <input
+                  type="date"
+                  value={qeDate}
+                  onChange={(e) => { setQeDate(e.target.value); setQeErrors((p) => ({ ...p, date: undefined })); }}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold focus:ring-2 focus:ring-blue-200 focus:border-blue-300 outline-none transition-all"
+                />
+                {qeErrors.date && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.date}</p>}
               </div>
               <div className="space-y-1.5">
                 <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1"><Receipt size={10} /> Payment Method</label>
-                <SearchableSelect options={Object.values(PaymentMethod).map((m) => ({ value: m, label: m }))} value={qePaymentMethod} onChange={(v) => setQePaymentMethod(v as PaymentMethod)} className="font-bold" />
+                <SearchableSelect
+                  options={Object.values(PaymentMethod).map((m) => ({ value: m, label: m }))}
+                  value={qePaymentMethod}
+                  onChange={(v) => {
+                    const method = v as PaymentMethod;
+                    setQePaymentMethod(method);
+                    if (method !== PaymentMethod.BANK) {
+                      setQeBankName('');
+                      setQeErrors((prev) => ({ ...prev, bankName: undefined }));
+                    }
+                  }}
+                  className="font-bold"
+                />
               </div>
             </div>
+
+            {qePaymentMethod === PaymentMethod.BANK && (
+              <div className="space-y-1.5 animate-fade-in">
+                <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Bank account</label>
+                <select
+                  value={qeBankName}
+                  onChange={(e) => {
+                    setQeBankName(e.target.value);
+                    setQeErrors((prev) => ({ ...prev, bankName: undefined }));
+                  }}
+                  className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold focus:ring-2 focus:ring-blue-200 focus:border-blue-300 outline-none transition-all"
+                >
+                  <option value="">{qeBankOptions.length === 0 ? 'No bank accounts available' : 'Select bank...'}</option>
+                  {qeBankOptions.map((b, idx) => (
+                    <option key={`${b.name}-${idx}`} value={b.name}>
+                      {b.name}
+                    </option>
+                  ))}
+                </select>
+                {qeErrors.bankName && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.bankName}</p>}
+              </div>
+            )}
 
             {/* ── SALES: Property & Tenant ── */}
             {qeType === 'SALES' && (
@@ -739,25 +1114,167 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
                 {qeErrors.vendorName && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.vendorName}</p>}
                 {qeErrors.vendorVAT && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.vendorVAT}</p>}
 
+                <div className="space-y-1.5">
+                  <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Expense category</label>
+                  <div className="flex items-center gap-2">
+                  <SearchableSelect
+                    options={[
+                      ...qeExpenseCategoryOptions.map((c) => ({ value: c, label: c })),
+                      ...(!Object.values(ExpenseCategory).includes(qeCategory as any) && qeCategory
+                        ? [{ value: '__DELETE_CAT__', label: '🗑 Delete selected category' }]
+                        : []),
+                    ]}
+                    value={qeCategory}
+                    onChange={(id) => {
+                      if (id === '__DELETE_CAT__') {
+                        deleteQeExpenseCategory();
+                        return;
+                      }
+                      setQeCategory(id);
+                      setQeSubCategory('');
+                      setQeErrors((p) => ({ ...p, category: undefined, subCategory: undefined }));
+                    }}
+                    className="font-bold"
+                  />
+                  {!Object.values(ExpenseCategory).includes(qeCategory as any) && !!qeCategory && (
+                    <button
+                      type="button"
+                      onClick={deleteQeExpenseCategory}
+                      className="px-3 py-2 rounded-xl border border-rose-200 bg-rose-50 text-rose-700 text-[10px] font-black uppercase tracking-wide hover:bg-rose-100 whitespace-nowrap"
+                      title="Delete selected category"
+                    >
+                      Delete
+                    </button>
+                  )}
+                  </div>
+                  {qeErrors.category && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.category}</p>}
+                  <div className="flex gap-2 mt-1">
+                    <input
+                      type="text"
+                      value={qeNewExpenseCategoryInput}
+                      onChange={(e) => setQeNewExpenseCategoryInput(e.target.value)}
+                      className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-amber-200"
+                      placeholder="New category name…"
+                    />
+                    <button
+                      type="button"
+                      onClick={addQeExpenseCategory}
+                      className="px-3 py-2 rounded-xl bg-amber-600 text-white text-[10px] font-black uppercase tracking-wide hover:bg-amber-700"
+                    >
+                      Add
+                    </button>
+                  </div>
+                </div>
+
+                {([...(EXPENSE_SUBCATEGORIES[qeCategory] || []), ...(qeExpenseCustomSubCategories[qeCategory] || [])].length > 0) ? (
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Sub-category</label>
+                    <div className="flex items-center gap-2">
+                    <SearchableSelect
+                      options={[
+                        ...[...(EXPENSE_SUBCATEGORIES[qeCategory] || []), ...(qeExpenseCustomSubCategories[qeCategory] || [])]
+                          .filter(Boolean)
+                          .map((s) => ({ value: s, label: s })),
+                        ...((qeSubCategory && !(EXPENSE_SUBCATEGORIES[qeCategory] || []).includes(qeSubCategory))
+                          ? [{ value: '__DELETE_SUB__', label: '🗑 Delete selected sub-category' }]
+                          : []),
+                      ]}
+                      value={qeSubCategory}
+                      onChange={(v) => {
+                        if (v === '__DELETE_SUB__') {
+                          deleteQeExpenseSubCategory();
+                          return;
+                        }
+                        setQeSubCategory(v);
+                        setQeErrors((p) => ({ ...p, subCategory: undefined }));
+                      }}
+                      className="font-bold"
+                      placeholder="Select…"
+                    />
+                    {qeSubCategory && !(EXPENSE_SUBCATEGORIES[qeCategory] || []).includes(qeSubCategory) && (
+                      <button
+                        type="button"
+                        onClick={deleteQeExpenseSubCategory}
+                        className="px-3 py-2 rounded-xl border border-rose-200 bg-rose-50 text-rose-700 text-[10px] font-black uppercase tracking-wide hover:bg-rose-100 whitespace-nowrap"
+                        title="Delete selected sub-category"
+                      >
+                        Delete
+                      </button>
+                    )}
+                    </div>
+                    {qeErrors.subCategory && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.subCategory}</p>}
+                    <div className="flex gap-2 mt-1">
+                      <input
+                        type="text"
+                        value={qeNewExpenseSubCategoryInput}
+                        onChange={(e) => setQeNewExpenseSubCategoryInput(e.target.value)}
+                        className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-amber-200"
+                        placeholder="New sub-category…"
+                      />
+                      <button
+                        type="button"
+                        onClick={addQeExpenseSubCategory}
+                        className="px-3 py-2 rounded-xl bg-amber-600 text-white text-[10px] font-black uppercase tracking-wide hover:bg-amber-700"
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-1.5">
+                    <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Sub-category (optional)</label>
+                    <input
+                      type="text"
+                      value={qeSubCategory}
+                      onChange={(e) => { setQeSubCategory(e.target.value); setQeErrors((p) => ({ ...p, subCategory: undefined })); }}
+                      className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-amber-200 transition-all"
+                      placeholder="e.g. Office supplies"
+                    />
+                    {qeErrors.subCategory && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.subCategory}</p>}
+                    <div className="flex gap-2 mt-2">
+                      <input
+                        type="text"
+                        value={qeNewExpenseSubCategoryInput}
+                        onChange={(e) => setQeNewExpenseSubCategoryInput(e.target.value)}
+                        className="flex-1 px-3 py-2 bg-white border border-slate-200 rounded-xl text-xs font-bold outline-none focus:ring-2 focus:ring-amber-200"
+                        placeholder="Add sub-category…"
+                      />
+                      <button
+                        type="button"
+                        onClick={addQeExpenseSubCategory}
+                        className="px-3 py-2 rounded-xl bg-amber-600 text-white text-[10px] font-black uppercase tracking-wide hover:bg-amber-700"
+                      >
+                        Add
+                      </button>
+                    </div>
+                  </div>
+                )}
+
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Invoice / Ref No.</label>
                     <input
                       type="text"
                       value={qeVendorRefNo}
-                      onChange={(e) => setQeVendorRefNo(e.target.value)}
+                      onChange={(e) => { setQeVendorRefNo(e.target.value); setQeErrors((p) => ({ ...p, vendorRefNo: undefined })); }}
                       className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold font-mono outline-none focus:ring-2 focus:ring-amber-200 transition-all"
                       placeholder="INV-2026-..."
                     />
+                    {qeErrors.vendorRefNo && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.vendorRefNo}</p>}
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Related Property</label>
                     <SearchableSelect
-                      options={[{ value: '', label: 'General Expense' }, ...nonResidentialBuildings.map((b) => ({ value: b.id, label: b.name }))]}
+                      options={[
+                        { value: '__SELECT__', label: 'Select property…' },
+                        { value: '__GENERAL__', label: 'General Expense' },
+                        ...buildings.map((b) => ({ value: b.id, label: b.name || b.id || '(unnamed)' })),
+                      ]}
                       value={qePurchaseBuildingId}
-                      onChange={setQePurchaseBuildingId}
+                      onChange={handleQePurchaseBuildingChange}
                       className="font-bold"
                     />
+                    {qeErrors.purchaseProperty && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.purchaseProperty}</p>}
                   </div>
                 </div>
               </div>
@@ -775,26 +1292,40 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
                 <div className="grid grid-cols-2 gap-4">
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Property</label>
-                    <SearchableSelect
-                      options={buildings.map((b) => ({ value: b.id, label: b.name || b.id || '(unnamed)' }))}
-                      value={qeBuildingId}
-                      onChange={handleQEBuildingChange}
-                      className="font-bold"
-                    />
+                    {feesEligibleBuildings.length === 0 ? (
+                      <p className="text-[10px] text-amber-700 font-bold bg-amber-50 border border-amber-200 rounded-xl px-3 py-2">
+                        No non-residential buildings are configured. Add one in Buildings or set property type to Non-Residential.
+                      </p>
+                    ) : (
+                      <SearchableSelect
+                        options={feesEligibleBuildings.map((b) => ({ value: b.id, label: b.name || b.id || '(unnamed)' }))}
+                        value={qeBuildingId}
+                        onChange={(id) => {
+                          handleQEBuildingChange(id);
+                          setQeErrors((p) => ({ ...p, property: undefined, unit: undefined }));
+                        }}
+                        className="font-bold"
+                      />
+                    )}
+                    {qeErrors.property && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.property}</p>}
                   </div>
                   <div className="space-y-1.5">
                     <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest">Unit</label>
                     <SearchableSelect
-                      options={(buildings.find((b) => b.id === qeBuildingId)?.units || [])
+                      options={(feesEligibleBuildings.find((b) => b.id === qeBuildingId)?.units || [])
                         .map((u: any) => {
                           const v = typeof u === 'string' ? u : u.unitNumber || u.name || '';
                           return { value: v, label: v || '(unnamed)' };
                         })
                         .filter((o) => o.value)}
                       value={qeUnitNumber}
-                      onChange={handleQEUnitChange}
+                      onChange={(u) => {
+                        handleQEUnitChange(u);
+                        setQeErrors((p) => ({ ...p, unit: undefined }));
+                      }}
                       className="font-bold"
                     />
+                    {qeErrors.unit && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.unit}</p>}
                     {qeContractLookupLoading && <div className="text-[10px] text-slate-400 font-bold animate-pulse mt-1">Looking up contract…</div>}
                   </div>
                 </div>
@@ -807,6 +1338,14 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
                     <div className="flex-1 min-w-0">
                       <div className="font-black text-slate-800 text-sm truncate">{formatNameWithRoom(qeActiveContract.customerName, qeContractCustomer?.roomNumber)}</div>
                       <div className="text-[10px] text-sky-600 font-bold mt-0.5">Contract #{qeActiveContract.contractNo}</div>
+                      {qeFeePeriodInstallment != null && !qeFeesAllPeriodsPaid && (
+                        <div className="text-[9px] font-black text-sky-700 mt-1 uppercase tracking-wide">
+                          {t('vat.feePeriodBadge', {
+                            current: String(qeFeePeriodInstallment),
+                            total: String(qeActiveContract.installmentCount || 1),
+                          })}
+                        </div>
+                      )}
                     </div>
                   </div>
                 )}
@@ -814,38 +1353,50 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
                 {qeActiveContract && (
                   <div className="rounded-xl border border-sky-200 bg-sky-50 p-3 space-y-1.5">
                     <div className="text-[9px] font-black text-sky-600 uppercase tracking-widest mb-2">Fee Breakdown (No VAT)</div>
-                    {[
-                      { label: 'Water Fee', val: Number((qeActiveContract as any).waterFee) || 0 },
-                      { label: 'Internet Fee', val: Number((qeActiveContract as any).internetFee) || 0 },
-                      { label: 'Parking Fee', val: Number((qeActiveContract as any).parkingFee) || 0 },
-                      { label: 'Management Fee', val: Number((qeActiveContract as any).managementFee) || 0 },
-                    ]
-                      .filter((f) => f.val > 0)
-                      .map((f) => (
-                        <div key={f.label} className="flex justify-between text-xs">
-                          <span className="text-slate-500 font-bold">{f.label}</span>
-                          <span className="font-black text-sky-800">{(f.val / (qeActiveContract.installmentCount || 1)).toLocaleString()} SAR<span className="text-slate-400 font-normal"> /inst</span></span>
-                        </div>
-                      ))}
-                    {qeNonVatFeesPerInst > 0 && (
-                      <div className="border-t border-sky-200 pt-1.5 mt-1 space-y-1">
-                        <div className="flex justify-between text-xs">
-                          <span className="text-sky-700 font-black uppercase text-[9px] tracking-wide">Total per Installment</span>
-                          <span className="font-black text-sky-700">{qeNonVatFeesPerInst.toLocaleString()} SAR</span>
-                        </div>
-                        {qeFeesPaidThisInst > 0 && (
-                          <div className="flex justify-between text-xs">
-                            <span className="text-emerald-600 font-bold text-[9px]">Already Paid This Period</span>
-                            <span className="font-black text-emerald-600">−{qeFeesPaidThisInst.toLocaleString()} SAR</span>
+                    {qeFeesAllPeriodsPaid ? (
+                      <p className="text-xs font-bold text-emerald-800 leading-snug">{t('vat.feesNoNextPeriodBanner')}</p>
+                    ) : (
+                      <>
+                        {getNonResFeeBreakdownLines(qeActiveContract as any).map((f) => {
+                          const inst = qeActiveContract.installmentCount || 1;
+                          const per = f.firstInstallmentOnly
+                            ? qeFeePeriodInstallment === 1
+                              ? f.val
+                              : 0
+                            : f.val / inst;
+                          return (
+                            <div key={f.key} className="flex justify-between text-xs">
+                              <span className={`font-bold ${f.val < 0 ? 'text-rose-700' : 'text-slate-500'}`}>{t(f.labelKey)}</span>
+                              <span className={`font-black ${f.val < 0 ? 'text-rose-700' : 'text-sky-800'}`}>
+                                {per.toLocaleString()} SAR
+                                <span className="text-slate-400 font-normal">{f.firstInstallmentOnly ? ' (1st inst only)' : ' /inst'}</span>
+                              </span>
+                            </div>
+                          );
+                        })}
+                        {qeNonVatFeesPerInst > 0 && (
+                          <div className="border-t border-sky-200 pt-1.5 mt-1 space-y-1">
+                            <div className="flex justify-between text-xs">
+                              <span className="text-sky-700 font-black uppercase text-[9px] tracking-wide">Total this fee period</span>
+                              <span className="font-black text-sky-700">{qeNonVatFeesPerInst.toLocaleString()} SAR</span>
+                            </div>
+                            {qeFeesPaidThisInst > 0 && (
+                              <div className="flex justify-between text-xs">
+                                <span className="text-emerald-600 font-bold text-[9px]">Already Paid This Period</span>
+                                <span className="font-black text-emerald-600">−{qeFeesPaidThisInst.toLocaleString()} SAR</span>
+                              </div>
+                            )}
+                            {qeFeesPaidThisInst > 0 && (
+                              <div className="flex justify-between text-xs bg-sky-100 rounded-lg px-2 py-1">
+                                <span className="text-sky-800 font-black uppercase text-[9px] tracking-wide">Remaining Due</span>
+                                <span className="font-black text-sky-800">
+                                  {Math.max(0, qeNonVatFeesPerInst - qeFeesPaidThisInst).toLocaleString()} SAR
+                                </span>
+                              </div>
+                            )}
                           </div>
                         )}
-                        {qeFeesPaidThisInst > 0 && (
-                          <div className="flex justify-between text-xs bg-sky-100 rounded-lg px-2 py-1">
-                            <span className="text-sky-800 font-black uppercase text-[9px] tracking-wide">Remaining Due</span>
-                            <span className="font-black text-sky-800">{Math.max(0, qeNonVatFeesPerInst - qeFeesPaidThisInst).toLocaleString()} SAR</span>
-                          </div>
-                        )}
-                      </div>
+                      </>
                     )}
                   </div>
                 )}
@@ -906,6 +1457,29 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
                   />
                 </div>
                 {qeErrors.amount && <p className="text-[10px] text-rose-500 font-bold -mt-2">{qeErrors.amount}</p>}
+                {qeErrors.feesComplete && <p className="text-[10px] text-emerald-700 font-bold -mt-2">{qeErrors.feesComplete}</p>}
+
+                {qeType === 'FEES' && (
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <div className="space-y-1">
+                      <label className="text-[10px] font-black text-slate-500 uppercase tracking-widest">Discount (SAR)</label>
+                      <input
+                        type="number"
+                        value={qeDiscount}
+                        min="0"
+                        onChange={(e) => setQeDiscount(e.target.value)}
+                        className="w-full px-4 py-3 bg-white border-2 border-sky-200 rounded-xl text-sm font-black text-slate-900 focus:border-sky-400 focus:ring-2 focus:ring-sky-100 outline-none transition-all"
+                        placeholder="0.00"
+                      />
+                    </div>
+                    <div className="rounded-xl border border-sky-200 bg-sky-50 px-4 py-3 flex items-center justify-between">
+                      <span className="text-[10px] font-black text-sky-700 uppercase tracking-widest">Net Fees</span>
+                      <span className="text-sm font-black text-sky-800">
+                        {Math.max(0, (parseFloat(qeAmount) || 0) - Math.max(0, parseFloat(qeDiscount || '0') || 0)).toFixed(2)} SAR
+                      </span>
+                    </div>
+                  </div>
+                )}
 
                 {qeType === 'FEES' && qeAmount && parseFloat(qeAmount) > 0 && (
                   <div className="flex items-center justify-center gap-2 py-2 bg-sky-50 rounded-xl border border-sky-200">
@@ -945,10 +1519,11 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
               <input
                 type="text"
                 value={qeDetails}
-                onChange={(e) => setQeDetails(e.target.value)}
+                onChange={(e) => { setQeDetails(e.target.value); setQeErrors((p) => ({ ...p, details: undefined })); }}
                 className="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-200 focus:border-blue-300 transition-all"
                 placeholder="Service description, installment details..."
               />
+              {qeErrors.details && <p className="text-[10px] text-rose-500 font-bold">{qeErrors.details}</p>}
             </div>
           </div>
 

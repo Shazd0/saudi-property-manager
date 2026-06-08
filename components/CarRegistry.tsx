@@ -5,6 +5,7 @@ import { Search, Car, User, Smartphone, Building2, FileText, Filter, ChevronDown
 import SoundService from '../services/soundService';
 import type { Customer, Contract } from '../types';
 import { useLanguage } from '../i18n';
+import { matchesAdvancedSearch } from '../utils/advancedSearch';
 import { formatNameWithRoom } from '../utils/customerDisplay';
 
 interface CarPlateEntry {
@@ -105,12 +106,24 @@ const CarRegistry: React.FC = () => {
     }, [plates]);
 
     const filtered = useMemo(() => {
-        let list = plates.filter(p =>
-            p.plate.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            p.customer.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            p.contractNo.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            p.building.toLowerCase().includes(searchTerm.toLowerCase()) ||
-            p.unit.toLowerCase().includes(searchTerm.toLowerCase())
+        let list = plates.filter((p) =>
+            !searchTerm.trim() ||
+            matchesAdvancedSearch(
+                searchTerm,
+                [
+                    p.plate,
+                    p.customer,
+                    p.customerId,
+                    p.customerCode,
+                    p.contractNo,
+                    p.building,
+                    p.unit,
+                    p.mobile,
+                    p.idNo,
+                    p.nationality,
+                    p.contractStatus,
+                ].join(' '),
+            ),
         );
         if (statusFilter !== 'All') {
             list = list.filter(p => p.contractStatus === statusFilter);

@@ -1,9 +1,0 @@
-node_modules
-dist
-release
-.git
-.gitignore
-*.md
-electron
-tools
-**/.DS_Store

@@ -12,7 +12,7 @@ import { fmtDate } from '../utils/dateFormat';
 import { auth } from '../firebase';
 import { useLanguage } from '../i18n';
 
-const ZATCA_SERVICE_URL = (import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3002';
+const ZATCA_SERVICE_URL = (import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022';
 
 const companyName = '��´��±�"���© ��§��±��§��± �"⬦�"Š�"�~�"Š�"⬠�"Š�"� �"⬦ ��§�"�~�"⬦��­��¯�"� ��¯��©';
 const companyNameEn = 'RR MILLENNIUM CO. LTD';
@@ -314,7 +314,7 @@ const [qeVendorAutoFilled, setQeVendorAutoFilled] = useState(false);
   const createAndReportCreditNote = async (original: Transaction) => {
     const cn = await createCreditNote(original);
     try {
-      const zatcaUrl = ((import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3002') + '/zatca/sign-and-report';
+      const zatcaUrl = ((import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022') + '/zatca/sign-and-report';
       const cnPayload = {
         invoiceNumber: cn.vatInvoiceNumber,
         issueDate: cn.date,

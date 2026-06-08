@@ -53,6 +53,8 @@ import ApprovalCenter from './components/ApprovalCenter';
 import ImmersiveLanding from '@/components/landing/ImmersiveLanding';
 import ReportBugButton from './components/ReportBugButton';
 import AdminBugDashboard from './components/AdminBugDashboard';
+import SheetsImport from './components/SheetsImport';
+import AmlakSheets from './components/AmlakSheets';
 
 import { NotificationBell, NotificationPanel, useNotifications } from './components/Notifications';
 import QuickActions, { QuickActionButton, QuickActionFAB } from './components/QuickActions';
@@ -63,6 +65,7 @@ import StaffChat from './components/StaffChat';
 import ChatBubble from './components/ChatBubble';
 import AIAssistant from './components/AIAssistant';
 import FloatingToolsDock from './components/FloatingToolsDock';
+import FloatingCalculator from './components/FloatingCalculator';
 import OfflineBanner from './components/OfflineBanner';
 import { UserRole } from './types';
 import { setUserScope } from './services/firestoreService';
@@ -218,6 +221,8 @@ const AppContent: React.FC = () => {
     };
   }, []);
   const isOnChatPage = currentHash.replace(/\/$/, '') === '#/chat';
+  const isOnSheetsPage = getRouteFromHash(currentHash).replace(/\/$/, '') === '/amlak-sheets';
+  const isStandaloneWorkspace = isOnChatPage || isOnSheetsPage;
 
   // Keep tab inputs (filters/search/forms) when switching routes.
   useEffect(() => {
@@ -250,15 +255,19 @@ const AppContent: React.FC = () => {
     return () => window.removeEventListener('hashchange', checkTenantMode);
   }, []);
 
-  // Auto Rent Payment processing
+  // Auto Rent Payment processing — defer so login/dashboard loads first
   useEffect(() => {
-    if (user && isAutoRentEnabled()) {
-      const userId = user.id || user.uid || 'system';
-      const userName = user.name || user.displayName || 'System';
-      processAutoRentPayments(userId, userName).then(count => {
-        if (count > 0) console.log(`Auto rent: ${count} transaction(s) generated`);
-      }).catch(e => console.log('Auto rent check skipped:', e?.message));
-    }
+    if (!user || !isAutoRentEnabled()) return;
+    const userId = user.id || user.uid || 'system';
+    const userName = user.name || user.displayName || 'System';
+    const timer = window.setTimeout(() => {
+      processAutoRentPayments(userId, userName)
+        .then((count) => {
+          if (count > 0) console.log(`Auto rent: ${count} transaction(s) generated`);
+        })
+        .catch((e) => console.log('Auto rent check skipped:', e?.message));
+    }, 8000);
+    return () => window.clearTimeout(timer);
   }, [user]);
 
   // Global click sound: any <button> or <a> click that isn't already handled plays a subtle click
@@ -545,9 +554,9 @@ const AppContent: React.FC = () => {
     <div className={`${darkMode ? 'dark' : 'light'} app-theme`} dir={isRTL ? 'rtl' : 'ltr'}>
       <OfflineBanner />
       <div className={`app-shell flex min-h-screen bg-gradient-to-br from-green-50 via-emerald-50 to-teal-50 dark:from-gray-900 dark:via-gray-900 dark:to-gray-900 dark:bg-none font-sans text-emerald-900 dark:text-slate-100 transition-colors duration-300 ${isRTL ? 'flex-row-reverse' : ''}`}>
-        <Sidebar user={user} onLogout={handleLogout} onToggleCollapse={setSidebarCollapsed} />
+        {!isOnSheetsPage && <Sidebar user={user} onLogout={handleLogout} onToggleCollapse={setSidebarCollapsed} pendingApprovals={pendingApprovals} />}
         {/* Dedicated mobile top bar (hidden on desktop) */}
-        {!isOnChatPage && (
+        {!isStandaloneWorkspace && (
           <MobileHeader
             user={user}
             darkMode={darkMode}
@@ -558,13 +567,13 @@ const AppContent: React.FC = () => {
             pendingApprovals={pendingApprovals}
           />
         )}
-        <main className={`app-main flex-1 ${sidebarCollapsed ? (isRTL ? 'md:mr-20' : 'md:ml-20') : (isRTL ? 'md:mr-72' : 'md:ml-72')} ${isRTL ? 'mr-0' : 'ml-0'} ${isOnChatPage ? 'overflow-hidden h-screen' : 'md:p-8 p-3 pb-28 mobile-main-top-pad overflow-y-auto'} transition-all duration-300`}>
-          {!isOnChatPage && (
+        <main className={`app-main flex-1 ${isOnSheetsPage ? '' : (sidebarCollapsed ? (isRTL ? 'md:mr-20' : 'md:ml-20') : (isRTL ? 'md:mr-72' : 'md:ml-72'))} ${isRTL ? 'mr-0' : 'ml-0'} ${isStandaloneWorkspace ? 'overflow-hidden h-screen' : 'md:p-8 p-3 mobile-main-top-pad mobile-main-bottom-pad overflow-y-visible md:overflow-y-auto'} transition-all duration-300`}>
+          {!isStandaloneWorkspace && (
             <GlobalSearchWithResults searching={searching} searchResults={searchResults} setSearching={setSearching} setSearchResults={setSearchResults} />
           )}
 
-          <div className={isOnChatPage ? 'h-full' : 'max-w-7xl mx-auto page-transition mobile-main-container'}>
-            {!isOnChatPage && (
+          <div className={isStandaloneWorkspace ? 'h-full' : 'max-w-7xl mx-auto page-transition mobile-main-container'}>
+            {!isStandaloneWorkspace && (
               <header className="app-page-header mb-6 md:mb-8 hidden md:flex flex-col gap-4 md:flex-row md:justify-between md:items-end">
                 <div>
                   <h1 className="text-3xl font-black text-emerald-800 dark:text-emerald-400 tracking-tight bg-clip-text text-transparent bg-gradient-to-r from-emerald-900 to-green-700 dark:from-emerald-400 dark:to-green-400">
@@ -618,6 +627,7 @@ const AppContent: React.FC = () => {
                     {/* ... other routes remain the same ... */}
                     <Route path="/entry" element={<EntryForm currentUser={user} />} />
                     <Route path="/bulk-rent" element={<BulkRentEntry currentUser={user} />} />
+                    <Route path="/amlak-sheets" element={<AmlakSheets currentUser={user} />} />
                     <Route path="/contracts" element={<ContractForm currentUser={user} />} />
                     <Route path="/history" element={<History currentUser={user} />} />
                     <Route path="/monitoring" element={<Monitoring />} />
@@ -663,6 +673,7 @@ const AppContent: React.FC = () => {
                         <Route path="/admin/backup" element={<BackupManager />} />
                         <Route path="/admin/cloud-backup" element={<CloudBackupManager currentUser={user} accessToken={localStorage.getItem('gdrive_access_token') || undefined} />} />
                         <Route path="/admin/bulk-import" element={<BulkImportCustomers />} />
+                        <Route path="/admin/sheets-import" element={<SheetsImport currentUser={user} />} />
                         <Route path="/admin/books" element={<BookManager currentUser={user} />} />
                       </>
                     )}
@@ -673,13 +684,16 @@ const AppContent: React.FC = () => {
             </ErrorBoundary>
           </div>
         </main>
-        <div className="md:hidden fixed bottom-0 left-0 right-0 z-50 mobile-bottom-nav-wrap">
-          <BottomNav user={user} onMenuClick={() => setMobileMenuOpen(true)} pendingApprovals={pendingApprovals} />
-        </div>
-        <MobileMenu user={user} isOpen={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} onLogout={handleLogout} pendingApprovals={pendingApprovals} />
+        {!isOnSheetsPage && (
+          <div className="md:hidden fixed bottom-0 left-0 right-0 z-50 mobile-bottom-nav-wrap">
+            <BottomNav user={user} onMenuClick={() => setMobileMenuOpen(true)} pendingApprovals={pendingApprovals} />
+          </div>
+        )}
+        {!isOnSheetsPage && <MobileMenu user={user} isOpen={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} onLogout={handleLogout} pendingApprovals={pendingApprovals} />}
         <NotificationPanel isOpen={notifOpen} onClose={() => setNotifOpen(false)} notifications={notif.notifications} onMarkRead={notif.markRead} onMarkAllRead={notif.markAllRead} onDismiss={notif.dismiss} onDismissAll={notif.dismissAll} />
-        <QuickActions user={user} isOpen={quickActionsOpen} onClose={() => setQuickActionsOpen(false)} />
-        <FloatingToolsDock user={user} />
+        {!isOnSheetsPage && <QuickActions user={user} isOpen={quickActionsOpen} onClose={() => setQuickActionsOpen(false)} />}
+        {!isOnSheetsPage && <FloatingToolsDock user={user} />}
+        {!isOnSheetsPage && <FloatingCalculator />}
       </div>
     </div>
   );

@@ -1,18 +1,22 @@
 import React, { useState, useEffect, useMemo, useRef, useCallback } from 'react';
 import { useLanguage } from '../i18n';
 import { Transaction, TransactionType, PaymentMethod, ExpenseCategory, User, Building, UserRole, Contract, Vendor, Bank, TransactionStatus, Customer, ServiceAgreement } from '../types';
-import { getBuildings, getUsers, saveTransaction, getActiveContract, getContracts, getVendors, getBanks, saveBank, getTransactions, requestTransactionEdit, getCustomers, getCustomExpenseCategories, saveCustomExpenseCategories, getCustomIncomeCategories, saveCustomIncomeCategories, getTransfers, getServiceAgreements, saveServiceAgreement } from '../services/firestoreService';
+import { getBuildings, getUsersAcrossBooks, saveTransaction, getActiveContract, getContracts, getVendors, getBanks, saveBank, getTransactions, requestTransactionEdit, getCustomers, getCustomExpenseCategories, saveCustomExpenseCategories, getCustomIncomeCategories, saveCustomIncomeCategories, getTransfers, getServiceAgreements, saveServiceAgreement } from '../services/firestoreService';
 import { Save, RefreshCw, CheckCircle, ArrowRight, Banknote, Calendar, Plus, TrendingUp, TrendingDown, Info, CreditCard, UserPlus, FileSignature, Calculator, Receipt, Sparkles } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 import SearchableSelect from './SearchableSelect';
 import { useToast } from './Toast';
 import SoundService from '../services/soundService';
-import { fmtDate } from '../utils/dateFormat';
+import { fmtDate, isDateInCurrentMonth, contractDateToYmd } from '../utils/dateFormat';
 import { getInstallmentRange } from '../utils/installmentSchedule';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
+import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
 import LoadingOverlay from './LoadingOverlay';
 import ConfirmDialog from './ConfirmDialog';
 import VATQuickEntryModal, { VATQuickEntryType } from './VATQuickEntryModal';
+import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
+import { getCarriedPriorInstallmentWindow } from '../utils/priorBalanceCarriedInstallment';
+import { getNonResFeePeriodContext } from '../utils/nonResidentialFeeSchedule';
 
 // ZATCA QR Code Generation (TLV Format) - Browser Compatible
 const generateZATCAQR = (tx: Partial<Transaction>, contract?: Contract, customers?: Customer[]) => {
@@ -57,12 +61,42 @@ const generateZATCAQR = (tx: Partial<Transaction>, contract?: Contract, customer
   return hexToBase64(tlv);
 };
 
+const getVatInclusiveEditAmount = (transaction: Transaction): number => {
+  const explicitInclusive = transaction.amountIncludingVAT ?? transaction.totalWithVat;
+  const base = Number(transaction.amount || 0);
+  const vat = Number(transaction.vatAmount || 0);
+
+  if (explicitInclusive != null) {
+    const inclusive = Number(explicitInclusive);
+    if (Number.isFinite(inclusive)) {
+      // Some older VAT expense rows stored the exclusive/base amount in
+      // amountIncludingVAT. In edit mode, show the same inclusive total as History.
+      if (
+        transaction.type === TransactionType.EXPENSE &&
+        vat > 0 &&
+        base > 0 &&
+        inclusive > 0 &&
+        inclusive <= base + 0.01
+      ) {
+        return base + vat;
+      }
+      return inclusive;
+    }
+  }
+
+  if (transaction.type === TransactionType.EXPENSE && vat > 0) {
+    return base + vat;
+  }
+
+  return base;
+};
+
 interface EntryFormProps {
   currentUser: User;
   prefillCategory?: string;
 }
 
-const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: propPrefillCategory }) => {
+export default function EntryForm({ currentUser, prefillCategory: propPrefillCategory }: EntryFormProps) {
   const INCOME_DELETE_OPTION = '__DELETE_SELECTED_INCOME__';
   const EXPENSE_DELETE_OPTION = '__DELETE_SELECTED_EXPENSE__';
     const { showSuccess, showError, showWarning } = useToast();
@@ -91,7 +125,15 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
   const [buildingId, setBuildingId] = useState('');
     const [unitNumber, setUnitNumber] = useState('');
     const isAdmin = currentUser.role === UserRole.ADMIN;
+    const canAdminFullEdit = currentUser.role === UserRole.ADMIN;
+    /** Set when staff opens an edit from History for a transaction dated in the current month. */
+    const [staffOpenedCurrentMonthFullEdit, setStaffOpenedCurrentMonthFullEdit] = useState(false);
+    const canFullEditEntry = canAdminFullEdit || (!!id && staffOpenedCurrentMonthFullEdit);
+    /** Admin editing an existing transaction from History — unlock create-only controls (type, amount, etc.). */
+    const adminEditingExisting = canAdminFullEdit && !!id;
   const [amount, setAmount] = useState<string>('');
+  // Non-residential only: allow entering non-VAT fees from the same (rent) entry screen.
+  const [nonVatFeesNow, setNonVatFeesNow] = useState<string>('');
   
   // Adjustments & Features
   const [extraAmount, setExtraAmount] = useState<string>('0');
@@ -107,10 +149,19 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
   const [newBankName, setNewBankName] = useState('');
   const [newBankIban, setNewBankIban] = useState('');
   const [showAddBank, setShowAddBank] = useState(false);
+  /** Prevents double-submit (e.g. double tap) from writing two identical rent rows. */
+  const saveInFlightRef = useRef(false);
   
   // Contract Intelligence
   const [activeContract, setActiveContract] = useState<Contract | undefined>(undefined);
-  const [contractStats, setContractStats] = useState({ paid: 0, remaining: 0, installmentNo: 1 });
+  const [contractStats, setContractStats] = useState({
+    paid: 0,
+    remaining: 0,
+    installmentNo: 1,
+    priorOutstanding: 0,
+    /** Exclusive rent applied to the schedule after FIFO prior-lease balance (renewals). */
+    paidExclSchedule: 0,
+  });
   const [overpaymentWarning, setOverpaymentWarning] = useState('');
   const [installmentDateRange, setInstallmentDateRange] = useState(''); 
   const [smartInstallmentMsg, setSmartInstallmentMsg] = useState(''); 
@@ -139,7 +190,8 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     } | null>(null);
     const [leaseEnteredDiff, setLeaseEnteredDiff] = useState<number | null>(null);
   // Expense
-  const [expenseCategory, setExpenseCategory] = useState<string>(ExpenseCategory.GENERAL);
+  // Expense category should not default to "General Expense" — user must choose (especially for purchases).
+  const [expenseCategory, setExpenseCategory] = useState<string>('');
   const [targetEmployeeId, setTargetEmployeeId] = useState('');
   const [isExternalBorrower, setIsExternalBorrower] = useState(false);
   const [externalBorrowerName, setExternalBorrowerName] = useState('');
@@ -185,6 +237,8 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     // When a prefill with keepAmount=true is used (e.g. "Collect Fees" from contract detail),
     // the smart contract amount auto-fill should not overwrite the prefilled amount.
     const keepPrefillAmountRef = useRef(false);
+    /** Resolved when a renewal contract has prior lease balance — used for details / date line outside checkContract. */
+    const priorOldContractMetaRef = useRef<{ period: string; contractNo: string }>({ period: '', contractNo: '' });
 
     const resetForm = useCallback(() => {
         setId(null);
@@ -207,7 +261,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
         setTargetOwnerId('');
         setTargetVendorId('');
         setSelectedServiceAgreementId('');
-        setExpenseCategory(ExpenseCategory.GENERAL);
+        setExpenseCategory('');
         setBonus('0');
         setDeduction('0');
         setBorrowDeduction('0');
@@ -273,6 +327,13 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
         return d.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
     };
 
+    const salaryCoveredAmount = (tx: Transaction): number => {
+        const paidNet = Number(tx.amount || 0);
+        const deductions = Number((tx as any).deductionAmount || 0) + Number((tx as any).borrowDeductionAmount || 0);
+        const bonusPaid = Number((tx as any).bonusAmount || 0);
+        return Math.max(0, paidNet + deductions - bonusPaid);
+    };
+
     const getContractInstallmentRange = (contract: Contract, installmentNo: number) =>
         getInstallmentRange({
             fromDate: (contract as any).fromDate,
@@ -307,7 +368,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                 const txPeriod = (t as any).salaryPeriod || getPeriodFromDate(t.date || '');
                 return txPeriod === lastPaidSalaryPeriod;
             })
-            .reduce((sum, t) => sum + (t.amount || 0), 0);
+            .reduce((sum, t) => sum + salaryCoveredAmount(t), 0);
         return paidForLastPeriod >= fullSalary;
     }, [allTransactions, targetEmployeeId, lastPaidSalaryPeriod, employees]);
 
@@ -352,7 +413,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                 const txPeriod = (t as any).salaryPeriod || getPeriodFromDate(t.date || '');
                 return txPeriod === selectedSalaryPeriod;
             })
-            .reduce((sum, t) => sum + (t.amount || 0), 0);
+            .reduce((sum, t) => sum + salaryCoveredAmount(t), 0);
     }, [allTransactions, targetEmployeeId, selectedSalaryPeriod, id]);
 
     const salaryFullAmount = useMemo(() => {
@@ -366,6 +427,11 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     }, [salaryFullAmount, salaryPaidForPeriod]);
 
     const isSalaryFullyPaid = salaryPaidForPeriod > 0 && salaryBalance <= 0;
+
+    const nonResFeePeriodCtx = useMemo(() => {
+        if (!activeContract || !isNonResidentialBuildingForContract(buildings, activeContract as any)) return null;
+        return getNonResFeePeriodContext(activeContract as any, contractPayments);
+    }, [activeContract, buildings, contractPayments]);
 
     // Auto-adjust amount when salary period or employee changes (if salary category)
     useEffect(() => {
@@ -450,15 +516,29 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     useEffect(() => {
         const load = async () => {
             const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
-            const [blds, usrs, vnds, bks, txs, custs, cloudCats, cloudIncomeCats, svcAgreements] = await Promise.all([getBuildings(), getUsers(), getVendors(), getBanks(), getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }), getCustomers(), getCustomExpenseCategories(), getCustomIncomeCategories(), getServiceAgreements()]);
+            const [blds, usrs, vnds, bks, txs, custs, cloudCats, cloudIncomeCats, svcAgreements] = await Promise.all([getBuildings(), getUsersAcrossBooks(), getVendors(), getBanks(), getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }), getCustomers(), getCustomExpenseCategories(), getCustomIncomeCategories(), getServiceAgreements()]);
             // Restrict buildings for non-admins/managers to assigned buildings (supports multiple)
             if (currentUser.role !== 'ADMIN' && currentUser.role !== 'MANAGER' && userBuildingIds.length > 0) {
                 setBuildings((blds || []).filter((b: any) => userBuildingIds.includes(b.id)));
             } else {
                 setBuildings(blds);
             }
-            setEmployees((usrs || []).filter((u: any) => u.role === UserRole.EMPLOYEE));
-            setOwners((usrs || []).filter((u: any) => u.role === UserRole.OWNER || u.isOwner));
+            // NOTE: staff/users can live in other books; load across books for salary + owner pickers.
+            // Staff roles vary in old data (EMPLOYEE/ENGINEER/STAFF) and sometimes only baseSalary is set.
+            const roleKey = (r: any) => String(r || '').trim().toUpperCase();
+            const staffRoles = new Set(['EMPLOYEE', 'ENGINEER', 'STAFF']);
+            setEmployees(
+                (usrs || [])
+                    .filter((u: any) => {
+                        const rk = roleKey(u.role);
+                        if (rk === 'ADMIN' || rk === 'OWNER') return false;
+                        if (staffRoles.has(rk)) return true;
+                        const sal = Number((u as any).baseSalary);
+                        return Number.isFinite(sal) && sal > 0;
+                    })
+                    .sort((a: any, b: any) => String(a?.name || '').localeCompare(String(b?.name || ''), undefined, { sensitivity: 'base' }))
+            );
+            setOwners((usrs || []).filter((u: any) => roleKey(u.role) === roleKey(UserRole.OWNER) || u.isOwner));
             setVendors(vnds || []);
             setBanks(bks || []);
             setCustomers(custs || []);
@@ -498,7 +578,28 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     useEffect(() => {
         if (location.state && location.state.transaction) {
             const transaction = location.state.transaction as Transaction;
-            setId(transaction.id); setType(transaction.type); setDate(transaction.date); setAmount(transaction.amount.toString());
+            const staffEligible =
+                currentUser.role === UserRole.EMPLOYEE &&
+                !!transaction.id &&
+                !!transaction.date &&
+                isDateInCurrentMonth(transaction.date);
+            setStaffOpenedCurrentMonthFullEdit(!!staffEligible);
+            setId(transaction.id); setType(transaction.type); setDate(transaction.date);
+            // --- VAT amount fix: show inclusive total matching History display ---
+            if (transaction.isVATApplicable && transaction.type === TransactionType.INCOME) {
+                // Show the inclusive total so the form amount matches what the user sees in History.
+                const incl = getVatInclusiveEditAmount(transaction);
+                setAmount((incl || 0).toFixed(2));
+            } else if (transaction.isVATApplicable && transaction.type === TransactionType.EXPENSE) {
+                // Expense VAT: edit amount must match the inclusive total shown in History.
+                // Strip out extras/discounts to recover the original entered inclusive base.
+                const extras = transaction.extraAmount || 0;
+                const discounts = transaction.discountAmount || 0;
+                const origInclusive = Math.max(0, getVatInclusiveEditAmount(transaction) - extras + discounts);
+                setAmount(origInclusive.toFixed(2));
+            } else {
+                setAmount((transaction.amount || 0).toString());
+            }
             setDetails(transaction.details); setPaymentMethod(transaction.paymentMethod);
             setExtraAmount(transaction.extraAmount?.toString() || '0');
             setDiscountAmount(transaction.discountAmount?.toString() || '0');
@@ -533,10 +634,22 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
             } else {
                 if (transaction.buildingId) setBuildingId(transaction.buildingId);
                 if (transaction.expenseCategory) setExpenseCategory(transaction.expenseCategory);
+                if (transaction.expenseCategory === ExpenseCategory.SALARY || transaction.expenseCategory === 'Salary') {
+                    setBonus(String((transaction as any).bonusAmount || 0));
+                    setDeduction(String((transaction as any).deductionAmount || 0));
+                    setBorrowDeduction(String((transaction as any).borrowDeductionAmount || 0));
+                    const txPeriod = (transaction as any).salaryPeriod || getPeriodFromDate(transaction.date || '');
+                    if (txPeriod) {
+                        setSalaryPeriodInput(txPeriod);
+                        setSalaryPeriodManual(true);
+                    }
+                }
             }
             window.history.replaceState({}, document.title);
+        } else {
+            setStaffOpenedCurrentMonthFullEdit(false);
         }
-    }, [location]);
+    }, [location, currentUser.role]);
 
     useEffect(() => {
             const prefill = (location.state as any)?.prefill;
@@ -549,7 +662,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                     setPaymentMethod(prefill.paymentMethod || PaymentMethod.BANK);
                     setBankName(prefill.bankName || '');
                     setDetails(prefill.details || '');
-                    setExpenseCategory(ExpenseCategory.GENERAL);
+                    setExpenseCategory(prefill.expenseCategory || '');
                     setIsVATApplicable(false);
                     setVatInvoiceNumber('');
                     // Prevent the smart contract amount from overwriting the prefilled amount
@@ -605,30 +718,34 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
       }
   }, [expenseCategory, localCategories]);
 
-    // When building selection changes, default to the building's bank details if present
+    // When building selection changes, default to the building's bank details if present.
+    // Do not override a bank the user already picked.
     useEffect(() => {
         if (buildingId && !id) {
             const b = buildings.find(bb => bb.id === buildingId);
-            if (b && b.bankName) {
+            if (b && b.bankName && !bankName) {
                 setBankName(b.bankName);
                 setPaymentMethod(PaymentMethod.BANK);
+            } else if (!b?.bankName && !bankName) {
+                setBankName('');
             }
             // VAT is handled separately in the VAT Report tab — never auto-enable it here
             if (b) {
                 setIsVATApplicable(false);
             }
         }
-    }, [buildingId, buildings]);
+    }, [buildingId, buildings, bankName, id]);
 
   // --- AUTOMATION: SMART CONTRACT LINKING & PARTIAL PAYMENTS ---
     useEffect(() => {
         const checkContract = async () => {
             if (!id && type === TransactionType.INCOME && buildingId && unitNumber) {
+                const catalogAll = (await getContracts({ includeDeleted: true })) || [];
+                const catalog = catalogAll.filter((c: any) => !c.deleted);
                 // Try active contract first; fall back to any contract for this unit
                 let contract = await getActiveContract(buildingId, unitNumber);
                 if (!contract) {
-                    const allContracts = await getContracts();
-                    const unitContracts = (allContracts || []).filter((c: any) => c.buildingId === buildingId && c.unitName === unitNumber && !c.deleted);
+                    const unitContracts = catalog.filter((c: any) => c.buildingId === buildingId && c.unitName === unitNumber);
                     unitContracts.sort((a: any, b: any) => (a.status === 'Active' ? -1 : b.status === 'Active' ? 1 : 0));
                     contract = unitContracts[0] || null;
                 }
@@ -638,21 +755,67 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
         setAutoCustomerName(contract ? formatCustomerFromMap(contract.customerName, contract.customerId, buildCustomerRoomMap(customers)) : '');
         
                                  if (contract) {
-                                 const contractId = (contract as any).id;
-                                 // Match by contractId OR by building+unit for income txs saved without a contractId (e.g. from VAT quick entry)
                                  const prevPayments = allTransactions.filter(t => {
                                      if (t.status !== TransactionStatus.APPROVED && t.status) return false;
-                                     if (contractId && t.contractId === contractId) return true;
-                                     if (!t.contractId && t.buildingId === buildingId && (t as any).unitNumber === unitNumber && t.type !== TransactionType.EXPENSE) return true;
-                                     return false;
+                                     if (t.type === TransactionType.EXPENSE) return false;
+                                     return transactionAppliesToContract(t, contract as any, catalog);
                                  });
                                  const upfrontPaid = Number((contract as any).upfrontPaid || 0);
                                  const totalValueStored = Number(contract.totalValue || 0);
                                  const totalInst = contract.installmentCount || 1;
+                                 const priorO = Math.max(0, Number((contract as any).priorLeaseOutstandingAtRenewal) || 0);
+                                 priorOldContractMetaRef.current = { period: '', contractNo: '' };
+                                 if (priorO > 0) {
+                                     const rid = (contract as any).renewedFromId;
+                                     let priorContractRow: any = rid ? catalogAll.find((x: any) => x.id === rid) : undefined;
+                                     const priorNoStored = String((contract as any).priorLeaseContractNoAtRenewal || '').trim();
+                                     if (!priorContractRow && priorNoStored) {
+                                         priorContractRow = catalogAll.find(
+                                             (x: any) =>
+                                                 String(x.contractNo || '').trim() === priorNoStored &&
+                                                 x.buildingId === contract.buildingId,
+                                         );
+                                     }
+                                     const contractNo =
+                                         priorNoStored ||
+                                         (priorContractRow?.contractNo != null ? String(priorContractRow.contractNo).trim() : '') ||
+                                         '';
+                                     let period = '';
+                                     const renewalYmd = contractDateToYmd((contract as any).fromDate);
+                                     if (priorContractRow && renewalYmd) {
+                                         const catalogForPriorPaid = catalogAll.map((x: any) =>
+                                             priorContractRow && x.id === priorContractRow.id ? { ...x, deleted: false } : x,
+                                         );
+                                         const carriedWin = getCarriedPriorInstallmentWindow({
+                                             priorContract: priorContractRow,
+                                             renewalYmd,
+                                             buildings,
+                                             catalog: catalogForPriorPaid,
+                                             transactions: allTransactions,
+                                         });
+                                         if (carriedWin) {
+                                             period = `Inst. ${carriedWin.installmentNo}/${carriedWin.totalInstallments} · ${fmtDate(
+                                                 carriedWin.startDate,
+                                             )} ${t('entry.dateRangeMid')} ${fmtDate(carriedWin.endDate)}`;
+                                         } else if (priorContractRow?.fromDate && priorContractRow?.toDate) {
+                                             period = `${fmtDate(priorContractRow.fromDate)} ${t('entry.dateRangeMid')} ${fmtDate(
+                                                 priorContractRow.toDate,
+                                             )}`;
+                                         }
+                                     } else if (priorContractRow?.fromDate && priorContractRow?.toDate) {
+                                         period = `${fmtDate(priorContractRow.fromDate)} ${t('entry.dateRangeMid')} ${fmtDate(
+                                             priorContractRow.toDate,
+                                         )}`;
+                                     }
+                                     priorOldContractMetaRef.current = { period, contractNo };
+                                 }
 
                                  // --- INSTALLMENT DETECTION: use EXCLUSIVE amounts (consistent with contract values) ---
-                                 // Exclude Non-VAT fees entries — they are collected separately and don't count toward rent installments
-                                 const rentPayments = prevPayments.filter(t => !(t as any).feesEntry);
+                                 // Non-residential: fees may be logged as separate feesEntry rows — exclude from rent installment schedule only then.
+                                 const nonResContract = isNonResidentialBuildingForContract(buildings, contract as any);
+                                 const rentPayments = nonResContract
+                                   ? prevPayments.filter(t => !(t as any).feesEntry)
+                                   : prevPayments;
                                  const totalPaidExcl = rentPayments.reduce((sum, t) => sum + (Number(t.amount) || 0) + ((t as any).discountAmount || 0), 0);
                                  const totalPaidEffective = totalPaidExcl + upfrontPaid;
                                  const otherInstAmtExcl = Number(contract.otherInstallment || 0);
@@ -670,7 +833,8 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                  const totalPaidIncl = rentPayments.reduce((sum, t) => sum + (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) + ((t as any).discountAmount || 0), 0);
                                  const totalPaidDisplayEffective = totalPaidIncl + upfrontPaid;
                                  const effectiveTotalIncl = totalValueStored + upfrontPaid + vatOnRent + vatOnOneTime;
-                                 const remaining = Math.max(0, effectiveTotalIncl - totalPaidDisplayEffective);
+                                 const totalDueAllIncl = effectiveTotalIncl + priorO;
+                                 const remaining = Math.max(0, totalDueAllIncl - totalPaidDisplayEffective);
 
                                  setContractPayments(prevPayments);
 
@@ -684,23 +848,88 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                          if (effectiveTotal > 0 && Math.abs(sumInstallments - effectiveTotal) > Math.max(5, totalInst)) {
                              firstInstAmt = Math.max(0, effectiveTotal - (otherInstAmt * Math.max(0, totalInst - 1)));
                          }
-             
+
+                         if (totalPaidDisplayEffective >= totalDueAllIncl) {
+               setOverpaymentWarning('Contract Fully Paid! Cannot add more Income.');
+               setAmount('0');
+               return;
+             }
+
+             let schedulePaidExcl = totalPaidEffective;
              let currentInstallment = 1;
              let recommendedAmount = 0;
              let isPartial = false;
 
-             // Build cumulative amounts for each installment
+             // FIFO: payments apply to prior-lease balance (renewal) before new lease installments
+             if (priorO > 0 && totalPaidDisplayEffective < priorO) {
+               currentInstallment = 0;
+               schedulePaidExcl = 0;
+               recommendedAmount = Math.round((priorO - totalPaidDisplayEffective) * 100) / 100;
+               isPartial = totalPaidDisplayEffective > 0;
+               setCurrentInstallmentRemaining(Math.max(0, recommendedAmount));
+               setContractStats({
+                 paid: totalPaidDisplayEffective,
+                 remaining,
+                 installmentNo: 0,
+                 priorOutstanding: priorO,
+                 paidExclSchedule: 0,
+               });
+               if (keepPrefillAmountRef.current) {
+                 keepPrefillAmountRef.current = false;
+               } else {
+                 setAmount(recommendedAmount > 0 ? recommendedAmount.toFixed(0) : '0');
+                 setSmartInstallmentMsg(
+                   isPartial ? t('entry.priorLeaseBalancePartial') : t('entry.priorLeaseBalanceDue'),
+                 );
+                 setInstallmentDateRange(
+                   priorOldContractMetaRef.current.period
+                     ? `${t('entry.priorLeasePeriod')}: ${priorOldContractMetaRef.current.period}`
+                     : t('entry.priorLeasePeriod'),
+                 );
+                 if (!details) {
+                   const contractCustLabel = formatCustomerFromMap(contract.customerName, contract.customerId, buildCustomerRoomMap(customers));
+                   const { period: pPer, contractNo: pNo } = priorOldContractMetaRef.current;
+                   if (pPer) {
+                     setDetails(
+                       t('entry.priorOldContractDetailsWithPeriod', {
+                         contractNo: pNo || '—',
+                         period: pPer,
+                         customer: contractCustLabel,
+                       }),
+                     );
+                   } else {
+                     setDetails(
+                       t('entry.priorOldContractDetailsNoPeriod', {
+                         contractNo: pNo || '—',
+                         customer: contractCustLabel,
+                       }),
+                     );
+                   }
+                 }
+               }
+             } else {
+               // After prior is cleared, only the remainder applies to the new lease schedule.
+               // priorO is stored in the same inclusive basis as contract list balance; map to exclusive for the schedule loop when VAT applies.
+               const paidAfterPriorIncl = Math.max(0, totalPaidDisplayEffective - priorO);
+               if (priorO > 0) {
+                 schedulePaidExcl =
+                   isVATBuilding && effectiveTotalIncl > 0
+                     ? (paidAfterPriorIncl * effectiveTotalExcl) / effectiveTotalIncl
+                     : paidAfterPriorIncl;
+               }
+
+             // Build cumulative amounts for each installment (schedule only, after prior cleared)
              let cumulative = 0;
              for (let i = 1; i <= totalInst; i++) {
                const instAmount = i === 1 ? firstInstAmt : otherInstAmt;
                cumulative += instAmount;
                
-                             if (totalPaidEffective < cumulative) {
+                             if (schedulePaidExcl < cumulative) {
                  // This is the first unpaid installment
                  currentInstallment = i;
                  const prevCumulative = i === 1 ? 0 : (firstInstAmt + (i - 2) * otherInstAmt);
                  const amountDueForThisInst = instAmount;
-                                 const amountPaidTowardsThis = Math.max(0, totalPaidEffective - prevCumulative);
+                                 const amountPaidTowardsThis = Math.max(0, schedulePaidExcl - prevCumulative);
                  recommendedAmount = amountDueForThisInst - amountPaidTowardsThis;
                  
                  if (amountPaidTowardsThis > 0) {
@@ -713,14 +942,20 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                }
              }
              
-             // Check if fully paid (cap cumulative at effectiveTotal)
-                         if (totalPaidEffective >= Math.min(cumulative, effectiveTotal)) {
+             // Check if fully paid on schedule (exclusive) — whole obligation already handled above
+                         if (schedulePaidExcl >= Math.min(cumulative, effectiveTotal)) {
                setOverpaymentWarning('Contract Fully Paid! Cannot add more Income.');
                setAmount('0');
                return;
              }
 
-                         setContractStats({ paid: totalPaidEffective, remaining, installmentNo: currentInstallment });
+                         setContractStats({
+               paid: totalPaidDisplayEffective,
+               remaining,
+               installmentNo: currentInstallment,
+               priorOutstanding: priorO,
+               paidExclSchedule: schedulePaidExcl,
+             });
 
              if (keepPrefillAmountRef.current) {
                // Prefill amount is locked (e.g. "Collect Fees" from contract detail) — don't overwrite it
@@ -728,19 +963,41 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
              } else {
                setAmount(recommendedAmount.toFixed(0));
                if (isPartial) setSmartInstallmentMsg(`Due: Remaining Balance of Installment ${currentInstallment}`);
-               const { startDate, endDate } = getContractInstallmentRange(contract, currentInstallment);
-               setInstallmentDateRange(`${fmtDate(startDate)} to ${fmtDate(endDate)}`);
+               const { startDate, endDate } = getContractInstallmentRange(contract, Math.max(1, currentInstallment));
+               const schedPeriod = `${fmtDate(startDate)} ${t('entry.dateRangeMid')} ${fmtDate(endDate)}`;
+               setInstallmentDateRange(schedPeriod);
                if (!details) {
                  const contractCustLabel = formatCustomerFromMap(contract.customerName, contract.customerId, buildCustomerRoomMap(customers));
-                 if (isPartial) setDetails(`Balance Payment - Installment ${currentInstallment} - ${contractCustLabel}`);
-                 else setDetails(currentInstallment === 1 ? `1st Payment (Rent+Fees) - ${contractCustLabel}` : `Installment ${currentInstallment} of ${contract.installmentCount} - ${contractCustLabel}`);
+                 if (isPartial) {
+                   setDetails(
+                     t('entry.rentInstallmentDetailsPartial', {
+                       installment: String(currentInstallment),
+                       customer: contractCustLabel,
+                       period: schedPeriod,
+                     }),
+                   );
+                 } else if (currentInstallment === 1) {
+                   setDetails(
+                     t('entry.rentFirstPaymentDetails', { customer: contractCustLabel, period: schedPeriod }),
+                   );
+                 } else {
+                   setDetails(
+                     t('entry.rentInstallmentDetails', {
+                       installment: String(currentInstallment),
+                       total: String(contract.installmentCount),
+                       customer: contractCustLabel,
+                       period: schedPeriod,
+                     }),
+                   );
+                 }
                }
+             }
              }
         }
             }
         };
         checkContract();
-    }, [buildingId, unitNumber, type, allTransactions]); 
+    }, [buildingId, unitNumber, type, allTransactions, buildings]); 
 
     // Update enteredRemaining when amount changes + carry-forward detection
     useEffect(() => {
@@ -764,12 +1021,13 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     firstInstAmt = Math.max(0, effectiveTotal - (otherInstAmt * Math.max(0, totalInst - 1)));
                                 }
                 const currentInst = contractStats.installmentNo;
+                const startFutureInst = currentInst === 0 ? 1 : currentInst + 1;
 
                 // Figure out how the extra covers future installments
                 let extraLeft = extra;
                 let coveredParts: string[] = [];
-                let coveredInstNums: number[] = [currentInst];
-                for (let i = currentInst + 1; i <= totalInst && extraLeft > 0; i++) {
+                let coveredInstNums: number[] = currentInst === 0 ? [] : [currentInst];
+                for (let i = startFutureInst; i <= totalInst && extraLeft > 0; i++) {
                     const instAmt = i === 1 ? firstInstAmt : otherInstAmt;
                     if (extraLeft >= instAmt) {
                         coveredParts.push(`Installment ${i} fully covered`);
@@ -783,10 +1041,24 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                 setCarryForwardMsg(`Extra ${extra.toLocaleString()} SAR will carry forward: ${coveredParts.join(', ')}`);
 
                 // Auto-update details to reflect multi-installment payment
-                const instLabel = coveredInstNums.length > 1
-                    ? `Installments ${coveredInstNums.join(' + ')} of ${totalInst}`
-                    : `Installment ${currentInst} of ${totalInst}`;
-                setDetails(`${instLabel} - ${formatCustomerFromMap(activeContract.customerName, activeContract.customerId, buildCustomerRoomMap(customers))}`);
+                const instLabel =
+                    coveredInstNums.length > 1
+                        ? `Installments ${coveredInstNums.join(' + ')} of ${totalInst}`
+                        : coveredInstNums.length === 1
+                          ? `Installment ${coveredInstNums[0]} of ${totalInst}`
+                          : currentInst === 0
+                            ? `${t('entry.priorLeasePaymentLabel')} + schedule`
+                            : `Installment ${currentInst} of ${totalInst}`;
+                const custLabel = formatCustomerFromMap(activeContract.customerName, activeContract.customerId, buildCustomerRoomMap(customers));
+                let periodNote = '';
+                if (coveredInstNums.length >= 1) {
+                    const { startDate, endDate } = getContractInstallmentRange(activeContract, coveredInstNums[0]);
+                    periodNote = ` — ${t('entry.paymentPeriodLabel')} ${fmtDate(startDate)} ${t('entry.dateRangeMid')} ${fmtDate(endDate)}`;
+                } else if (currentInst === 0) {
+                    const pPer = priorOldContractMetaRef.current.period;
+                    if (pPer) periodNote = ` — ${t('entry.paymentPeriodLabel')} ${pPer}`;
+                }
+                setDetails(`${instLabel} - ${custLabel}${periodNote}`);
             } else {
                 setCarryForwardMsg('');
                 // Reset details to single installment when amount goes back to normal
@@ -795,12 +1067,49 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                     const totalInst = activeContract.installmentCount || 1;
                     const isPartialNow = a < currentInstallmentRemaining;
                     const acLabel = formatCustomerFromMap(activeContract.customerName, activeContract.customerId, buildCustomerRoomMap(customers));
-                    if (isPartialNow) {
-                        setDetails(`Balance Payment - Installment ${currentInst} - ${acLabel}`);
+                    if (currentInst === 0) {
+                        const { period: pPer, contractNo: pNo } = priorOldContractMetaRef.current;
+                        if (pPer) {
+                            setDetails(
+                                t('entry.priorOldContractDetailsWithPeriod', {
+                                    contractNo: pNo || '—',
+                                    period: pPer,
+                                    customer: acLabel,
+                                }),
+                            );
+                        } else {
+                            setDetails(
+                                t('entry.priorOldContractDetailsNoPeriod', {
+                                    contractNo: pNo || '—',
+                                    customer: acLabel,
+                                }),
+                            );
+                        }
+                    } else if (isPartialNow) {
+                        const { startDate, endDate } = getContractInstallmentRange(activeContract, Math.max(1, currentInst));
+                        const schedPeriod = `${fmtDate(startDate)} ${t('entry.dateRangeMid')} ${fmtDate(endDate)}`;
+                        setDetails(
+                            t('entry.rentInstallmentDetailsPartial', {
+                                installment: String(currentInst),
+                                customer: acLabel,
+                                period: schedPeriod,
+                            }),
+                        );
+                    } else if (currentInst === 1) {
+                        const { startDate, endDate } = getContractInstallmentRange(activeContract, 1);
+                        const schedPeriod = `${fmtDate(startDate)} ${t('entry.dateRangeMid')} ${fmtDate(endDate)}`;
+                        setDetails(t('entry.rentFirstPaymentDetails', { customer: acLabel, period: schedPeriod }));
                     } else {
-                        setDetails(currentInst === 1
-                            ? `1st Payment (Rent+Fees) - ${acLabel}`
-                            : `Installment ${currentInst} of ${totalInst} - ${acLabel}`);
+                        const { startDate, endDate } = getContractInstallmentRange(activeContract, Math.max(1, currentInst));
+                        const schedPeriod = `${fmtDate(startDate)} ${t('entry.dateRangeMid')} ${fmtDate(endDate)}`;
+                        setDetails(
+                            t('entry.rentInstallmentDetails', {
+                                installment: String(currentInst),
+                                total: String(totalInst),
+                                customer: acLabel,
+                                period: schedPeriod,
+                            }),
+                        );
                     }
                 }
             }
@@ -840,6 +1149,35 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
         }
     }, [amount, leaseInstallmentInfo, type, expenseCategory]);
 
+    /** Output VAT on rent/income in this form only applies to non-residential or buildings flagged vatApplicable. */
+    const entryBuilding = useMemo(
+        () => (buildingId ? buildings.find((b) => b.id === buildingId) : undefined),
+        [buildings, buildingId],
+    );
+    const buildingChargesOutputVatOnRent = !!(
+        entryBuilding &&
+        (entryBuilding.propertyType === 'NON_RESIDENTIAL' || entryBuilding.vatApplicable === true)
+    );
+    const vatApplicableEffective = useMemo(() => {
+        if (!isVATApplicable) return false;
+        if (
+            type === TransactionType.INCOME &&
+            buildingId &&
+            entryBuilding &&
+            !buildingChargesOutputVatOnRent
+        ) {
+            return false;
+        }
+        return true;
+    }, [isVATApplicable, type, buildingId, entryBuilding, buildingChargesOutputVatOnRent]);
+
+    // Clear a mistaken VAT flag on income for residential buildings (legacy rows) so the form state matches save rules.
+    useEffect(() => {
+        if (isVATApplicable && !vatApplicableEffective) {
+            setIsVATApplicable(false);
+        }
+    }, [isVATApplicable, vatApplicableEffective]);
+
     // VAT breakdown when VAT is toggled for expenses (amount entered is VAT-inclusive)
     useEffect(() => {
         const a = parseFloat(amount) || 0;
@@ -856,15 +1194,26 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     // VAT breakdown when VAT is toggled for income (amount entered is VAT-exclusive, VAT added on top)
     useEffect(() => {
         const a = parseFloat(amount) || 0;
-        if (type === TransactionType.INCOME && isVATApplicable && a > 0) {
-            const exclusive = a;
-            const vat = Number((exclusive * 0.15).toFixed(2));
-            const inclusive = Number((exclusive + vat).toFixed(2));
+        if (type === TransactionType.INCOME && vatApplicableEffective && a > 0) {
+            let exclusive: number;
+            let vat: number;
+            let inclusive: number;
+            if (id) {
+                // Edit mode: amount field shows inclusive total
+                inclusive = a;
+                exclusive = Number((inclusive / 1.15).toFixed(2));
+                vat = Number((inclusive - exclusive).toFixed(2));
+            } else {
+                // New entry: amount field is exclusive, VAT added on top
+                exclusive = a;
+                vat = Number((exclusive * 0.15).toFixed(2));
+                inclusive = Number((exclusive + vat).toFixed(2));
+            }
             setIncomeVatInfo({ inclusive, vat, exclusive });
         } else {
             setIncomeVatInfo(null);
         }
-    }, [amount, isVATApplicable, type]);
+    }, [amount, vatApplicableEffective, type, id]);
 
   const handleAddBank = async () => {
       if(newBankName && newBankIban) {
@@ -924,17 +1273,17 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
             return;
         }
         const day = new Date(date).getDate();
-        if (lastPaidSalaryPeriod && lastPaidSalaryPeriod === currentPeriod && day < 25) {
+        if (!id && lastPaidSalaryPeriod && lastPaidSalaryPeriod === currentPeriod && day < 25) {
             showError('Salary already paid for this month. You can add the next month after the 25th.');
             setLoading(false);
             return;
         }
-        if (selectedSalaryPeriod && isSalaryFullyPaid) {
+        if (!id && selectedSalaryPeriod && isSalaryFullyPaid) {
             showError(`Salary for ${salaryPeriodLabel} is fully paid for this staff.`);
             setLoading(false);
             return;
         }
-        if (selectedSalaryPeriod && salaryBalance > 0 && (parseFloat(amount) || 0) > salaryBalance) {
+        if (!id && selectedSalaryPeriod && salaryBalance > 0 && (parseFloat(amount) || 0) > salaryBalance) {
             showError(`Only ${salaryBalance.toLocaleString()} SAR remaining for ${salaryPeriodLabel}. Cannot exceed balance.`);
             setLoading(false);
             return;
@@ -964,9 +1313,14 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     let ownerName = '';
 
     // If VAT is applied for expense, amount entered is VAT-inclusive -> convert to exclusive for storage
-    // If VAT is applied for income, amount entered is VAT-exclusive -> VAT is added on top
+    // If VAT is applied for income (new entry), amount entered is VAT-exclusive -> VAT is added on top
+    // If VAT is applied for income (edit mode), amount entered is VAT-inclusive (matches History display) -> convert to exclusive
     let inclusiveAmount: number | null = null;
-    if (type === TransactionType.EXPENSE && isVATApplicable) {
+    if (id && type === TransactionType.INCOME && isVATApplicable) {
+        inclusiveAmount = baseAmount;
+        const exclusive = Number((inclusiveAmount / 1.15).toFixed(2));
+        finalBase = exclusive;
+    } else if (type === TransactionType.EXPENSE && isVATApplicable) {
         inclusiveAmount = baseAmount;
         const exclusive = Number((inclusiveAmount / 1.15).toFixed(2));
         finalBase = exclusive;
@@ -993,34 +1347,50 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     const status = TransactionStatus.APPROVED;
     
     // Feature: VAT
+    // - Expense VAT & income VAT edits: amount field is VAT-inclusive
+    // - New income VAT: amount field is VAT-exclusive; VAT added on top
     const netAmount = finalBase + ext - disc;
+
     let vatVal = 0;
-    if (isVATApplicable) {
-        if (type === TransactionType.EXPENSE && inclusiveAmount !== null) {
-            // Expense: entered amount is VAT-inclusive, VAT is extracted from it
-            vatVal = Number((inclusiveAmount - finalBase).toFixed(2));
+    let amountExclVAT: number | undefined = undefined;
+    let amountInclVAT: number | undefined = undefined;
+
+    if (vatApplicableEffective) {
+        if (inclusiveAmount !== null) {
+            // Expense or income edit: entered amount is VAT-inclusive. VAT is whatever remains after removing exclusive.
+            amountExclVAT = Number(netAmount.toFixed(2));
+            amountInclVAT = Number((inclusiveAmount + ext - disc).toFixed(2));
+            vatVal = Number((amountInclVAT - amountExclVAT).toFixed(2));
         } else {
-            // Income & Fallback: VAT is added on top of entered amount
-            vatVal = Number((netAmount * 0.15).toFixed(2));
+            // New income entry: VAT is added on top of the (exclusive) net amount.
+            amountExclVAT = Number(netAmount.toFixed(2));
+            vatVal = Number((amountExclVAT * 0.15).toFixed(2));
+            amountInclVAT = Number((amountExclVAT + vatVal).toFixed(2));
         }
     }
-    const totalWithVat = type === TransactionType.EXPENSE && inclusiveAmount !== null && isVATApplicable
-        ? inclusiveAmount + ext - disc
-        : Number((netAmount + vatVal).toFixed(2));
-    
-    const savedAmount = netAmount;
-    // For VAT expenses: save the entered (inclusive) amount as the main amount so it shows correctly
-    // For VAT income: save the total with VAT (inclusive) as the main amount
-    const txAmount = (type === TransactionType.EXPENSE && isVATApplicable && inclusiveAmount !== null)
-        ? inclusiveAmount + ext - disc
-        : (type === TransactionType.INCOME && isVATApplicable)
-            ? totalWithVat
+
+    const computedTotalWithVat = vatApplicableEffective
+        ? Number((amountInclVAT || 0).toFixed(2))
+        : Number(netAmount.toFixed(2));
+
+    const savedAmount = Number(netAmount.toFixed(2));
+    // For VAT expenses: save the inclusive total as the main amount so dashboards/history match receipts.
+    // For VAT income: also save the inclusive total as the main amount.
+    const txAmount =
+        vatApplicableEffective
+            ? computedTotalWithVat
             : savedAmount;
     
     // Auto-generate invoice number if VAT applicable and not provided
-    const autoInvoiceNumber = isVATApplicable && !vatInvoiceNumber 
-      ? `INV-${date.replace(/-/g, '')}-${Date.now().toString().slice(-6)}` 
-      : vatInvoiceNumber;
+    const autoInvoiceNumber =
+      vatApplicableEffective && !vatInvoiceNumber
+        ? (type === TransactionType.INCOME
+            ? getNextVatInvoiceNumber(
+                allTransactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+                date,
+              )
+            : getNextVatInvoiceNumber(allTransactions, date))
+        : vatInvoiceNumber;
 
     const newTx: Transaction = {
       id: id || crypto.randomUUID(),
@@ -1029,7 +1399,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
       type: (type === TransactionType.EXPENSE && (expenseCategory === ExpenseCategory.BORROWING || expenseCategory === 'Borrowing') && borrowingType === 'REPAYMENT') ? TransactionType.INCOME : type,
     amount: txAmount,
     vatAmount: vatVal,
-    totalWithVat: totalWithVat,
+    totalWithVat: vatApplicableEffective ? computedTotalWithVat : undefined,
       paymentMethod,
       bankName: paymentMethod === PaymentMethod.BANK ? bankName : undefined,
       chequeNo: paymentMethod === PaymentMethod.CHEQUE ? chequeNo : undefined,
@@ -1053,13 +1423,20 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
       borrowingType: ((type === TransactionType.EXPENSE || type === TransactionType.INCOME) && (expenseCategory === ExpenseCategory.BORROWING || expenseCategory === 'Borrowing')) ? borrowingType : undefined,
       vendorId: targetVendorId || undefined,
       vendorName: vendors.find(v => v.id === targetVendorId)?.nameEn || vendors.find(v => v.id === targetVendorId)?.name || undefined,
-      isVATApplicable: isVATApplicable,
-      vatInvoiceNumber: isVATApplicable ? autoInvoiceNumber : undefined,
-      amountExcludingVAT: isVATApplicable ? finalBase : undefined,
-      amountIncludingVAT: isVATApplicable ? (inclusiveAmount || totalWithVat) : undefined,
-      vatRate: isVATApplicable ? 15 : undefined,
-      vendorVATNumber: (isVATApplicable && type === TransactionType.EXPENSE && targetVendorId) ? vendors.find(v => v.id === targetVendorId)?.vatNumber || vendors.find(v => v.id === targetVendorId)?.vatNo : undefined,
-      customerVATNumber: (isVATApplicable && type === TransactionType.INCOME && activeContract) ? customers.find(c => c.id === activeContract.customerId)?.vatNumber : undefined,
+      isVATApplicable: vatApplicableEffective,
+      vatInvoiceNumber: vatApplicableEffective ? autoInvoiceNumber : undefined,
+      amountExcludingVAT: vatApplicableEffective ? amountExclVAT : undefined,
+      amountIncludingVAT: vatApplicableEffective ? amountInclVAT : undefined,
+      vatRate: vatApplicableEffective ? 15 : undefined,
+      vendorVATNumber: (vatApplicableEffective && type === TransactionType.EXPENSE && targetVendorId) ? vendors.find(v => v.id === targetVendorId)?.vatNumber || vendors.find(v => v.id === targetVendorId)?.vatNo : undefined,
+      customerVATNumber: (vatApplicableEffective && type === TransactionType.INCOME && activeContract) ? customers.find(c => c.id === activeContract.customerId)?.vatNumber : undefined,
+      customerName: type === TransactionType.INCOME && activeContract
+        ? formatCustomerFromMap(activeContract.customerName, activeContract.customerId, buildCustomerRoomMap(customers))
+        : undefined,
+      customerId:
+        type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract?.customerId
+          ? activeContract.customerId
+          : undefined,
             details: details || (type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SALARY
                 ? `Salary ${salaryPeriodLabel || ''} - ${empName}`.trim()
                 : (type === TransactionType.EXPENSE && (expenseCategory === ExpenseCategory.BORROWING || expenseCategory === 'Borrowing') && empName
@@ -1112,12 +1489,21 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
             };
           }
         }
+        if (type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract && contractStats.installmentNo > 0) {
+          const instNo = contractStats.installmentNo;
+          const { startDate, endDate } = getContractInstallmentRange(activeContract, Math.max(1, instNo));
+          return {
+            installmentNumber: instNo,
+            installmentStartDate: contractDateToYmd(startDate),
+            installmentEndDate: contractDateToYmd(endDate),
+          };
+        }
         return {};
       })()
     };
 
     // Generate ZATCA QR code after transaction object is created
-    if (isVATApplicable) {
+    if (vatApplicableEffective) {
       newTx.zatcaQRCode = generateZATCAQR(newTx, activeContract, customers);
     }
 
@@ -1134,6 +1520,18 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                 }
             }
 
+            if (!isAdmin && isStaff && staffOpenedCurrentMonthFullEdit && id && !isDateInCurrentMonth(date)) {
+                showError('As staff you can only save edits when the transaction date stays in the current calendar month.');
+                setLoading(false);
+                return;
+            }
+
+            if (saveInFlightRef.current) {
+                setLoading(false);
+                return;
+            }
+            saveInFlightRef.current = true;
+            try {
             // Editing: save directly for all users
             if (id) {
                 await saveTransaction(newTx);
@@ -1144,6 +1542,43 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
             }
 
             await saveTransaction(newTx);
+
+            // Non-residential: optionally create a separate non-VAT fees entry from the same form.
+            // This keeps accounting/reporting consistent while letting users enter fees here.
+            if (
+              type === TransactionType.INCOME &&
+              incomeSubType === 'RENTAL' &&
+              activeContract &&
+              isNonResidentialBuildingForContract(buildings, activeContract as any)
+            ) {
+              const feeAmt = parseFloat(nonVatFeesNow || '0') || 0;
+              if (feeAmt > 0) {
+                const feeTx: any = {
+                  id: crypto.randomUUID(),
+                  date,
+                  type: TransactionType.INCOME,
+                  amount: Math.round(feeAmt * 100) / 100,
+                  paymentMethod,
+                  bankName: paymentMethod === PaymentMethod.BANK ? bankName : undefined,
+                  chequeNo: paymentMethod === PaymentMethod.CHEQUE ? chequeNo : undefined,
+                  chequeDueDate: paymentMethod === PaymentMethod.CHEQUE ? chequeDueDate : undefined,
+                  buildingId: buildingId || undefined,
+                  buildingName: buildings.find(b => b.id === buildingId)?.name,
+                  unitNumber: unitNumber || undefined,
+                  customerName: newTx.customerName,
+                  customerId: newTx.customerId,
+                  contractId: activeContract?.id,
+                  details: `Non-VAT Fees - ${newTx.customerName || ''}${unitNumber ? ` - Unit ${unitNumber}` : ''}${activeContract?.contractNo ? ` - #${activeContract.contractNo}` : ''}`.trim(),
+                  createdAt: Date.now(),
+                  createdBy: currentUser.id,
+                  createdByName: currentUser.name,
+                  status,
+                  isVATApplicable: false,
+                  feesEntry: true,
+                };
+                await saveTransaction(feeTx);
+              }
+            }
             
             // Update service agreement payments when category is Service Agreement
             if (type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SERVICE_AGREEMENT && selectedServiceAgreementId) {
@@ -1218,6 +1653,9 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                     resetForm();
                 }, 800);
             }
+            } finally {
+                saveInFlightRef.current = false;
+            }
         } finally {
             setLoading(false);
         }
@@ -1247,11 +1685,8 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     return 0;
   });
 
-  // Show residential buildings (or legacy buildings with no propertyType set).
-  // Exclude only those explicitly marked as NON_RESIDENTIAL or vatApplicable.
-  const residentialBuildings = sortedBuildings.filter(b =>
-    b.propertyType !== 'NON_RESIDENTIAL' && !b.vatApplicable
-  );
+  // Show all buildings in Entry Form (residential + non-residential).
+  const residentialBuildings = sortedBuildings;
   
   // Sort units by block (A, B, C) and then numerically
   const sortedUnits = selectedBuilding?.units ? [...selectedBuilding.units].sort((a, b) => {
@@ -1279,15 +1714,25 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     let previewNet = (parseFloat(amount)||0) + (parseFloat(extraAmount)||0) - (parseFloat(discountAmount)||0) + (parseFloat(bonus)||0) - (parseFloat(deduction)||0);
     const previewBorrowDeduction = (type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SALARY) ? (parseFloat(borrowDeduction)||0) : 0;
     previewNet -= previewBorrowDeduction;
-    let previewVat = isVATApplicable ? previewNet * 0.15 : 0;
-    let previewTotal = previewNet + previewVat;
+    let previewVat = 0;
+    let previewTotal = 0;
 
-    if (type === TransactionType.EXPENSE && isVATApplicable) {
-        const inclusive = parseFloat(amount)||0;
-        const exclusive = Number((inclusive / 1.15).toFixed(2));
-        previewNet = exclusive + (parseFloat(extraAmount)||0) - (parseFloat(discountAmount)||0) + (parseFloat(bonus)||0) - (parseFloat(deduction)||0) - previewBorrowDeduction;
-        previewVat = Number((inclusive - exclusive).toFixed(2));
+    if (vatApplicableEffective) {
+        const a = parseFloat(amount)||0;
+        if ((type === TransactionType.INCOME && id) || type === TransactionType.EXPENSE) {
+            // Inclusive mode: amount field shows inclusive total (income edit or expense)
+            const inclusive = a;
+            const exclusive = Number((inclusive / 1.15).toFixed(2));
+            previewNet = exclusive + (parseFloat(extraAmount)||0) - (parseFloat(discountAmount)||0) + (parseFloat(bonus)||0) - (parseFloat(deduction)||0) - previewBorrowDeduction;
+            previewVat = Number((inclusive - exclusive).toFixed(2));
+        } else {
+            // Exclusive mode: income new entry, VAT added on top
+            previewNet = a + (parseFloat(extraAmount)||0) - (parseFloat(discountAmount)||0) + (parseFloat(bonus)||0) - (parseFloat(deduction)||0) - previewBorrowDeduction;
+            previewVat = Number((previewNet * 0.15).toFixed(2));
+        }
         previewTotal = Number((previewNet + previewVat).toFixed(2));
+    } else {
+        previewTotal = previewNet;
     }
 
   const getSelectedBankIBAN = () => {
@@ -1298,12 +1743,12 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
   const whiteInputStyle = "w-full p-2.5 sm:p-3 rounded-xl border border-slate-200 bg-white text-sm font-bold shadow-sm outline-none focus:ring-2 focus:ring-emerald-500/30 transition-all";
 
     return (
-        <div className="mobile-tab-shell tab-entry max-w-4xl mx-auto animate-fade-in pb-20 px-3 sm:px-0">
+        <div className="mobile-tab-shell tab-entry w-full min-w-0 max-w-4xl mx-auto animate-fade-in overflow-x-hidden pb-4 sm:pb-6 px-3 sm:px-0">
 
             <form onSubmit={handleSubmit} className="bg-white rounded-2xl shadow-lg p-5 sm:p-8 space-y-5 sm:space-y-8 relative">
         {/* Income/Expense Toggle */}
         <div className="flex justify-center">
-            {!id ? (
+            {!id || adminEditingExisting ? (
                 <div className="bg-slate-100 p-1 rounded-xl flex border border-slate-200">
                     <button type="button" onClick={() => setType(TransactionType.INCOME)} className={`px-5 sm:px-8 py-2.5 rounded-lg text-xs font-bold transition-all ${type === TransactionType.INCOME ? 'bg-emerald-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-700'}`}>{t('entry.income')}</button>
                     <button type="button" onClick={() => setType(TransactionType.EXPENSE)} className={`px-5 sm:px-8 py-2.5 rounded-lg text-xs font-bold transition-all ${type === TransactionType.EXPENSE ? 'bg-rose-600 text-white shadow-md' : 'text-slate-500 hover:text-slate-700'}`}>{t('entry.expense')}</button>
@@ -1393,8 +1838,8 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
 
                 {type === TransactionType.INCOME ? (
                     <>
-                        {/* Income Sub-Type Toggle - Hide in edit mode unless it's the active type (which is redundant since we only show active) */}
-                        {!id && (
+                        {/* Income Sub-Type Toggle — staff see a label when editing; admin can switch anytime */}
+                        {(!id || adminEditingExisting) && (
                         <div className="flex gap-2">
                             <button type="button" onClick={() => { setIncomeSubType('RENTAL'); setOtherIncomeCategory(''); }} className={`flex-1 px-3 py-2 rounded-lg text-[10px] sm:text-xs font-bold transition-all border ${incomeSubType === 'RENTAL' ? 'bg-emerald-50 border-emerald-300 text-emerald-700 shadow-sm' : 'bg-white border-slate-200 text-slate-400'}`}>
                                 {t('entry.rentalIncomeLabel')}
@@ -1405,7 +1850,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                         </div>
                         )}
                         
-                        {id && (
+                        {id && !adminEditingExisting && (
                             <div className="bg-emerald-50 border border-emerald-200 text-emerald-700 font-bold px-4 py-2 rounded-xl text-center text-sm shadow-sm">
                                 {incomeSubType === 'RENTAL' ? t('entry.rentalIncomeLabel') : t('entry.otherIncomeLabel')}
                             </div>
@@ -1421,7 +1866,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     value={buildingId}
                                     onChange={val => { setBuildingId(val); setUnitNumber(''); }}
                                     placeholder={t('entry.select')}
-                                    disabled={!!id}
+                                    disabled={!canFullEditEntry && !!id}
                                     className={inputStyle}
                                 />
                             </div>
@@ -1433,11 +1878,11 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                         label: u.name
                                     }))}
                                     value={unitNumber}
-                                    onChange={val => { if (!isAdmin && !!id) return; setUnitNumber(val); }}
+                                    onChange={val => { if (!canFullEditEntry && !!id) return; setUnitNumber(val); }}
                                     placeholder={buildingId ? 'Select...' : 'Select building first...'}
-                                    disabled={!buildingId || (!isAdmin && !!id)}
+                                    disabled={!buildingId || (!canFullEditEntry && !!id)}
                                 />
-                                {!isAdmin && !!id && <div className="text-xs text-slate-400 mt-1">{t('entry.adminOnlyUnit')}</div>}
+                                {!canFullEditEntry && !!id && <div className="text-xs text-slate-400 mt-1">{t('entry.adminOnlyUnit')}</div>}
                             </div>
                         </div>
                         
@@ -1450,23 +1895,35 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                         )}
                         
                         {activeContract && !overpaymentWarning && (() => {
-                            // Build installment data for timeline
+                            // Build installment data for timeline (schedule uses paidExclSchedule so prior-lease FIFO does not look like "last installment again")
                             const totalInst = activeContract.installmentCount || 1;
                             const upfrontPaid = Number((activeContract as any).upfrontPaid || 0);
                             const totalValueStored = Number(activeContract.totalValue || 0);
-                            const effectiveTotal = totalValueStored + upfrontPaid;
+                            const effectiveTotalExcl = totalValueStored + upfrontPaid;
                             const otherInstAmt = Number(activeContract.otherInstallment || 0);
                             let firstInstAmt = Number(activeContract.firstInstallment || 0) + upfrontPaid;
                             const sumInst = firstInstAmt + (otherInstAmt * Math.max(0, totalInst - 1));
-                            if (effectiveTotal > 0 && Math.abs(sumInst - effectiveTotal) > Math.max(5, totalInst)) {
-                                firstInstAmt = Math.max(0, effectiveTotal - (otherInstAmt * Math.max(0, totalInst - 1)));
+                            if (effectiveTotalExcl > 0 && Math.abs(sumInst - effectiveTotalExcl) > Math.max(5, totalInst)) {
+                                firstInstAmt = Math.max(0, effectiveTotalExcl - (otherInstAmt * Math.max(0, totalInst - 1)));
                             }
+
+                            const priorO = Math.max(0, Number((activeContract as any).priorLeaseOutstandingAtRenewal) || 0);
+                            const isVATBuilding = (() => {
+                                const b = buildings.find(bb => bb.id === buildingId);
+                                return b?.propertyType === 'NON_RESIDENTIAL' || b?.vatApplicable === true;
+                            })();
+                            const rentValue = Number((activeContract as any).rentValue || 0);
+                            const vatOnRent = isVATBuilding ? rentValue * 0.15 : 0;
+                            const vatOnOneTime = isVATBuilding ? Math.max(0, firstInstAmt - otherInstAmt) * 0.15 : 0;
+                            const effectiveTotalIncl = totalValueStored + upfrontPaid + vatOnRent + vatOnOneTime;
+                            const grandTotalDue = effectiveTotalIncl + priorO;
+                            const schedulePaidTowardInst = contractStats.paidExclSchedule;
 
                             const installments: { no: number; status: 'paid' | 'partial' | 'current' | 'upcoming'; paid: number; total: number }[] = [];
                             for (let i = 1; i <= totalInst; i++) {
                                 const instAmt = i === 1 ? firstInstAmt : otherInstAmt;
                                 const prevCum = i === 1 ? 0 : (firstInstAmt + (i - 2) * otherInstAmt);
-                                const paidForThis = Math.max(0, Math.min(instAmt, contractStats.paid - prevCum));
+                                const paidForThis = Math.max(0, Math.min(instAmt, schedulePaidTowardInst - prevCum));
                                 const isCurrent = contractStats.installmentNo === i;
                                 let status: 'paid' | 'partial' | 'current' | 'upcoming' = 'upcoming';
                                 if (paidForThis >= instAmt) status = 'paid';
@@ -1475,9 +1932,25 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                 installments.push({ no: i, status, paid: paidForThis, total: instAmt });
                             }
 
-                            const progressPct = effectiveTotal > 0 ? Math.min(100, (contractStats.paid / effectiveTotal) * 100) : 0;
-                            const currentInst = installments.find(i => i.no === contractStats.installmentNo);
+                            const paidTowardPrior = Math.min(contractStats.paid, priorO);
+                            let priorStatus: 'paid' | 'partial' | 'current' | 'upcoming' = 'upcoming';
+                            if (priorO > 0) {
+                                if (paidTowardPrior >= priorO) priorStatus = 'paid';
+                                else if (paidTowardPrior > 0) priorStatus = 'partial';
+                                else if (contractStats.installmentNo === 0) priorStatus = 'current';
+                                else priorStatus = 'upcoming';
+                            }
+
+                            const progressPct =
+                                grandTotalDue > 0 ? Math.min(100, (contractStats.paid / grandTotalDue) * 100) : 0;
+                            const currentInst =
+                                contractStats.installmentNo > 0
+                                    ? installments.find(i => i.no === contractStats.installmentNo)
+                                    : undefined;
                             const isPartialInst = currentInst && currentInst.paid > 0 && currentInst.paid < currentInst.total;
+                            const isPriorBucket = contractStats.installmentNo === 0 && priorO > 0;
+                            const isPartialPrior =
+                                isPriorBucket && paidTowardPrior > 0 && paidTowardPrior < priorO;
 
                             return (
                                 <div className="relative overflow-hidden bg-gradient-to-br from-emerald-50/80 via-white to-teal-50/60 border border-emerald-200/60 rounded-2xl p-4 sm:p-5 space-y-4 shadow-lg shadow-emerald-100/40">
@@ -1509,12 +1982,16 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     </div>
                                 </div>
 
-                                {/* Financial Summary Cards */}
+                                {/* Financial Summary Cards — totals match contract list (incl. VAT when applicable + prior lease at renewal) */}
                                 <div className="relative grid grid-cols-3 gap-2">
                                     <div className="bg-white/80 backdrop-blur-sm rounded-xl p-2.5 border border-white/50 shadow-sm">
-                                        <div className="text-[8px] sm:text-[9px] font-bold text-slate-400 uppercase tracking-wider">{t('common.total')}</div>
-                                        <div className="text-sm sm:text-base font-black text-slate-800 mt-0.5">{effectiveTotal.toLocaleString()}</div>
-                                        <div className="text-[8px] text-slate-400">{t('common.sar')}</div>
+                                        <div className="text-[8px] sm:text-[9px] font-bold text-slate-400 uppercase tracking-wider">
+                                            {priorO > 0 ? t('entry.totalDueGrand') : t('common.total')}
+                                        </div>
+                                        <div className="text-sm sm:text-base font-black text-slate-800 mt-0.5">
+                                            {(priorO > 0 ? grandTotalDue : isVATBuilding ? effectiveTotalIncl : effectiveTotalExcl).toLocaleString()}
+                                        </div>
+                                        <div className="text-[8px] text-slate-400">{priorO > 0 ? t('entry.inclPriorNote') : t('common.sar')}</div>
                                     </div>
                                     <div className="bg-white/80 backdrop-blur-sm rounded-xl p-2.5 border border-emerald-100 shadow-sm">
                                         <div className="text-[8px] sm:text-[9px] font-bold text-emerald-500 uppercase tracking-wider">{t('tenant.paidAmount')}</div>
@@ -1541,8 +2018,58 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     </div>
                                 </div>
 
-                                {/* Current Installment Highlight */}
-                                {currentInst && currentInst.paid < currentInst.total && (
+                                {/* Prior lease balance (renewal) — shown before schedule installments */}
+                                {isPriorBucket && currentInstallmentRemaining > 0 && (
+                                    <div
+                                        className={`relative p-3 rounded-xl border-2 shadow-sm ${
+                                            isPartialPrior
+                                                ? 'bg-gradient-to-r from-sky-100/90 to-indigo-100/80 border-sky-400'
+                                                : 'bg-gradient-to-r from-sky-50/90 to-blue-50/80 border-sky-300'
+                                        }`}
+                                    >
+                                        <div className="flex items-center justify-between mb-2">
+                                            <div className="flex items-center gap-2">
+                                                <div
+                                                    className={`w-6 h-6 rounded-lg flex items-center justify-center text-[9px] font-black text-white ${
+                                                        isPartialPrior ? 'bg-sky-600' : 'bg-sky-500'
+                                                    }`}
+                                                >
+                                                    {t('entry.priorLeaseChip')}
+                                                </div>
+                                                <span className="text-xs font-black text-slate-700">{t('entry.priorLeasePaymentLabel')}</span>
+                                            </div>
+                                            <span className={`text-sm sm:text-base font-black ${isPartialPrior ? 'text-sky-800' : 'text-sky-700'}`}>
+                                                {currentInstallmentRemaining.toLocaleString()} SAR
+                                            </span>
+                                        </div>
+                                        {isPartialPrior && (
+                                            <div className="space-y-1.5">
+                                                <div className="flex justify-between text-[10px] font-bold">
+                                                    <span className="text-slate-500">{t('entry.installmentTotal')}</span>
+                                                    <span className="text-slate-700">{priorO.toLocaleString()} SAR</span>
+                                                </div>
+                                                <div className="flex justify-between text-[10px] font-bold">
+                                                    <span className="text-emerald-600">{t('entry.alreadyPaid')}</span>
+                                                    <span className="text-emerald-700">{paidTowardPrior.toLocaleString()} SAR</span>
+                                                </div>
+                                                <div className="w-full bg-white/70 rounded-full h-1.5 mt-1">
+                                                    <div
+                                                        className="bg-gradient-to-r from-sky-400 to-sky-600 h-1.5 rounded-full transition-all"
+                                                        style={{ width: `${Math.min(100, (paidTowardPrior / priorO) * 100)}%` }}
+                                                    />
+                                                </div>
+                                            </div>
+                                        )}
+                                        {smartInstallmentMsg && (
+                                            <div className="text-[9px] font-bold text-sky-900 bg-white/80 px-2 py-1 rounded border border-sky-200 inline-block mt-1">
+                                                {smartInstallmentMsg}
+                                            </div>
+                                        )}
+                                    </div>
+                                )}
+
+                                {/* Current schedule installment */}
+                                {!isPriorBucket && currentInst && currentInst.paid < currentInst.total && (
                                     <div className={`relative p-3 rounded-xl border-2 ${isPartialInst ? 'bg-gradient-to-r from-teal-100/80 to-cyan-100/80 border-teal-300' : 'bg-gradient-to-r from-emerald-100/80 to-teal-100/80 border-emerald-300'} shadow-sm`}>
                                         <div className="flex items-center justify-between mb-2">
                                             <div className="flex items-center gap-2">
@@ -1584,7 +2111,23 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                 {installments.length > 0 && installments.length <= 24 && (
                                     <div className="relative">
                                         <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-2">{t('entry.installmentTimeline')}</div>
-                                        <div className="flex flex-wrap gap-1.5">
+                                        <div className="flex flex-wrap gap-1.5 items-center">
+                                            {priorO > 0 && (
+                                                <div
+                                                    title={`${t('entry.priorLeaseTimelineHint')}: ${paidTowardPrior.toLocaleString()} / ${priorO.toLocaleString()} SAR`}
+                                                    className={`w-7 h-7 sm:w-8 sm:h-8 rounded-lg flex items-center justify-center text-[8px] sm:text-[9px] font-black border transition-all cursor-default ${
+                                                        priorStatus === 'paid'
+                                                            ? 'bg-sky-500 text-white border-sky-600 shadow-sm shadow-sky-200'
+                                                            : priorStatus === 'partial'
+                                                              ? 'bg-gradient-to-br from-sky-400 to-indigo-500 text-white border-sky-500 shadow-sm ring-2 ring-sky-300 ring-offset-1'
+                                                              : priorStatus === 'current'
+                                                                ? 'bg-sky-600 text-white border-sky-700 shadow-sm ring-2 ring-sky-300 ring-offset-1 animate-pulse'
+                                                                : 'bg-white/60 text-slate-400 border-slate-200'
+                                                    }`}
+                                                >
+                                                    {priorStatus === 'paid' ? 'OK' : t('entry.priorLeaseChip')}
+                                                </div>
+                                            )}
                                             {installments.map(inst => (
                                                 <div
                                                     key={inst.no}
@@ -1600,7 +2143,13 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                 </div>
                                             ))}
                                         </div>
-                                        <div className="flex items-center gap-3 mt-2 text-[8px] sm:text-[9px] text-slate-500">
+                                        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 mt-2 text-[8px] sm:text-[9px] text-slate-500">
+                                            {priorO > 0 && (
+                                                <span className="flex items-center gap-1">
+                                                    <span className="w-2.5 h-2.5 rounded bg-sky-500 inline-block" />
+                                                    {t('entry.priorLeasePaymentLabel')}
+                                                </span>
+                                            )}
                                             <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-emerald-500 inline-block"></span>{t('tenant.paidAmount')}</span>
                                             <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-gradient-to-br from-teal-400 to-cyan-500 inline-block"></span> {t('entry.legendPartial')}</span>
                                             <span className="flex items-center gap-1"><span className="w-2.5 h-2.5 rounded bg-emerald-600 inline-block"></span> {t('entry.legendCurrent')}</span>
@@ -1679,7 +2228,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                     setOtherIncomeCategory(val);
                                                 }}
                                                 placeholder={t('entry.selectCategory')}
-                                                disabled={!!id}
+                                                disabled={!canFullEditEntry && !!id}
                                                 className={inputStyle + " !w-full !rounded-xl !shadow-md !border-emerald-300"}
                                             />
                                         </div>
@@ -1710,7 +2259,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     placeholder={t('entry.incomeDetails')}
                                     rows={2}
                                     className={inputStyle + " resize-none"}
-                                    readOnly={!!id}
+                                    readOnly={!canFullEditEntry && !!id}
                                 />
                             </div>
 
@@ -1726,7 +2275,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     value={buildingId}
                                     onChange={val => { setBuildingId(val); setUnitNumber(''); }}
                                     placeholder={t('entry.selectBuilding')}
-                                    disabled={!!id}
+                                    disabled={!canFullEditEntry && !!id}
                                     className={inputStyle}
                                 />
                             </div>
@@ -1767,10 +2316,11 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                         navigate('/transfers');
                                                         return;
                                                     }
+                                                    // Owner Expense should be enterable directly (no forced redirect to Treasury)
                                                     setExpenseCategory(val);
                                                 }}
                                                 placeholder={t('entry.selectCategory')}
-                                                disabled={!!id}
+                                                disabled={!canFullEditEntry && !!id}
                                                 className={inputStyle + " !w-full !rounded-xl !shadow-md !border-emerald-300"}
                                             />
                                         </div>
@@ -1802,13 +2352,13 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     value={targetEmployeeId}
                                     onChange={handleEmployeeSelect}
                                     placeholder={t('entry.select')}
-                                    disabled={!!id}
+                                    disabled={!canFullEditEntry && !!id}
                                     className={inputStyle}
                                 />
                                 <div className="space-y-1">
                                     <label className="text-[9px] sm:text-[10px] text-slate-500 font-bold">{t('entry.salaryMonth')}</label>
                                     <input
-                                        disabled={!!id}
+                                        disabled={!canFullEditEntry && !!id}
                                         type="month"
                                         value={salaryPeriodInput}
                                         onChange={e => { setSalaryPeriodInput(e.target.value); setSalaryPeriodManual(true); }}
@@ -1870,7 +2420,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                         {(expenseCategory === ExpenseCategory.BORROWING || expenseCategory === 'Borrowing') && (
                             <div className="space-y-3 animate-fadeIn">
                                 {/* Borrow / Repayment Toggle */}
-                                {!id && (
+                                {(!id || adminEditingExisting) && (
                                 <div>
                                     <label className="text-[9px] sm:text-[11px] font-bold text-slate-500 uppercase tracking-wider ml-1 mb-1 block">{t('history.type')}</label>
                                     <div className="flex bg-slate-100 p-1 rounded-lg">
@@ -1883,13 +2433,13 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     </div>
                                 </div>
                                 )}
-                                {id && (
+                                {id && !adminEditingExisting && (
                                     <div className={`text-center py-2 font-bold rounded-lg mb-2 text-sm ${borrowingType === 'BORROW' ? 'bg-rose-50 text-rose-700 border border-rose-200' : 'bg-emerald-50 text-emerald-700 border border-emerald-200'}`}>
                                         {borrowingType === 'BORROW' ? 'New Borrowing' : 'Repayment'}
                                     </div>
                                 )}
                                 {/* Staff / External Person Toggle */}
-                                {!id && (
+                                {(!id || adminEditingExisting) && (
                                 <div>
                                     <label className="text-[9px] sm:text-[11px] font-bold text-slate-500 uppercase tracking-wider ml-1 mb-1 block">{t('entry.borrowerType')}</label>
                                     <div className="flex bg-slate-100 p-1 rounded-lg">
@@ -1912,7 +2462,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                 onChange={e => setExternalBorrowerName(e.target.value)}
                                                 placeholder={t('entry.personNamePlaceholder')}
                                                 className={inputStyle}
-                                                disabled={!!id}
+                                                disabled={!canFullEditEntry && !!id}
                                             />
                                             <p className="text-[8px] sm:text-[9px] text-orange-500 ml-1 font-medium">{t('entry.externalPersonNote')}</p>
                                         </>
@@ -1923,7 +2473,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                 value={targetEmployeeId}
                                                 onChange={handleBorrowingEmployeeSelect}
                                                 placeholder={t('entry.select')}
-                                                disabled={!!id}
+                                                disabled={!canFullEditEntry && !!id}
                                                 className={inputStyle}
                                             />
                                             <p className="text-[8px] sm:text-[9px] text-slate-400 ml-1">{borrowingType === 'REPAYMENT' ? 'Staff returning money' : 'Who borrowed this'}</p>
@@ -1957,7 +2507,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                     value={targetOwnerId}
                                     onChange={handleOwnerSelect}
                                     placeholder={t('entry.selectOwner')}
-                                    disabled={!!id}
+                                    disabled={!canFullEditEntry && !!id}
                                     className={inputStyle}
                                 />
                                 <p className="text-[8px] sm:text-[9px] text-slate-400 ml-1">
@@ -1981,14 +2531,14 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                             onChange={setTargetVendorId}
                                             placeholder={t('entry.search')}
                                             className=""
-                                            disabled={!!id}
+                                            disabled={!canFullEditEntry && !!id}
                                         />
                                     </div>
                                     <button
                                         type="button"
-                                        disabled={!!id}
+                                        disabled={!canFullEditEntry && !!id}
                                         onClick={() => navigate('/vendors', { state: { returnTo: '/entry', fromEntry: true } })}
-                                        className={`px-3 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 whitespace-nowrap flex items-center gap-1 shadow-sm ${!!id ? 'opacity-50 cursor-not-allowed' : ''}`}
+                                        className={`px-3 py-2 bg-emerald-600 text-white rounded-xl text-xs font-bold hover:bg-emerald-700 whitespace-nowrap flex items-center gap-1 shadow-sm ${!!id && !canFullEditEntry ? 'opacity-50 cursor-not-allowed' : ''}`}
                                     >
                                         <UserPlus size={14} />{t('common.add')}</button>
                                 </div>
@@ -1999,7 +2549,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                             <div className="space-y-3 animate-fadeIn">
                                 <label className="text-[9px] sm:text-[11px] font-bold text-slate-500 uppercase tracking-wider ml-1">{t('entry.serviceAgreementLabel')}</label>
                                 <select
-                                    disabled={!!id}
+                                    disabled={!canFullEditEntry && !!id}
                                     value={selectedServiceAgreementId}
                                     onChange={e => {
                                         const agr = serviceAgreements.find(a => a.id === e.target.value);
@@ -2146,7 +2696,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                             <div className="space-y-3 animate-fadeIn">
                                 <label className="text-[9px] sm:text-[11px] font-bold text-slate-500 uppercase tracking-wider ml-1">{t('entry.buildingLeased')}</label>
                                 <select 
-                                    disabled={!!id}
+                                    disabled={!canFullEditEntry && !!id}
                                     value={buildingId} 
                                     onChange={e => {
                                         const bid = e.target.value;
@@ -2418,7 +2968,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
 
                         <div className="space-y-2">
                              <label className="text-[11px] font-bold text-slate-500 uppercase tracking-wider ml-1">{t('entry.expenseSource')}</label>
-                             <select disabled={!!id} value={buildingId} onChange={e => { if (e.target.value === 'HEAD_OFFICE') { navigate('/transfers'); return; } setBuildingId(e.target.value); }} className={inputStyle}>
+                             <select disabled={!canFullEditEntry && !!id} value={buildingId} onChange={e => { if (e.target.value === 'HEAD_OFFICE') { navigate('/transfers'); return; } setBuildingId(e.target.value); }} className={inputStyle}>
                                 <option value="">{t('entry.selectSource')}</option>
                                 <option value="HEAD_OFFICE">{t('entry.headOfficeLabel')}</option>
                                 {sortedBuildings.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
@@ -2465,11 +3015,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                     onChange={e => setAmount(e.target.value)}
                                                     className={`${inputStyle} text-lg sm:text-xl font-black`}
                                                     placeholder={t('entry.zero')}
-                                                    disabled={!!id && !(
-                                                        ((expenseCategory === ExpenseCategory.BORROWING || expenseCategory === 'Borrowing') &&
-                                                            ((type === TransactionType.EXPENSE && borrowingType === 'BORROW') || (type === TransactionType.INCOME && borrowingType === 'REPAYMENT')) &&
-                                                            isAdmin)
-                                                    )}
+                                                    disabled={!!id && !canAdminFullEdit}
                                                 />
                     </div>
                 </div>
@@ -2478,6 +3024,48 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                                                 You entered {Number(amount||0).toLocaleString()} SAR. Remaining for this installment: {enteredRemaining.toLocaleString()} SAR
                                                         </div>
                                                 )}
+
+                        {/* Non-residential: allow fee amount entry here (creates a separate feesEntry transaction) */}
+                        {!id && type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract && isNonResidentialBuildingForContract(buildings, activeContract as any) && (
+                          <div className="mt-3 rounded-2xl border border-sky-200 bg-sky-50/40 p-3 sm:p-4 space-y-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="text-[10px] font-black text-sky-700 uppercase tracking-wider">Fees collected now (Non‑VAT)</span>
+                              {(() => {
+                                const ctx = nonResFeePeriodCtx;
+                                if (!ctx?.hasConfiguredFees) return null;
+                                if (ctx.allPeriodsPaid) {
+                                  return (
+                                    <span className="text-[10px] font-bold text-emerald-800 bg-white border border-emerald-200 rounded-full px-2 py-1 leading-snug max-w-[min(100%,220px)] text-right">
+                                      {t('vat.feesNoNextPeriodBanner')}
+                                    </span>
+                                  );
+                                }
+                                const suggested =
+                                  ctx.feesRemaining > 0.02 ? ctx.feesRemaining : ctx.nonVatPerInst;
+                                if (!(suggested > 0)) return null;
+                                return (
+                                  <span className="text-[10px] font-black text-sky-700 bg-white border border-sky-200 rounded-full px-2 py-1">
+                                    Suggested: {suggested.toLocaleString()} {t('common.sar')}
+                                  </span>
+                                );
+                              })()}
+                            </div>
+                            <div className="form-with-icon has-prefix">
+                              <span className="absolute left-2 sm:left-3 top-1/2 -translate-y-1/2 text-slate-400 font-bold text-[10px] sm:text-xs z-30 bg-white px-1 sm:px-2 rounded" style={{pointerEvents:'none'}}>{t('common.sar')}</span>
+                              <input
+                                type="number"
+                                step="0.01"
+                                value={nonVatFeesNow}
+                                onChange={(e) => setNonVatFeesNow(e.target.value)}
+                                className={`${inputStyle} font-black`}
+                                placeholder="0"
+                              />
+                            </div>
+                            <p className="text-[10px] text-sky-700 font-semibold">
+                              This will save a separate Fees record linked to the contract.
+                            </p>
+                          </div>
+                        )}
 
                         {/* Property Rent Balance Display */}
                         {leaseEnteredDiff !== null && type === TransactionType.EXPENSE && (expenseCategory === ExpenseCategory.PROPERTY_RENT || expenseCategory === 'Property Rent') && leaseInstallmentInfo && (
@@ -2535,17 +3123,54 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                  {/* Adjustments & VAT */}
                  <div className="bg-slate-50/50 rounded-3xl p-3 sm:p-6 border border-slate-200">
                      <h3 className="text-sm font-black text-slate-800 flex items-center gap-2 mb-6"><Calculator size={16}/>{t('contract.financialBreakdown')}</h3>
+
+                     {type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract && isNonResidentialBuildingForContract(buildings, activeContract) && (() => {
+                       const ac = activeContract;
+                       const num = (v: unknown) => Number(v) || 0;
+                       const fmtSar = (v: number) => `${v.toLocaleString()} ${t('entry.sar')}`;
+                       const feeRows: { label: string; value: number }[] = [
+                         { label: t('contract.waterFee'), value: num(ac.waterFee) },
+                         { label: t('contract.internetFee'), value: num(ac.internetFee) },
+                         { label: t('contract.parkingFee'), value: num(ac.parkingFee) },
+                         { label: t('contract.managementFee'), value: num(ac.managementFee) },
+                         { label: t('contract.insurance'), value: num(ac.insuranceFee) },
+                         { label: t('contract.serviceFee'), value: num(ac.serviceFee) },
+                         { label: t('contract.otherFees'), value: num(ac.otherAmount) },
+                       ];
+                       const officeAmt = num((ac as any).officeFeeAmount);
+                       if (officeAmt > 0) feeRows.push({ label: t('contract.officeFeeAmount'), value: officeAmt });
+                       const dedAmt = num((ac as any).otherDeduction);
+                       if (dedAmt > 0) feeRows.push({ label: t('contract.otherDeduction'), value: dedAmt });
+                       return (
+                         <div className="mb-5 rounded-xl border border-slate-200/90 bg-white/80 p-3 sm:p-4 space-y-2 shadow-sm">
+                           <div className="text-[9px] font-black text-slate-500 uppercase tracking-wider">
+                             {t('entry.leaseFeeTotalsFromContract')}
+                           </div>
+                           <div className="grid grid-cols-2 gap-x-3 gap-y-1.5 text-[10px] sm:text-xs font-semibold text-slate-800">
+                             {feeRows.map((row) => (
+                               <React.Fragment key={row.label}>
+                                 <span className="text-slate-500 font-bold truncate" title={row.label}>{row.label}</span>
+                                 <span className="text-end tabular-nums">{fmtSar(row.value)}</span>
+                               </React.Fragment>
+                             ))}
+                           </div>
+                           <p className="text-[9px] text-slate-500 font-medium leading-snug pt-1 border-t border-slate-100">
+                             {t('entry.leaseFeeTotalsNote')}
+                           </p>
+                         </div>
+                       );
+                     })()}
                      
                      {type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SALARY ? (
                          <div className="space-y-3">
                              <div className="grid grid-cols-2 gap-2 sm:gap-4">
                                  <div>
                                      <label className="text-[10px] font-bold text-slate-500 uppercase">{t('entry.bonus')}</label>
-                                     <input type="number" min="0" value={bonus} onChange={e => setBonus(e.target.value)} className={whiteInputStyle} readOnly={!isAdmin && !!id} />
+                                     <input type="number" min="0" value={bonus} onChange={e => setBonus(e.target.value)} className={whiteInputStyle} readOnly={!canFullEditEntry && !!id} />
                                  </div>
                                  <div>
                                      <label className="text-[10px] font-bold text-slate-500 uppercase">{t('entry.deduction')}</label>
-                                     <input type="number" min="0" value={deduction} onChange={e => setDeduction(e.target.value)} className={whiteInputStyle} readOnly={!isAdmin && !!id} />
+                                     <input type="number" min="0" value={deduction} onChange={e => setDeduction(e.target.value)} className={whiteInputStyle} readOnly={!canFullEditEntry && !!id} />
                                  </div>
                              </div>
                              {/* Borrowing Deduction from Salary */}
@@ -2561,7 +3186,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                                              {t('entry.deductFromBorrowingLabel')}
                                              <span className="text-[9px] normal-case text-emerald-500 font-medium ml-1">({t('entry.outstandingBalance')}: {outstanding.toLocaleString()} SAR)</span>
                                          </label>
-                                         <input type="number" min="0" max={outstanding} value={borrowDeduction} onChange={e => setBorrowDeduction(e.target.value)} className={whiteInputStyle} placeholder="0" readOnly={!isAdmin && !!id} />
+                                         <input type="number" min="0" max={outstanding} value={borrowDeduction} onChange={e => setBorrowDeduction(e.target.value)} className={whiteInputStyle} placeholder="0" readOnly={!canFullEditEntry && !!id} />
                                          <p className="text-[9px] text-emerald-600 font-medium">{t('entry.deductFromSalaryNote')}</p>
                                      </div>
                                  );
@@ -2572,18 +3197,50 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
                              <div className="grid grid-cols-2 gap-2 sm:gap-4">
                                  <div>
                                      <label className="text-[8px] sm:text-[9px] font-bold text-slate-500 uppercase">{t('entry.extraCharges')}</label>
-                                     <input type="number" min="0" value={extraAmount} onChange={e => setExtraAmount(e.target.value)} className={whiteInputStyle} readOnly={!isAdmin && !!id} />
+                                     <input type="number" min="0" value={extraAmount} onChange={e => setExtraAmount(e.target.value)} className={whiteInputStyle} readOnly={!canFullEditEntry && !!id} />
                                  </div>
                                  <div>
                                      <label className="text-[8px] sm:text-[9px] font-bold text-slate-500 uppercase">{t('entry.discountShort')}</label>
-                                     <input type="number" min="0" value={discountAmount} onChange={e => setDiscountAmount(e.target.value)} className={whiteInputStyle} readOnly={!isAdmin && !!id} />
+                                     <input type="number" min="0" value={discountAmount} onChange={e => setDiscountAmount(e.target.value)} className={whiteInputStyle} readOnly={!canFullEditEntry && !!id} />
                                  </div>
                              </div>
                          </>
                      )}
+
+                     {/* ── VAT Toggle & Invoice Number (editable by admin / staff current-month) ── */}
+                     {(canFullEditEntry || !id) && (
+                         <div className="mt-4 space-y-3 p-3 rounded-xl bg-slate-100/80 border border-slate-200/70">
+                             <label className="flex items-center gap-2 cursor-pointer select-none">
+                                 <input
+                                     type="checkbox"
+                                     checked={isVATApplicable}
+                                     onChange={(e) => setIsVATApplicable(e.target.checked)}
+                                     className="w-4 h-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                                 />
+                                 <span className="text-[10px] font-black text-slate-700 uppercase tracking-wider">
+                                     VAT Applicable (15%)
+                                 </span>
+                             </label>
+                             {isVATApplicable && (
+                                 <div className="space-y-1">
+                                     <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">
+                                         VAT Invoice Number
+                                     </label>
+                                     <input
+                                         type="text"
+                                         value={vatInvoiceNumber}
+                                         onChange={(e) => setVatInvoiceNumber(e.target.value)}
+                                         className="w-full px-3 py-2 rounded-lg border border-slate-300 bg-white text-xs font-bold text-slate-800 focus:ring-2 focus:ring-emerald-500 focus:border-emerald-400 outline-none"
+                                         placeholder="INV-001"
+                                     />
+                                     <p className="text-[8px] text-slate-400 mt-0.5">Leave blank to auto-generate</p>
+                                 </div>
+                             )}
+                         </div>
+                     )}
                      
                      <div className="pt-3 border-t border-slate-200/80 flex justify-between items-end">
-                         <span className="text-[9px] sm:text-xs font-black text-slate-500 uppercase tracking-wider">{t('entry.netTotalLabel')} {isVATApplicable && '(inc. VAT)'}</span>
+                         <span className="text-[9px] sm:text-xs font-black text-slate-500 uppercase tracking-wider">{t('entry.netTotalLabel')} {vatApplicableEffective && '(inc. VAT)'}</span>
                         <span className={`text-lg sm:text-xl font-black ${type === TransactionType.INCOME ? 'text-emerald-700' : 'text-rose-700'}`}>{previewTotal.toLocaleString()} <span className="text-[8px] sm:text-[10px] text-slate-400 font-bold">{t('entry.sar')}</span></span>
                      </div>
                      {previewBorrowDeduction > 0 && (
@@ -2709,7 +3366,4 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
       />
     </div>
   );
-};
-
-export default EntryForm;
-
+}

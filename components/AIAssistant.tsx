@@ -7,12 +7,16 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Bot, X, Send, Settings, Trash2, Minimize2, Maximize2, Sparkles, ChevronRight, Eye, EyeOff } from 'lucide-react';
 import { useLanguage } from '../i18n';
+import { buildContextForMessage, type AiAction } from '../services/amlakAiContext';
+import AiActionCard from './AiActionCard';
+import { UserRole } from '../types';
 
 // --- Types ---
 interface Message {
   role: 'user' | 'assistant';
   text: string;
   timestamp: number;
+  actions?: AiAction[];
 }
 
 interface Props {
@@ -416,12 +420,12 @@ Direct, helpful, action-oriented. Give the answer AND take them there. Use bulle
 
 // --- Quick suggestion chips ---
 const QUICK_SUGGESTIONS = [
-  { label: 'Can I edit a customer?',       emoji: '\u270F\uFE0F' },
-  { label: 'Where can I add rent?',        emoji: '\uD83D\uDCB0' },
-  { label: 'How do I add a contract?',     emoji: '\uD83D\uDCC4' },
+  { label: 'Who is overdue on rent?',      emoji: '\u23F0' },
+  { label: 'How much outstanding in my buildings?', emoji: '\uD83D\uDCB0' },
+  { label: 'Any duplicate payments?',      emoji: '\u26A0\uFE0F' },
+  { label: 'Where can I add rent?',        emoji: '\u2795' },
   { label: 'Where is the VAT report?',     emoji: '\uD83D\uDCCA' },
-  { label: 'Can I delete a transaction?',  emoji: '\uD83D\uDDD1\uFE0F' },
-  { label: 'Where can I add a building?',  emoji: '\uD83C\uDFE2' },
+  { label: 'How do I add a contract?',     emoji: '\uD83D\uDCC4' },
 ];
 
 // --- Groq API call ---
@@ -517,6 +521,9 @@ const AIAssistant: React.FC<Props> = ({ currentUser, defaultOpen, hideTrigger, o
     if (open && !minimized && !showSettings) setTimeout(() => inputRef.current?.focus(), 100);
   }, [open, minimized, showSettings]);
 
+  const canSendWhatsApp =
+    currentUser?.role === UserRole.ADMIN || currentUser?.role === UserRole.MANAGER;
+
   const sendMessage = useCallback(async (text?: string) => {
     const msg = (text || input).trim();
     if (!msg) return;
@@ -529,10 +536,41 @@ const AIAssistant: React.FC<Props> = ({ currentUser, defaultOpen, hideTrigger, o
     setError('');
 
     try {
-      const raw = await callGroq(apiKey, messages, systemPrompt, msg);
+      let aiContext;
+      try {
+        aiContext = await buildContextForMessage(msg, currentUser || { id: '', name: '', role: 'ADMIN' });
+      } catch {
+        aiContext = { facts: '', toolsRun: [], actions: [] as AiAction[] };
+      }
+
+      if (aiContext.directAnswer && aiContext.toolsRun.length > 0) {
+        setMessages(prev => [
+          ...prev,
+          {
+            role: 'assistant',
+            text: aiContext.directAnswer!,
+            timestamp: Date.now(),
+            actions: aiContext.actions,
+          },
+        ]);
+        setLoading(false);
+        return;
+      }
+
+      const operatorBlock = aiContext.facts
+        ? `\n\n━━━ LIVE DATA (authoritative — do not invent numbers) ━━━\n${aiContext.facts}\n\nWhen LIVE DATA is present, answer with those numbers first. Only use [NAV:...] if the user asks how to do something in the UI. Do not navigate for pure data questions.`
+        : '';
+
+      const promptWithData = systemPrompt + operatorBlock;
+      const raw = await callGroq(apiKey, messages, promptWithData, msg);
       const { clean, route } = extractNav(raw);
-      setMessages(prev => [...prev, { role: 'assistant', text: clean, timestamp: Date.now() }]);
-      if (route) setTimeout(() => { navigate(route!); setMinimized(true); }, 600);
+      setMessages(prev => [
+        ...prev,
+        { role: 'assistant', text: clean, timestamp: Date.now(), actions: aiContext.actions },
+      ]);
+      if (route && !aiContext.toolsRun.length) {
+        setTimeout(() => { navigate(route!); setMinimized(true); }, 600);
+      }
     } catch (e: any) {
       const errMsg: string = e.message || 'Something went wrong.';
       if (errMsg.toLowerCase().includes('401') || errMsg.toLowerCase().includes('invalid') || errMsg.toLowerCase().includes('api_key')) {
@@ -545,7 +583,7 @@ const AIAssistant: React.FC<Props> = ({ currentUser, defaultOpen, hideTrigger, o
     } finally {
       setLoading(false);
     }
-  }, [input, apiKey, messages, systemPrompt, navigate, hasKey]);
+  }, [input, apiKey, messages, systemPrompt, navigate, hasKey, currentUser]);
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
@@ -825,6 +863,14 @@ const AIAssistant: React.FC<Props> = ({ currentUser, defaultOpen, hideTrigger, o
                           }
                         >
                           {renderText(msg.text)}
+                          {msg.role === 'assistant' && msg.actions?.map((act, ai) => (
+                            <AiActionCard
+                              key={ai}
+                              action={act}
+                              userId={currentUser?.id || 'ai'}
+                              canSendWhatsApp={canSendWhatsApp}
+                            />
+                          ))}
                           <div className={`text-[9px] mt-1.5 ${msg.role === 'user' ? 'text-indigo-200 text-right' : 'text-slate-400'}`}>
                             {new Date(msg.timestamp).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
                           </div>

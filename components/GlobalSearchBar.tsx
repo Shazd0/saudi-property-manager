@@ -18,10 +18,10 @@ const GlobalSearchBar: React.FC<GlobalSearchBarProps> = ({ onSearch }) => {
   };
 
   return (
-    <form onSubmit={handleSubmit} className="flex items-center gap-2 w-full max-w-xl mx-auto mb-4">
+    <form onSubmit={handleSubmit} className="mx-auto mb-4 flex min-w-0 w-full max-w-full items-center gap-2 sm:max-w-xl">
       <input
         type="text"
-        className="flex-1 px-4 py-2 border rounded-lg focus:ring-2 focus:ring-emerald-500"
+        className="min-w-0 flex-1 px-4 py-2 border rounded-lg focus:ring-2 focus:ring-emerald-500"
         placeholder="Search customers, contracts, properties..."
         value={query}
         onChange={e => setQuery(e.target.value)}

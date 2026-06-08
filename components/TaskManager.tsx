@@ -157,7 +157,7 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
   };
 
   return (
-    <div className="premium-card h-[calc(100vh-140px)] flex flex-col animate-fade-in overflow-hidden">
+    <div className="premium-card mobile-tab-shell flex h-auto min-h-0 flex-col animate-fade-in overflow-x-hidden overflow-y-visible md:h-[calc(100vh-140px)] md:overflow-hidden">
         <div className="p-3 sm:p-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 sm:gap-4 bg-slate-50/30 z-10">
              <div className="w-full sm:w-auto">
                 <h2 className="text-base sm:text-lg font-black text-slate-800 flex items-center gap-1.5 sm:gap-2">
@@ -174,8 +174,8 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
                 </div>
              </div>
              
-             <form onSubmit={handleAddTask} className="flex gap-2 w-full sm:max-w-md">
-                 <div className="relative flex-1 group">
+             <form onSubmit={handleAddTask} className="flex min-w-0 w-full gap-2 sm:max-w-md">
+                 <div className="relative min-w-0 flex-1 group">
                     <div className="absolute inset-y-0 left-0 pl-2.5 sm:pl-3 flex items-center pointer-events-none">
                         <Zap size={12} className="sm:size-[14px] text-slate-400 group-focus-within:text-violet-500 transition-colors" />
                     </div>
@@ -193,7 +193,7 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
              </form>
         </div>
 
-        <div className="flex-1 p-3 sm:p-6 flex gap-3 sm:gap-6 overflow-x-auto bg-slate-50/30">
+        <div className="max-md:flex-none flex-1 min-h-0 p-3 sm:p-6 flex gap-3 sm:gap-6 overflow-x-auto overflow-y-visible bg-slate-50/30">
             <Column status={TaskStatus.TODO} title={t('task.todo')} icon={Circle} color="border-slate-200 text-slate-500" />
             <Column status={TaskStatus.IN_PROGRESS} title={t('task.inProgress')} icon={Clock} color="border-blue-200 text-blue-500" />
             <Column status={TaskStatus.DONE} title={t('task.done')} icon={CheckCircle} color="border-emerald-200 text-emerald-500" />

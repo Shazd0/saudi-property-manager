@@ -72,15 +72,15 @@ async function generateNotifications(): Promise<AppNotification[]> {
   const readIds = getReadIds();
 
   try {
-    const [transactions, contracts, users, buildings, settings, approvals, customers] = await Promise.all([
+    const [transactions, contracts, users, buildings, settings, approvals] = await Promise.all([
       getTransactions().catch(() => []),
       getContracts().catch(() => []),
       getUsers().catch(() => []),
       getBuildings().catch(() => []),
       getSettings().catch(() => null),
       getApprovals().catch(() => []),
-      getCustomers().catch(() => []),
     ]);
+    const customers: any[] = [];
     const customerRoomMap = buildCustomerRoomMap(customers as any[]);
 
     // 1. Overdue Payments — active contracts with no income this month
@@ -461,9 +461,13 @@ export function useNotifications() {
   }, []);
 
   useEffect(() => {
-    refresh();
+    // Defer so dashboard / login are not competing for the same full Firestore reads
+    const t0 = window.setTimeout(() => refresh(), 4000);
     const iv = setInterval(refresh, 5 * 60 * 1000);
-    return () => clearInterval(iv);
+    return () => {
+      window.clearTimeout(t0);
+      clearInterval(iv);
+    };
   }, [refresh]);
 
   const markRead = useCallback((id: string) => {

@@ -2,8 +2,17 @@ import React, { useState, useEffect, useMemo } from 'react';
 import {
   FileSignature, Plus, Search, Edit2, Trash2, X, RefreshCw, AlertTriangle,
   Copy, Download, Upload, ArrowRightLeft, Link2, SlidersHorizontal,
-  CheckCircle2, Clock, Building2, User, Calendar, ChevronDown,
+  CheckCircle2, Clock, Building2, User, Calendar, ChevronDown, ArrowDown, ArrowUp,
 } from 'lucide-react';
+import {
+  compareEjarToContract,
+  hasMismatch,
+  syncEjarFromLocal,
+  syncLocalFromEjar,
+  type EjarFieldDiff,
+  type SyncToLocalField,
+} from '../services/ejarSyncService';
+import { ejarApiMode } from '../services/ejarSyncService';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import {
@@ -117,6 +126,12 @@ const EjarIntegration: React.FC = () => {
   const [isFormOpen, setIsFormOpen] = useState(false);
   const [isImportOpen, setIsImportOpen] = useState(false);
   const [isDupModalOpen, setIsDupModalOpen] = useState(false);
+  const [diffModal, setDiffModal] = useState<{
+    ejar: EjarContract;
+    contract: Contract;
+    diffs: EjarFieldDiff[];
+  } | null>(null);
+  const [pullFields, setPullFields] = useState<Set<SyncToLocalField>>(new Set(['dates', 'rent']));
   const [formData, setFormData] = useState<any>({ ...emptyForm });
   const [importData, setImportData] = useState<any>({
     ejarNumber: '', tenantName: '', tenantIdNo: '',
@@ -487,27 +502,63 @@ const EjarIntegration: React.FC = () => {
     }
   };
 
-  // ── Sync from local ──
+  const openDiffModal = (ej: EjarContract) => {
+    const c = localContracts.find((ct) => ct.id === ej.contractId);
+    if (!c) {
+      showError('No linked local contract');
+      return;
+    }
+    const customer = customers.find((cu) => cu.id === c.customerId);
+    const diffs = compareEjarToContract(ej, c, customer);
+    setDiffModal({ ejar: ej, contract: c, diffs });
+    setPullFields(new Set(['dates', 'rent']));
+  };
+
   const syncFromLocal = async (ej: EjarContract) => {
-    const c = localContracts.find(ct => ct.id === ej.contractId);
-    if (!c) { showError('No linked local contract found'); return; }
-    const customer = customers.find(cu => cu.id === c.customerId);
-    const next: EjarContract = {
-      ...ej,
-      tenantName: c.customerName,
-      tenantIdNo: customer?.idNo || ej.tenantIdNo,
-      buildingName: c.buildingName,
-      unitName: c.unitName,
-      rentAmount: c.rentValue,
-      startDate: c.fromDate,
-      endDate: c.toDate,
-      lastSyncDate: new Date().toISOString(),
-    };
-    next.status = ej.status === 'Terminated' ? 'Terminated' : deriveStatus(next);
-    await saveEjarContract(next);
-    showSuccess('Ejar record synced with local contract data');
+    const c = localContracts.find((ct) => ct.id === ej.contractId);
+    if (!c) {
+      showError('No linked local contract found');
+      return;
+    }
+    const customer = customers.find((cu) => cu.id === c.customerId);
+    await syncEjarFromLocal(ej, c, customer);
+    showSuccess('Ejar record updated from Amlak contract');
     load();
   };
+
+  const handlePullToAmlak = async () => {
+    if (!diffModal) return;
+    const fields = Array.from(pullFields) as SyncToLocalField[];
+    if (fields.length === 0) {
+      showWarning('Select at least one field to pull');
+      return;
+    }
+    if (fields.includes('rent') || fields.includes('dates')) {
+      const rentChanged = diffModal.diffs.some((d) => d.field === 'rentAmount' || d.field === 'startDate' || d.field === 'endDate');
+      if (rentChanged && !window.confirm('Changing rent or dates may require updating installments on the contract. Continue?')) {
+        return;
+      }
+    }
+    try {
+      const { diffsApplied } = await syncLocalFromEjar(diffModal.ejar, diffModal.contract, { fields });
+      showSuccess(`Amlak contract updated: ${diffsApplied.join(', ')}`);
+      setDiffModal(null);
+      load();
+    } catch (err: any) {
+      showError(err?.message || 'Pull failed');
+    }
+  };
+
+  const mismatchCount = useMemo(() => {
+    let n = 0;
+    for (const ej of dedupedEjarContracts) {
+      const c = localContracts.find((ct) => ct.id === ej.contractId);
+      if (!c) continue;
+      const customer = customers.find((cu) => cu.id === c.customerId);
+      if (hasMismatch(compareEjarToContract(ej, c, customer))) n++;
+    }
+    return n;
+  }, [dedupedEjarContracts, localContracts, customers]);
 
   // ── Merge duplicates ──
   const mergeDuplicateGroup = async (groupRows: EjarContract[]) => {
@@ -645,13 +696,15 @@ const EjarIntegration: React.FC = () => {
       </div>
 
       {/* ───────────── KPIs ───────────── */}
-      <div className="grid grid-cols-2 lg:grid-cols-5 gap-3 mb-6">
+      <div className="grid grid-cols-2 lg:grid-cols-6 gap-3 mb-2">
         <KpiCard label="Total Records" value={stats.total} icon={<FileSignature size={18} />} tone="slate" />
         <KpiCard label="Active" value={stats.active} icon={<CheckCircle2 size={18} />} tone="emerald" />
         <KpiCard label="Registered" value={stats.registered} icon={<Link2 size={18} />} tone="blue" />
         <KpiCard label="Pending" value={stats.pending} icon={<Clock size={18} />} tone="amber" />
+        <KpiCard label="Mismatches" value={mismatchCount} icon={<ArrowRightLeft size={18} />} tone="rose" />
         <KpiCard label="Unregistered" value={stats.unregistered} icon={<AlertTriangle size={18} />} tone="rose" />
       </div>
+      <p className="text-[10px] text-slate-400 mb-4">Two-way sync · mode: {ejarApiMode()}</p>
 
       {/* ───────────── Alerts ───────────── */}
       {stats.unregistered > 0 && (
@@ -828,6 +881,13 @@ const EjarIntegration: React.FC = () => {
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-3">
           {filtered.map(ej => {
             const linkedContract = localContracts.find(c => c.id === ej.contractId);
+            const linkedCustomer = linkedContract
+              ? customers.find((cu) => cu.id === linkedContract.customerId)
+              : undefined;
+            const fieldDiffs = linkedContract
+              ? compareEjarToContract(ej, linkedContract, linkedCustomer)
+              : [];
+            const mismatched = hasMismatch(fieldDiffs);
             const style = STATUS_STYLES[ej.status as EjarStatus] || STATUS_STYLES.Pending;
             return (
               <div
@@ -857,6 +917,11 @@ const EjarIntegration: React.FC = () => {
                       {linkedContract && (
                         <span className="text-[11px] bg-emerald-50 text-emerald-700 border border-emerald-200 px-2 py-0.5 rounded-md flex items-center gap-1">
                           <Link2 size={10} /> Contract #{linkedContract.contractNo}
+                        </span>
+                      )}
+                      {mismatched && (
+                        <span className="text-[11px] bg-rose-50 text-rose-700 border border-rose-200 px-2 py-0.5 rounded-md">
+                          Mismatch
                         </span>
                       )}
                     </div>
@@ -896,8 +961,11 @@ const EjarIntegration: React.FC = () => {
                     </div>
                     <div className="flex gap-1">
                       <button onClick={() => copyToClipboard(ej)} title="Copy details for Ejar portal" className="p-1.5 text-violet-600 hover:bg-violet-50 rounded-lg transition-colors"><Copy size={14} /></button>
+                      {linkedContract && mismatched && (
+                        <button onClick={() => openDiffModal(ej)} title="View Amlak vs Ejar differences" className="p-1.5 text-amber-600 hover:bg-amber-50 rounded-lg transition-colors"><ArrowRightLeft size={14} /></button>
+                      )}
                       {linkedContract && (
-                        <button onClick={() => syncFromLocal(ej)} title="Sync from local contract" className="p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"><RefreshCw size={14} /></button>
+                        <button onClick={() => syncFromLocal(ej)} title="Push Amlak → Ejar record" className="p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-lg transition-colors"><ArrowUp size={14} /></button>
                       )}
                       <button onClick={() => handleEdit(ej)} title="Edit" className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg transition-colors"><Edit2 size={14} /></button>
                       <button onClick={() => handleDelete(ej.id)} title="Delete" className="p-1.5 text-rose-600 hover:bg-rose-50 rounded-lg transition-colors"><Trash2 size={14} /></button>
@@ -1064,6 +1132,90 @@ const EjarIntegration: React.FC = () => {
               </div>
             </>
           )}
+        </Modal>
+      )}
+
+      {diffModal && (
+        <Modal onClose={() => setDiffModal(null)} title="Amlak ↔ Ejar sync" icon={<ArrowRightLeft size={18} />} size="lg">
+          <p className="text-sm text-slate-600 mb-4">
+            Contract #{diffModal.contract.contractNo} · {diffModal.ejar.tenantName}
+          </p>
+          {diffModal.diffs.length === 0 ? (
+            <p className="text-emerald-700 text-sm font-medium">Records are in sync.</p>
+          ) : (
+            <table className="w-full text-sm mb-4">
+              <thead>
+                <tr className="text-left text-xs text-slate-500 border-b">
+                  <th className="py-2">Field</th>
+                  <th className="py-2">Ejar</th>
+                  <th className="py-2">Amlak</th>
+                  <th className="py-2">Severity</th>
+                </tr>
+              </thead>
+              <tbody>
+                {diffModal.diffs.map((d) => (
+                  <tr key={d.field} className="border-b border-slate-50">
+                    <td className="py-2 font-medium">{d.field}</td>
+                    <td className="py-2">{String(d.ejarValue)}</td>
+                    <td className="py-2">{String(d.amlakValue)}</td>
+                    <td className="py-2">
+                      <span
+                        className={`text-[10px] px-2 py-0.5 rounded-full ${
+                          d.severity === 'critical'
+                            ? 'bg-rose-100 text-rose-700'
+                            : d.severity === 'warning'
+                              ? 'bg-amber-100 text-amber-700'
+                              : 'bg-slate-100 text-slate-600'
+                        }`}
+                      >
+                        {d.severity}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+          <div className="flex flex-wrap gap-3 mb-4 text-xs">
+            {(['dates', 'rent', 'tenant', 'unit'] as SyncToLocalField[]).map((f) => (
+              <label key={f} className="flex items-center gap-1.5 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={pullFields.has(f)}
+                  onChange={() => {
+                    const next = new Set(pullFields);
+                    if (next.has(f)) next.delete(f);
+                    else next.add(f);
+                    setPullFields(next);
+                  }}
+                />
+                Pull {f} to Amlak
+              </label>
+            ))}
+          </div>
+          <div className="flex gap-2 justify-end">
+            <button
+              type="button"
+              onClick={() => setDiffModal(null)}
+              className="px-4 py-2 border rounded-xl text-sm"
+            >
+              Close
+            </button>
+            <button
+              type="button"
+              onClick={() => syncFromLocal(diffModal.ejar)}
+              className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold flex items-center gap-1"
+            >
+              <ArrowUp size={14} /> Push to Ejar
+            </button>
+            <button
+              type="button"
+              onClick={handlePullToAmlak}
+              className="px-4 py-2 bg-blue-600 text-white rounded-xl text-sm font-bold flex items-center gap-1"
+            >
+              <ArrowDown size={14} /> Pull to Amlak
+            </button>
+          </div>
         </Modal>
       )}
 

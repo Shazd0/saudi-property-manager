@@ -1,14 +1,14 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
 import {
-  X, LayoutDashboard, PlusCircle, History, Users, Building, UserCheck,
+  X, PlusCircle, History, Users, Building, UserCheck,
   FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart,
   Car, Bell, ArrowRightLeft, Receipt, FolderOpen, Info, Upload, Settings,
-  MessageCircle, Calculator, ChevronRight, Home, Search, BookOpen,
+  MessageCircle, Calculator, ChevronRight, ChevronDown, Home, Search, BookOpen,
   LogOut, Package, Landmark, ClipboardCheck, BarChart3, FileText,
-  Crown, Fingerprint, ShieldAlert, MapPin, Zap, Shield, MessageSquare,
+  Crown, ShieldAlert, MapPin, Zap, Shield, MessageSquare,
   Banknote, CreditCard, FileCheck, BookMarked, Layers, Scale,
-  TrendingUp, TrendingDown, DollarSign, Globe,
+  TrendingUp, TrendingDown, DollarSign,
 } from 'lucide-react';
 import SoundService from '../services/soundService';
 import HapticService from '../services/hapticService';
@@ -16,6 +16,7 @@ import logo from '../images/logo.png';
 import { User, UserRole } from '../types';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
+import LanguageToggle from './LanguageToggle';
 
 interface MobileMenuProps {
   user: User;
@@ -177,9 +178,9 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
     { key: 'main', label: t('nav.menu'), icon: Home },
     { key: 'data', label: t('nav.database'), icon: FolderOpen },
     { key: 'analytics', label: t('nav.analytics'), icon: PieChart },
-    { key: 'accounting', label: t('nav.accounting'), icon: Calculator },
     { key: 'ops', label: t('nav.operations'), icon: ArrowRightLeft },
     { key: 'compliance', label: t('nav.compliance') || 'Compliance', icon: ShieldAlert },
+    { key: 'accounting', label: t('nav.accounting'), icon: Calculator },
     { key: 'integrations', label: t('nav.integrations') || 'Integrations', icon: Zap },
     { key: 'settings', label: t('nav.settings'), icon: Settings },
   ];
@@ -218,85 +219,95 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
       <div
         className="mmenu-backdrop"
         onClick={() => { SoundService.play('close'); HapticService.light(); onClose(); }}
+        aria-hidden
       />
 
       {/* Drawer */}
-      <div
+      <aside
         className={`mmenu-drawer${isRTL ? ' is-rtl' : ''}`}
         dir={isRTL ? 'rtl' : 'ltr'}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t('nav.menu')}
       >
-        {/* Top drag handle */}
-        <div className="mmenu-handle" />
-
-        {/* Header: user profile */}
-        <div className="mmenu-header">
-          {/* Brand bar */}
+        <div className="mmenu-scroll-region">
+        {/* Header — sticky while scrolling sections */}
+        <div className="mmenu-header mmenu-header--sticky">
           <div className="mmenu-brand-bar">
-            <img
-              src={LOGO_URL}
-              alt=""
-              className="mmenu-brand-logo"
-              onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
-            />
-            <span className="mmenu-brand-name">AMLAK</span>
+            <div className="mmenu-brand-cluster">
+              <div className="mmenu-brand-logo-wrap">
+                <img
+                  src={LOGO_URL}
+                  alt=""
+                  className="mmenu-brand-logo"
+                  onError={e => { (e.target as HTMLImageElement).style.display = 'none'; }}
+                />
+              </div>
+              <div className="mmenu-brand-text">
+                <span className="mmenu-brand-name">{t('app.title')}</span>
+                <span className="mmenu-brand-tag">{t('app.subtitle')}</span>
+              </div>
+            </div>
             <button
+              type="button"
               onClick={() => { SoundService.play('close'); HapticService.light(); onClose(); }}
               className="mmenu-close-btn"
-              aria-label="Close menu"
+              aria-label={t('common.close') || 'Close'}
             >
-              <X size={18} />
+              <X size={20} strokeWidth={2.25} />
             </button>
           </div>
 
-          {/* User card */}
           <div className="mmenu-user-card">
             {userPhotoURL ? (
-              <img src={userPhotoURL} alt={user.name} className="mmenu-avatar-img" />
+              <img src={userPhotoURL} alt="" className="mmenu-avatar-img" />
             ) : (
-              <div className="mmenu-avatar-placeholder">
+              <div className="mmenu-avatar-placeholder" aria-hidden>
                 {(user?.name || user?.email || 'U').charAt(0).toUpperCase()}
               </div>
             )}
             <div className="mmenu-user-info">
               <p className="mmenu-user-name">{user?.name || user?.email || 'User'}</p>
-              <p className="mmenu-user-role">{user.role}</p>
+              <span className="mmenu-user-role">{user.role}</span>
             </div>
           </div>
 
-          {/* Search */}
           <div className="mmenu-search-wrap">
-            <Search size={15} className="mmenu-search-icon" />
+            <Search size={16} className="mmenu-search-icon" strokeWidth={2} />
             <input
               type="search"
               value={menuSearch}
               onChange={e => setMenuSearch(e.target.value)}
               placeholder={t('common.search') || 'Search...'}
               className="mmenu-search-input"
+              enterKeyHint="search"
             />
           </div>
         </div>
 
-        {/* Quick tiles */}
+        {/* Quick access — horizontal chips */}
         {!searchActive && (
           <div className="mmenu-quick-section">
-            <p className="mmenu-section-label">{t('nav.quickAccess') || 'Quick Access'}</p>
-            <div className="mmenu-tiles">
-              {quickTiles.map(tile => {
-                const Icon = tile.icon;
-                return (
-                  <button
-                    key={tile.to}
-                    type="button"
-                    onClick={() => go(tile.to)}
-                    className="mmenu-tile"
-                  >
-                    <span className={`mmenu-tile-icon bg-gradient-to-br ${colorMap[tile.color]}`}>
-                      <Icon size={18} strokeWidth={2.2} />
-                    </span>
-                    <span className="mmenu-tile-label">{tile.label}</span>
-                  </button>
-                );
-              })}
+            <p className="mmenu-section-label">{t('nav.quickAccess') || 'Quick access'}</p>
+            <div className="mmenu-tiles-scroll">
+              <div className="mmenu-tiles">
+                {quickTiles.map(tile => {
+                  const Icon = tile.icon;
+                  return (
+                    <button
+                      key={tile.to}
+                      type="button"
+                      onClick={() => go(tile.to)}
+                      className="mmenu-tile"
+                    >
+                      <span className={`mmenu-tile-icon bg-gradient-to-br ${colorMap[tile.color]}`}>
+                        <Icon size={20} strokeWidth={2.1} />
+                      </span>
+                      <span className="mmenu-tile-label">{tile.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
             </div>
           </div>
         )}
@@ -305,7 +316,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
         {!searchActive && isAdmin && (
           <div className="mmenu-books-section">
             <p className="mmenu-section-label">{t('nav.booksPartitions') || 'Books'}</p>
-            {books.length > 1 && (
+            {books.length > 1 ? (
               <select
                 value={activeBook.id}
                 onChange={e => { switchBook(e.target.value); SoundService.play('toggle'); HapticService.selection(); }}
@@ -315,14 +326,17 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
                   <option key={book.id} value={book.id}>{book.name}</option>
                 ))}
               </select>
+            ) : (
+              <p className="mmenu-books-single">{activeBook.name}</p>
             )}
             <button
               type="button"
               onClick={() => go('/admin/books')}
-              className="mmenu-row mt-1"
+              className="mmenu-row mmenu-row--button"
             >
-              <span className="mmenu-row-icon"><BookOpen size={16} /></span>
-              <span className="mmenu-row-label">{t('nav.booksPartitions') || 'Manage Books'}</span>
+              <span className="mmenu-row-icon"><BookOpen size={17} strokeWidth={2} /></span>
+              <span className="mmenu-row-label">{t('nav.booksPartitions')}</span>
+              <ChevronRight size={16} className="mmenu-row-chevron" strokeWidth={2} />
             </button>
           </div>
         )}
@@ -354,8 +368,9 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
                       <SecIcon size={18} strokeWidth={2} />
                     </span>
                     <span className="mmenu-section-title">{sec.label}</span>
-                    <ChevronRight
-                      size={16}
+                    <ChevronDown
+                      size={18}
+                      strokeWidth={2.25}
                       className={`mmenu-chevron${isExpanded ? ' is-open' : ''}`}
                     />
                   </button>
@@ -381,32 +396,31 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
             <span>
               {pendingApprovals} {t('nav.pendingApprovals') || 'pending approval(s)'}
             </span>
-            <ChevronRight size={14} className="ml-auto" />
+            <ChevronRight size={16} strokeWidth={2.25} className="mmenu-approvals-chevron" />
           </button>
         )}
+        </div>
 
         {/* Footer: language toggle + logout */}
         <div className="mmenu-footer">
-          <button
-            type="button"
-            onClick={() => { SoundService.play('toggle'); HapticService.medium(); }}
-            className="mmenu-footer-btn"
-          >
-            <Globe size={16} />
-            <span>{t('common.language') || 'Language'}</span>
-          </button>
+          <div className="mmenu-footer-lang">
+            <LanguageToggle
+              compact
+              className="mmenu-footer-lang-btn !w-full !min-h-[48px] !py-2.5 !px-3 !rounded-xl !text-[0.8125rem] !font-semibold !justify-center !gap-2 !border !border-slate-200/90 !bg-white !text-slate-700 !shadow-sm hover:!bg-slate-50 dark:!border-white/10 dark:!bg-white/[0.06] dark:!text-slate-200 dark:hover:!bg-white/[0.1]"
+            />
+          </div>
           {onLogout && (
             <button
               type="button"
               onClick={() => { SoundService.play('swoosh'); HapticService.heavy(); onClose(); onLogout(); }}
               className="mmenu-footer-btn mmenu-footer-btn--danger"
             >
-              <LogOut size={16} />
+              <LogOut size={17} strokeWidth={2} />
               <span>{t('common.logout') || 'Logout'}</span>
             </button>
           )}
         </div>
-      </div>
+      </aside>
     </>
   );
 };

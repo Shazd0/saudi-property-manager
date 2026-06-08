@@ -66,7 +66,7 @@ import { getTransactions, getContracts, getApprovals, getBuildings, getSettings,
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
-import { normalizePaymentMethod, normalizeTransactionType } from '../utils/transactionUtils';
+import { normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -194,7 +194,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
           ? [currentUser.buildingId]
           : [];
 
-      const [txs, cons, apprs, blds, custs, appSettings, trsf] = await Promise.all([
+      const [txs, cons, apprs, blds, appSettings, trsf] = await Promise.all([
         getTransactions({
           userId: actorId,
           role: actorRoleKey,
@@ -203,31 +203,24 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         getContracts(),
         getApprovals(),
         getBuildings(),
-        getCustomers(),
         getSettings().catch(() => null),
         getTransfers({}),
       ]);
 
       clearTimeout(safetyTimeout);
 
-      let resolvedTxs = txs || [];
-      if ((!resolvedTxs || resolvedTxs.length === 0) && currentUser) {
-        const allTxs = await getTransactions({ role: UserRole.ADMIN as any });
-        if (actorRoleKey === UserRole.ADMIN || actorRoleKey === UserRole.MANAGER || !(currentUser as any)?.role) {
-          resolvedTxs = allTxs || [];
-        } else {
-          resolvedTxs = (allTxs || []).filter((t: any) =>
-            t.createdBy === actorId || t.createdById === actorId || t.userId === actorId
-          );
-        }
-      }
+      const resolvedTxs = txs || [];
 
-      setTransactions((resolvedTxs || []).filter((t: any) => !t.vatReportOnly));
+      // Include VAT purchase/import-only rows in dashboard totals (must match History).
+      setTransactions(resolvedTxs || []);
       setContracts(cons || []);
       setApprovals(apprs || []);
       setBuildings(blds || []);
-      setCustomers(custs || []);
       setTransfers(trsf || []);
+
+      getCustomers()
+        .then((c) => setCustomers(c || []))
+        .catch(() => setCustomers([]));
       setOpeningBalancesByBuilding(((appSettings as any)?.openingBalancesByBuilding || {}) as Record<string, { cash: number; bank: number; date?: string }>);
 
     } catch (error) {
@@ -389,6 +382,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const isAdmin = (currentUser as any)?.role === UserRole.ADMIN;
       const isAdminOrManager = (currentUser as any)?.role === UserRole.ADMIN || (currentUser as any)?.role === UserRole.MANAGER;
       const userBuildingIds = (currentUser as any)?.buildingIds || ((currentUser as any)?.buildingId ? [(currentUser as any).buildingId] : []);
+      const norm = (v: any) => String(v || '').trim().toLowerCase();
 
       const existingTreasuryIds = new Set(allTransactions.filter(t => (t as any).transferId).map(tx => (t as any).transferId));
       const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
@@ -400,15 +394,64 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         type: tr.fromType === 'BUILDING' ? 'EXPENSE' : 'INCOME',
         amount: Number(tr.amount) || 0,
         paymentMethod: 'TREASURY',
+        // Preserve the user-selected flow (CASH/BANK/CHEQUE) for proper cash/bank split.
+        originalPaymentMethod: tr.paymentMethod,
         fromType: tr.fromType,
         toType: tr.toType,
+        fromId: tr.fromId,
+        toId: tr.toId,
         source: 'treasury',
         buildingId: tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : undefined),
         status: tr.status || 'APPROVED',
         expenseCategory: '',
         borrowingType: undefined,
+        transferId: tr.id,
       } as any));
-      const allTxns = [...allTransactions, ...buildingOwnerPseudo];
+      // Inter-building pseudo legs (match History.tsx): fill missing source/dest transaction legs
+      // for same-book transfers that lack one side in older data.
+      const interBuildingPseudo: any[] = [];
+      const rawOf = (compositeId: string | undefined): string => {
+        if (!compositeId) return '';
+        const s = String(compositeId);
+        return s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
+      };
+      const bookOf = (compositeId: string | undefined): string => {
+        if (!compositeId) return '';
+        const s = String(compositeId);
+        return s.includes(':') ? s.slice(0, s.indexOf(':')) : '';
+      };
+      (transfers || []).forEach((tr: any) => {
+        if (tr.deleted) return;
+        if (!(tr.fromType === 'BUILDING' && tr.toType === 'BUILDING' && tr.fromId && tr.toId && tr.fromId !== tr.toId)) return;
+        const isCrossBook =
+          (tr.sourceBookId && tr.destBookId && tr.sourceBookId !== tr.destBookId)
+          || (!!bookOf(tr.fromId) && !!bookOf(tr.toId) && bookOf(tr.fromId) !== bookOf(tr.toId));
+        if (isCrossBook) return;
+        const fromRaw = rawOf(tr.fromId);
+        const toRaw = rawOf(tr.toId);
+        const linked = allTransactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
+        const hasSource = linked.some(tx => norm((tx as any).buildingId) === norm(fromRaw));
+        const hasDest = linked.some(tx => norm((tx as any).buildingId) === norm(toRaw));
+        const base = {
+          date: tr.date || '',
+          amount: Number(tr.amount) || 0,
+          paymentMethod: 'TREASURY',
+          originalPaymentMethod: tr.paymentMethod,
+          fromType: tr.fromType,
+          toType: tr.toType,
+          fromId: tr.fromId,
+          toId: tr.toId,
+          source: 'treasury',
+          status: tr.status || 'APPROVED',
+          expenseCategory: '',
+          borrowingType: undefined,
+          transferId: tr.id,
+        };
+        if (!hasSource) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_src`, type: 'EXPENSE', buildingId: fromRaw, interBuildingRole: 'SOURCE' });
+        if (!hasDest) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME', buildingId: toRaw, interBuildingRole: 'DEST' });
+      });
+
+      const allTxns = [...allTransactions, ...buildingOwnerPseudo, ...interBuildingPseudo];
 
       let approvedTxns = allTxns.filter(t => {
         if ((t as any).deleted) return false;
@@ -461,33 +504,50 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         return approved;
       }
 
-      const selectedBuildingNames = new Set(
-        allBuildings.filter(b => selectedBuildingIds.includes(b.id)).map(b => b.name)
-      );
+      const normalize = (v?: string) => String(v || '').trim().toLowerCase();
+      const getBuildingName = (id?: string) => {
+        if (!id) return '';
+        if (id.includes(',')) return '';
+        const b = allBuildings.find(x => x.id === id || (x as any)._id === id);
+        return b ? (b as any).name || '' : '';
+      };
+      const matchTransactionBuilding = (tx: Transaction, buildingId: string) => {
+        const targetId = normalize(buildingId);
+        const targetName = normalize(getBuildingName(buildingId));
+        if (!targetId) return false;
 
-      return approved.filter(t => {
-        const ownerCat = (t.expenseCategory || '').trim();
-        const isOwnerType = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal' || ownerCat === 'Owner Opening Balance' || ownerCat === 'OWNER_EXPENSE' || (t as any).isOwnerOpeningBalance;
-        if (isOwnerType) {
-          const bId = String((t as any).buildingId || '');
-          if (!bId) return false;
+        // Same rule as History.tsx: for treasury-sourced rows, match STRICTLY by tx.buildingId
+        if ((tx as any).source === 'treasury') {
+          if (!tx.buildingId) return false;
+          return normalize(tx.buildingId) === targetId;
         }
 
-        if ((t as any).buildingId && selectedBuildingIds.includes(String((t as any).buildingId))) {
-          return true;
-        }
+        const rawIds = [
+          (tx as any).buildingId,
+          (tx as any).building,
+          (tx as any).building_id,
+          (tx as any).targetBuildingId,
+          (tx as any).fromId,
+          (tx as any).toId,
+        ]
+          .flatMap(v => String(v || '').split(','))
+          .map(v => normalize(v))
+          .filter(Boolean);
+        if (rawIds.includes(targetId)) return true;
 
-        if (t.buildingName && selectedBuildingNames.has(t.buildingName)) {
-          return true;
-        }
-
-        const altBuildingId = (t as any).building || (t as any).building_id;
-        if (altBuildingId && selectedBuildingIds.includes(String(altBuildingId))) {
-          return true;
-        }
-
+        const rawNames = [
+          (tx as any).buildingName,
+          typeof (tx as any).building === 'string' ? (tx as any).building : '',
+          (tx as any).building_name,
+        ]
+          .flatMap(v => String(v || '').split(','))
+          .map(v => normalize(v))
+          .filter(Boolean);
+        if (targetName && rawNames.includes(targetName)) return true;
         return false;
-      });
+      };
+
+      return approved.filter(t => selectedBuildingIds.some(id => matchTransactionBuilding(t, id)));
     },
     [approved, selectedBuildingIds, allBuildings]
   );
@@ -513,73 +573,128 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
     return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(lastDay).padStart(2, '0')}`;
   }, []);
 
-  const effectiveDateFrom = tillDate ? '2000-01-01' : (fromDate || currentMonthStart);
-  const effectiveDateTo = tillDate || toDate || currentMonthEnd;
+  // Match History.tsx date-window semantics
+  const hasDateFilter = !!(fromDate || toDate || tillDate);
+  const effectiveDateFrom = fromDate || '';
+  const effectiveDateTo = tillDate || toDate || '9999-12-31';
 
-  const prevMonthClosing = useMemo(() => {
-    const cutoff = effectiveDateFrom.substring(0, 8) + '01';
-    let prevTxns = filteredApproved.filter(t => t.date && t.date < cutoff);
+  /** Amount to use in dashboard totals (prefer VAT-inclusive when available). */
+  const txDisplayAmount = useCallback((t: Transaction): number => {
+    const inclRaw = (t as any).amountIncludingVAT ?? (t as any).totalWithVat;
+    if (inclRaw != null && inclRaw !== '') {
+      const n = Number(inclRaw);
+      if (!Number.isNaN(n)) {
+        const base = Number((t as any).amount) || 0;
+        const vat = Number((t as any).vatAmount) || 0;
+        const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
+        // Old data guard: some rows stored "amountIncludingVAT" but it equals the exclusive/base.
+        if (isExpense && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
+        return n;
+      }
+    }
+    const base = Number((t as any).amount) || 0;
+    const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
+    const vat = Number((t as any).vatAmount) || 0;
+    // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
+    // and some rows may be missing `isVATApplicable` even though VAT was entered.
+    if (isExpense && vat > 0) return base + vat;
+    return base;
+  }, []);
 
-    let cashBal = 0, bankBal = 0, totalBal = 0;
-    Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
-      if (selectedBuildingIds.length > 0 && !selectedBuildingIds.includes(buildingId)) return;
-      const c = Number((row as any).cash) || 0;
-      const b = Number((row as any).bank) || 0;
-      cashBal += c;
-      bankBal += b;
-      totalBal += c + b;
-    });
+  const dashLedgerSummary = useMemo(() => {
+    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + txDisplayAmount(r), 0);
     const isOpeningBalance = (t: Transaction) =>
       t.borrowingType === 'OPENING_BALANCE' ||
       (t as any).isOwnerOpeningBalance === true ||
       t.expenseCategory === 'Owner Opening Balance';
-    for (const t of prevTxns) {
+
+    // Settings opening balances
+    let settingsOpeningCash = 0;
+    let settingsOpeningBank = 0;
+    Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
+      if (selectedBuildingIds.length > 0 && !selectedBuildingIds.includes(buildingId)) return;
+      settingsOpeningCash += Number((row as any).cash) || 0;
+      settingsOpeningBank += Number((row as any).bank) || 0;
+    });
+    const settingsOpeningAll = settingsOpeningCash + settingsOpeningBank;
+
+    const openingCutoff = hasDateFilter ? (fromDate || currentMonthStart) : currentMonthStart;
+    const periodTxns = hasDateFilter
+      ? filteredApproved.filter(t => t.date && t.date >= effectiveDateFrom && t.date <= effectiveDateTo)
+      : filteredApproved.filter(t => t.date && t.date >= currentMonthStart);
+
+    const incomeRows = periodTxns.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
+    const expenseRows = periodTxns.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
+
+    const cashIncome = sumAmt(incomeRows.filter(r => transactionCountsAsCashForSplit(r)));
+    const bankIncome = sumAmt(incomeRows.filter(r => transactionCountsAsBankForSplit(r)));
+    const incomeTotal = sumAmt(incomeRows);
+
+    const cashExpense = sumAmt(expenseRows.filter(r => transactionCountsAsCashForSplit(r)));
+    const bankExpense = sumAmt(expenseRows.filter(r => transactionCountsAsBankForSplit(r)));
+    const expenseTotal = sumAmt(expenseRows);
+
+    // Opening balances from prior txns
+    let openingCash = 0, openingBank = 0, openingAll = 0;
+    const priorTxns = filteredApproved.filter(t => t.date && t.date < openingCutoff);
+    for (const t of priorTxns) {
       if (isOpeningBalance(t)) continue;
-      const amt = Number(t.amount) || 0;
-      const isIncome = normalizeTransactionType(t.type) === TransactionType.INCOME;
-      const rawMethod = String(t.paymentMethod || '').toUpperCase();
-      const isCash = rawMethod === 'CASH' || rawMethod === 'TREASURY';
-      const isBank = rawMethod === 'BANK' || rawMethod === 'CHEQUE';
-      const netAmt = isIncome ? amt : -amt;
-      totalBal += netAmt;
-      if (isCash) cashBal += netAmt;
-      else if (isBank) bankBal += netAmt;
-    }
-    return { cash: cashBal, bank: bankBal, total: totalBal };
-  }, [filteredApproved, effectiveDateFrom, openingBalancesByBuilding, selectedBuildingIds]);
-
-  const dashSummary = useMemo(() => {
-    let txns = dateFilteredApproved;
-    if (!fromDate && !toDate && !tillDate) {
-      txns = txns.filter(t => t.date && t.date >= currentMonthStart && t.date <= currentMonthEnd);
+      const amt = txDisplayAmount(t);
+      const isInc = normalizeTransactionType(t.type) === TransactionType.INCOME;
+      const netAmt = isInc ? amt : -amt;
+      openingAll += netAmt;
+      if (transactionCountsAsCashForSplit(t)) openingCash += netAmt;
+      else if (transactionCountsAsBankForSplit(t)) openingBank += netAmt;
     }
 
-    const isOpeningBalance = (r: Transaction) =>
-      r.borrowingType === 'OPENING_BALANCE' ||
-      (r as any).isOwnerOpeningBalance === true ||
-      r.expenseCategory === 'Owner Opening Balance';
-    const incomeRows = txns.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
-    const expenseRows = txns.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
-    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + (Number(r.amountIncludingVAT || (r as any).totalWithVat || r.amount) || 0), 0);
-    // Use originalPaymentMethod for treasury-linked transactions so BANK/CHEQUE
-    // treasury transfers are classified correctly instead of falling into Cash.
-    const effM = (r: any) => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase();
-    const ci = sumAmt(incomeRows.filter(r => { const m = effM(r); return m === 'CASH' || m === 'TREASURY'; }));
-    const bi = sumAmt(incomeRows.filter(r => { const m = effM(r); return m === 'BANK' || m === 'CHEQUE'; }));
-    const ce = Math.abs(sumAmt(expenseRows.filter(r => { const m = effM(r); return m === 'CASH' || m === 'TREASURY'; })));
-    const be = Math.abs(sumAmt(expenseRows.filter(r => { const m = effM(r); return m === 'BANK' || m === 'CHEQUE'; })));
-    const it = sumAmt(incomeRows);
-    const et = sumAmt(expenseRows);
-    const cashBal = prevMonthClosing.cash + ci - ce;
-    const bankBal = prevMonthClosing.bank + bi - be;
+    const cashBalance = openingCash + settingsOpeningCash + cashIncome - cashExpense;
+    const bankBalance = openingBank + settingsOpeningBank + bankIncome - bankExpense;
+    const totalNet = openingAll + settingsOpeningAll + incomeTotal - expenseTotal;
+
     return {
-      cashIncome: ci, bankIncome: bi, incomeTotal: it,
-      cashExpense: ce, bankExpense: be, expenseTotal: et,
-      cashBalance: cashBal,
-      bankBalance: bankBal,
-      totalNet: prevMonthClosing.total + it - et,
+      openingCash: openingCash + settingsOpeningCash,
+      openingBank: openingBank + settingsOpeningBank,
+      openingTotal: openingAll + settingsOpeningAll,
+      cashIncome,
+      bankIncome,
+      incomeTotal,
+      cashExpense,
+      bankExpense,
+      expenseTotal,
+      cashBalance,
+      bankBalance,
+      totalNet,
     };
-  }, [dateFilteredApproved, currentMonthStart, currentMonthEnd, prevMonthClosing, fromDate, toDate, tillDate]);
+  }, [
+    filteredApproved,
+    openingBalancesByBuilding,
+    selectedBuildingIds,
+    hasDateFilter,
+    fromDate,
+    currentMonthStart,
+    effectiveDateFrom,
+    effectiveDateTo,
+  ]);
+
+  const prevMonthClosing = useMemo(
+    () => ({ cash: dashLedgerSummary.openingCash, bank: dashLedgerSummary.openingBank, total: dashLedgerSummary.openingTotal }),
+    [dashLedgerSummary.openingCash, dashLedgerSummary.openingBank, dashLedgerSummary.openingTotal],
+  );
+
+  const dashSummary = useMemo(
+    () => ({
+      cashIncome: dashLedgerSummary.cashIncome,
+      bankIncome: dashLedgerSummary.bankIncome,
+      incomeTotal: dashLedgerSummary.incomeTotal,
+      cashExpense: dashLedgerSummary.cashExpense,
+      bankExpense: dashLedgerSummary.bankExpense,
+      expenseTotal: dashLedgerSummary.expenseTotal,
+      cashBalance: dashLedgerSummary.cashBalance,
+      bankBalance: dashLedgerSummary.bankBalance,
+      totalNet: dashLedgerSummary.totalNet,
+    }),
+    [dashLedgerSummary],
+  );
 
   const treasurySummary = useMemo(() => {
     const activeTransfers = transfers.filter((t: any) => t.status === 'COMPLETED' && !t.deleted);
@@ -595,7 +710,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     const periodStart = effectiveDateFrom;
     const periodEnd = effectiveDateTo;
-    const openingCutoff = periodStart.substring(0, 8) + '01';
+    const openingCutoff = tillDate ? periodStart : (fromDate || currentMonthStart);
 
     const officeOpeningBalance = allBuildingsSelected
       ? activeTransfers
@@ -629,29 +744,38 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
     const netBalance = openingTotal + totalIn - totalOut - headOfficeExpenses;
 
     return { officeOpeningBalance: openingTotal, totalIn, totalOut, headOfficeExpenses, netBalance };
-  }, [transfers, filteredApproved, effectiveDateFrom, effectiveDateTo, selectedBuildingIds, buildings]);
+  }, [transfers, filteredApproved, effectiveDateFrom, effectiveDateTo, selectedBuildingIds, buildings, tillDate, fromDate, currentMonthStart]);
 
   const ownerExpensesTotal = useMemo(() => {
-    const periodStart = effectiveDateFrom;
-    const periodEnd = effectiveDateTo;
-    const openingCutoff = periodStart.substring(0, 8) + '01';
+    // Align with History / transaction cards: VAT-inclusive amount, sane month window when no date filter,
+    // and do not double-count rows already represented by Treasury HO→OWNER transfers after conversion.
+    const periodStartRaw = hasDateFilter ? effectiveDateFrom : currentMonthStart;
+    const periodEndRaw = hasDateFilter ? effectiveDateTo : currentMonthEnd;
+    const periodStart = (periodStartRaw && String(periodStartRaw).trim()) ? periodStartRaw : currentMonthStart;
+    const periodEnd = (periodEndRaw && String(periodEndRaw).trim()) ? periodEndRaw : currentMonthEnd;
+    const openingCutoff = tillDate ? periodStart : (fromDate || currentMonthStart);
 
-    const ownerExpenses = filteredApproved.filter(t =>
-      t.type === TransactionType.EXPENSE && (
-        (t.expenseCategory || '').trim() === 'Owner Expense' ||
-        (t.expenseCategory || '').trim() === 'Owner Profit Withdrawal' ||
-        (t.expenseCategory || '').trim() === 'OWNER_EXPENSE' ||
-        (t.expenseCategory || '').trim() === 'Owner Opening Balance' ||
-        (t as any).isOwnerOpeningBalance
-      )
-    );
+    const ownerExpenses = filteredApproved.filter(t => {
+      if (t.type !== TransactionType.EXPENSE) return false;
+      const cat = (t.expenseCategory || '').trim();
+      const isOwnerOpeningRow = cat === 'Owner Opening Balance' || (t as any).isOwnerOpeningBalance === true;
+      const isOwnerLike =
+        cat === 'Owner Expense' ||
+        cat === 'Owner Profit Withdrawal' ||
+        cat === 'OWNER_EXPENSE' ||
+        isOwnerOpeningRow;
+      if (!isOwnerLike) return false;
+      if ((t as any).treasuryConverted && !isOwnerOpeningRow) return false;
+      return true;
+    });
 
     let openingBalance = 0;
     let thisMonth = 0;
 
     ownerExpenses.forEach(t => {
       const txDate = t.date || '';
-      const amt = Number(t.amount) || 0;
+      if (!txDate) return;
+      const amt = txDisplayAmount(t);
       if (txDate >= periodStart && txDate <= periodEnd) {
         thisMonth += amt;
       } else if (txDate < openingCutoff) {
@@ -667,6 +791,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     ownerTransfers.forEach((tr: any) => {
       const txDate = tr.date || '';
+      if (!txDate) return;
       const amt = Number(tr.amount) || 0;
       if (txDate >= periodStart && txDate <= periodEnd) {
         thisMonth += amt;
@@ -681,6 +806,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     ownerReturns.forEach((tr: any) => {
       const txDate = tr.date || '';
+      if (!txDate) return;
       const amt = Number(tr.amount) || 0;
       if (txDate >= periodStart && txDate <= periodEnd) {
         thisMonth -= amt;
@@ -690,7 +816,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
     });
 
     return { openingBalance, thisMonth, total: openingBalance + thisMonth };
-  }, [filteredApproved, transfers, selectedBuildingIds, allBuildings, effectiveDateFrom, effectiveDateTo]);
+  }, [filteredApproved, transfers, selectedBuildingIds, allBuildings, effectiveDateFrom, effectiveDateTo, tillDate, fromDate, currentMonthStart, currentMonthEnd, hasDateFilter, txDisplayAmount]);
 
   const monthlyData = useMemo(() => {
     const months: Record<string, { month: string; income: number; expense: number; net: number }> = {};
@@ -714,8 +840,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       if (!months[key]) return;
       const ownerCat = (t.expenseCategory || '').trim();
       const isOwnerExp = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal';
-      if (t.type === TransactionType.INCOME) months[key].income += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
-      if (t.type === TransactionType.EXPENSE && !isOwnerExp) months[key].expense += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+      const amt = txDisplayAmount(t);
+      if (t.type === TransactionType.INCOME) months[key].income += amt;
+      if (t.type === TransactionType.EXPENSE && !isOwnerExp) months[key].expense += amt;
       months[key].net = months[key].income - months[key].expense;
     });
 
@@ -730,16 +857,17 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const isIncome = normalizeTransactionType(t.type) === TransactionType.INCOME;
       const ownerCat = (t.expenseCategory || '').trim();
       const isOwnerExp = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal';
+      const amt = txDisplayAmount(t);
       if (isIncome) {
-        methods[method].income += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+        methods[method].income += amt;
       } else if (!isOwnerExp) {
-        methods[method].expense += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+        methods[method].expense += amt;
       }
     });
     return Object.entries(methods)
       .filter(([, v]) => v.income > 0 || v.expense > 0)
       .map(([name, v]) => ({ name, income: v.income, expense: v.expense }));
-  }, [dateFilteredApproved]);
+  }, [dateFilteredApproved, txDisplayAmount]);
 
   const customerRoomMap = useMemo(() => buildCustomerRoomMap(customers), [customers]);
   const formatContractCustomer = useCallback((c: { customerId?: string; customerName?: string } | null | undefined): string => {
@@ -900,8 +1028,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
      * These three together guarantee NOTHING escapes the screen horizontally.
      */
     <div
-      className="mobile-tab-shell tab-dashboard space-y-4 animate-fade-in pb-20 overflow-x-hidden w-full max-w-full"
-      style={{ touchAction: 'pan-y' }}
+      className="mobile-tab-shell tab-dashboard space-y-4 animate-fade-in pb-4 sm:pb-6 overflow-x-hidden w-full max-w-full min-w-0"
     >
       {/* ── Install App Banner ── */}
       {!isAppInstalled && !installDismissed && (
@@ -972,12 +1099,12 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
        * absolute inset-0 overflow-hidden wrapper so they are still clipped to
        * the card boundary while the dropdown can escape downward.
        */}
-      <div className="page-header page-header-emerald dashboard-page-header !mb-0" style={{ overflow: 'visible' }}>
+      <div className="page-header page-header-emerald dashboard-page-header !mb-0 min-w-0 max-w-full">
         <div className="absolute inset-0 overflow-hidden pointer-events-none" style={{ borderRadius: 'inherit' }}>
           <div className="absolute top-0 right-0 w-48 h-48 bg-white/5 rounded-full -translate-y-1/2 translate-x-1/2"></div>
           <div className="absolute bottom-0 left-0 w-36 h-36 bg-white/5 rounded-full translate-y-1/2 -translate-x-1/4"></div>
         </div>
-        <div className="relative z-10">
+        <div className="relative z-10 min-w-0 max-w-full">
 
           {/* Row 1: title + refresh */}
           <div className="flex items-start justify-between gap-2 mb-3">
@@ -1213,28 +1340,30 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
             </div>
           )}
 
-          {/* Row 3: date filters — 2×2 grid on mobile, 4 cols on desktop */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 dash-date-bar">
-            <div>
-              <label className="block text-[9px] font-black uppercase tracking-wider text-white/70 mb-1">{t('history.fromDate')}</label>
-              <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
-                className="w-full px-2 py-1.5 rounded-xl bg-white/90 text-slate-800 text-[11px] font-bold border border-white/30 outline-none focus:ring-2 focus:ring-emerald-300" />
+          {/* Row 3: mobile = From|To row, then Till full width, then Clear. sm+ = one row × 4 cols */}
+          <div className="dash-date-bar flex min-w-0 flex-col gap-2 sm:grid sm:grid-cols-4 sm:gap-2">
+            <div className="grid min-w-0 grid-cols-2 gap-2 sm:contents">
+              <div className="min-w-0">
+                <label className="block text-[9px] font-black uppercase tracking-wider text-white/70 mb-1">{t('history.fromDate')}</label>
+                <input type="date" value={fromDate} onChange={e => setFromDate(e.target.value)}
+                  className="box-border w-full min-w-0 max-w-full px-2 py-1.5 rounded-xl bg-white/90 text-slate-800 text-[11px] font-bold border border-white/30 outline-none focus:ring-2 focus:ring-emerald-300" />
+              </div>
+              <div className="min-w-0">
+                <label className="block text-[9px] font-black uppercase tracking-wider text-white/70 mb-1">{t('history.toDate')}</label>
+                <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
+                  className="box-border w-full min-w-0 max-w-full px-2 py-1.5 rounded-xl bg-white/90 text-slate-800 text-[11px] font-bold border border-white/30 outline-none focus:ring-2 focus:ring-emerald-300" />
+              </div>
             </div>
-            <div>
-              <label className="block text-[9px] font-black uppercase tracking-wider text-white/70 mb-1">{t('history.toDate')}</label>
-              <input type="date" value={toDate} onChange={e => setToDate(e.target.value)}
-                className="w-full px-2 py-1.5 rounded-xl bg-white/90 text-slate-800 text-[11px] font-bold border border-white/30 outline-none focus:ring-2 focus:ring-emerald-300" />
-            </div>
-            <div>
+            <div className="min-w-0 sm:contents">
               <label className="block text-[9px] font-black uppercase tracking-wider text-emerald-200 mb-1">{t('dashboard.allTillDate')}</label>
               <input type="date" value={tillDate} onChange={e => setTillDate(e.target.value)}
-                className={`w-full px-2 py-1.5 rounded-xl bg-white/90 text-slate-800 text-[11px] font-bold outline-none focus:ring-2 focus:ring-emerald-300 ${tillDate ? 'border-2 border-emerald-400' : 'border border-white/30'}`} />
+                className={`box-border w-full min-w-0 max-w-full px-2 py-1.5 rounded-xl bg-white/90 text-slate-800 text-[11px] font-bold outline-none focus:ring-2 focus:ring-emerald-300 ${tillDate ? 'border-2 border-emerald-400' : 'border border-white/30'}`} />
             </div>
-            <div className="flex items-end">
+            <div className="flex w-full min-w-0 items-end sm:contents">
               <button
                 type="button"
                 onClick={() => { setFromDate(''); setToDate(''); setTillDate(''); sessionStorage.removeItem('dash_fromDate'); sessionStorage.removeItem('dash_toDate'); sessionStorage.removeItem('dash_tillDate'); }}
-                className="w-full px-2 py-1.5 rounded-xl bg-white/20 text-white text-[11px] font-black hover:bg-white/30 border border-white/20 transition"
+                className="w-full px-2 py-1.5 rounded-xl bg-white/20 text-white text-[11px] font-black hover:bg-white/30 border border-white/20 transition sm:h-full sm:min-h-[42px]"
               >{t('history.clear')}</button>
             </div>
           </div>
@@ -1260,7 +1389,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       {!loading && (
       <>
       {/* ── Quick Actions ── */}
-      <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 dash-qa-grid">
+      <div className="dash-qa-grid grid min-w-0 grid-cols-2 gap-2 sm:grid-cols-4">
         <ActionButton icon={<PlusCircle size={18} />} label={t('dashboard.newEntry')} onClick={() => navigate('/entry')} />
         <ActionButton icon={<FileSignature size={18} />} label={t('nav.contracts')} onClick={() => navigate('/contracts')} />
         <ActionButton icon={<Users size={18} />} label={t('dashboard.tenants')} onClick={() => navigate('/customers')} />
@@ -1362,9 +1491,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       {/* ── Property Occupancy Heatmap ── */}
       <div className="premium-card overflow-hidden">
         <div className="p-3 sm:p-5 border-b border-slate-100 bg-slate-50/30">
-          <div className="flex items-start justify-between gap-2">
-            <div className="min-w-0">
-              <h3 className="text-sm font-black text-slate-800 flex items-center gap-2">
+          <div className="flex flex-nowrap items-start justify-between gap-2 min-w-0">
+            <div className="min-w-0 flex-1">
+              <h3 className="text-sm font-black text-slate-800 flex items-center gap-2 min-w-0">
                 <div className="w-7 h-7 bg-gradient-to-br from-emerald-500 to-emerald-600 rounded-lg flex items-center justify-center shadow-sm flex-shrink-0">
                   <Building2 className="text-white" size={14} />
                 </div>
@@ -1372,7 +1501,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
               </h3>
               <p className="text-[10px] text-slate-500 mt-0.5 ml-9">{t('dashboard.heatmapDesc')}</p>
             </div>
-            <div className="flex items-center gap-1 flex-shrink-0">
+            <div className="flex flex-shrink-0 flex-nowrap items-center gap-1">
               <button onClick={() => setExpandedBuildings(new Set(unitHeatmap.map(b => b.id)))} className="px-2 py-1.5 text-[10px] font-bold rounded-lg border border-emerald-200 bg-white text-emerald-700 hover:bg-emerald-50 transition-colors whitespace-nowrap">{t('dashboard.expandAll')}</button>
               <button onClick={() => setExpandedBuildings(new Set())} className="px-2 py-1.5 text-[10px] font-bold rounded-lg border border-emerald-200 bg-white text-emerald-700 hover:bg-emerald-50 transition-colors whitespace-nowrap">{t('dashboard.collapseAll')}</button>
             </div>
@@ -1495,7 +1624,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
               const isIncome = normalizeTransactionType(tx.type) === TransactionType.INCOME;
               const method = normalizePaymentMethod(tx.paymentMethod);
               return (
-                <div key={tx.id} className="p-3 hover:bg-slate-50/50 transition-colors flex items-center gap-2.5">
+                <div key={tx.id} className="p-3 hover:bg-slate-50/50 transition-colors flex min-w-0 flex-nowrap items-center gap-2.5">
                   <div className={`w-8 h-8 rounded-xl flex items-center justify-center shadow-sm flex-shrink-0 ${isIncome ? 'bg-gradient-to-br from-emerald-400 to-emerald-500' : 'bg-gradient-to-br from-rose-400 to-rose-500'}`}>
                     {isIncome ? <ArrowDownRight className="text-white" size={14} /> : <ArrowUpRight className="text-white" size={14} />}
                   </div>
@@ -1513,7 +1642,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
                     </div>
                   </div>
                   <div className={`text-right flex-shrink-0 ${isIncome ? 'text-emerald-600' : 'text-rose-600'}`}>
-                    <div className="font-black text-xs">{isIncome ? '+' : '-'}{Number(tx.amountIncludingVAT || (tx as any).totalWithVat || tx.amount).toLocaleString()}</div>
+                    <div className="font-black text-xs">{isIncome ? '+' : '-'}{txDisplayAmount(tx).toLocaleString()}</div>
                     <div className="text-[9px] font-medium text-slate-400">{t('common.sar')}</div>
                   </div>
                 </div>
@@ -1540,7 +1669,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         </div>
         <div className="p-3 sm:p-5" style={{ width: '100%', minWidth: 0 }}>
           <ResponsiveContainer width="100%" height={200}>
-            <AreaChart data={monthlyData} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
+            <AreaChart data={monthlyData} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
               <defs>
                 <linearGradient id="incGrad" x1="0" y1="0" x2="0" y2="1">
                   <stop offset="5%" stopColor="#10b981" stopOpacity={0.35} />
@@ -1582,7 +1711,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
               <span className="flex items-center gap-1 text-[10px] font-bold text-rose-500"><span className="w-2.5 h-2.5 rounded-sm bg-rose-400 inline-block"></span>{t('entry.expense')}</span>
             </div>
             <ResponsiveContainer width="100%" height={190}>
-              <BarChart data={paymentMethodData} barGap={4} margin={{ top: 4, right: 4, left: -24, bottom: 0 }}>
+              <BarChart data={paymentMethodData} barGap={4} margin={{ top: 8, right: 8, left: 4, bottom: 4 }}>
                 <CartesianGrid strokeDasharray="3 3" stroke="#e2e8f0" />
                 <XAxis dataKey="name" tick={{ fontSize: 10 }} />
                 <YAxis tick={{ fontSize: 10 }} width={38} />
@@ -1681,7 +1810,7 @@ const StatMini = ({ label, value, color, bold, highlight }: { label: string; val
 };
 
 const ActionButton = ({ icon, label, onClick }: { icon: React.ReactNode; label: string; onClick: () => void }) => (
-  <button onClick={onClick} className="group premium-card premium-card-interactive p-3 text-left w-full">
+  <button type="button" onClick={onClick} className="group premium-card premium-card-interactive min-w-0 w-full p-3 text-left">
     <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-600 text-white flex items-center justify-center mb-2 group-hover:scale-105 transition-transform shadow-lg shadow-emerald-200/50">
       {icon}
     </div>

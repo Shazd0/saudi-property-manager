@@ -201,7 +201,8 @@ const OwnerLogin: React.FC<OwnerLoginProps> = ({ onLogin, onSwitchToStaff }) => 
           (u.phone && u.phone === loginId.trim());
       });
       if (!owner) { setError('Owner account not found. Try your name, email, phone, or ID.'); setLoading(false); return; }
-      if (owner.password && owner.password !== password) { setError('Incorrect password.'); setLoading(false); return; }
+      const isPassValid = await svc.verifyPassword(password, owner.password || '');
+      if (!isPassValid) { setError('Incorrect password.'); setLoading(false); return; }
       if (biometricAvailable && !isBiometricEnabled(owner.id)) {
         pendingLoginRef.current = { ...owner, isOwner: true }; setShowBiometricSetup(true); setLoading(false); return;
       }
@@ -398,11 +399,7 @@ const OwnerLogin: React.FC<OwnerLoginProps> = ({ onLogin, onSwitchToStaff }) => 
               </div>
             )}
 
-            <div>
-              <button onClick={onSwitchToStaff} className="text-slate-300 hover:text-slate-500 text-[10px] font-semibold transition-colors tracking-wide">
-                ← Staff Portal
-              </button>
-            </div>
+            
           </div>
 
           {/* ── Branding ── */}

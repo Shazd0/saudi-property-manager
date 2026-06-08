@@ -1,14 +1,13 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, PlusCircle, History, Users, Settings, LogOut, Building, UserCheck, FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart, Search, Car, Bell, ArrowRightLeft, Receipt, ChevronLeft, ChevronRight, FolderOpen, Info, ChevronDown, ChevronUp, Upload, MessageCircle, FileText, DollarSign, BarChart3, Crown, BookOpen, Fingerprint, Landmark, ShieldAlert, MapPin, Zap, Shield, MessageSquare, Banknote, CreditCard, FileCheck, Star, GripVertical, Pencil, Check, Plus, X, Calculator, Layers, Scale, TrendingDown, TrendingUp, BookMarked } from 'lucide-react';
+import { LayoutDashboard, PlusCircle, History, Users, Settings, LogOut, Building, UserCheck, FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart, Search, Car, Bell, ArrowRightLeft, Receipt, ChevronLeft, ChevronRight, FolderOpen, Info, ChevronDown, ChevronUp, Upload, MessageCircle, FileText, DollarSign, BarChart3, Crown, BookOpen, Fingerprint, Landmark, ShieldAlert, MapPin, Zap, Shield, MessageSquare, Banknote, CreditCard, FileCheck, Star, GripVertical, Pencil, Check, Plus, X, Calculator, Layers, Scale, TrendingDown, TrendingUp, BookMarked, FileSpreadsheet } from 'lucide-react';
 import SoundService from '../services/soundService';
-import { db } from '../firebase';
 import logo from '../images/logo.png';
-import { collection, query, where, onSnapshot, orderBy } from 'firebase/firestore';
 import { User, UserRole } from '../types';
 import { useLanguage } from '../i18n';
 import LanguageToggle from './LanguageToggle';
 import { useBook } from '../contexts/BookContext';
+import { matchesAdvancedSearch } from '../utils/advancedSearch';
 
 // Fallback logo URL if import fails
 const LOGO_URL = logo || '/images/logo.png';
@@ -33,12 +32,102 @@ const ALL_QA_DEFS: { to: string; labelKey: string; icon: any }[] = [
   { to: '/sadad',             labelKey: 'nav.sadadBills',   icon: CreditCard },
   { to: '/approvals',         labelKey: 'nav.approvals',    icon: Bell },
   { to: '/bulk-rent',         labelKey: 'nav.bulkRent',     icon: Upload },
+  { to: '/amlak-sheets',      labelKey: 'nav.amlakSheets',  icon: FileSpreadsheet },
+  { to: '/admin/sheets-import', labelKey: 'nav.sheetsImport', icon: FileSpreadsheet },
 ];
 
 const DEFAULT_QA_ROUTES = [
   '/', '/properties', '/admin/employees', '/customers',
   '/contracts', '/entry', '/history', '/monitoring',
 ];
+
+// ── Main Menu (Menu group): default order + drag-reorder persistence ─────
+const MAIN_MENU_DRAG_MIME = 'application/x-spm-main-menu';
+
+type MainMenuDef = {
+  to: string;
+  labelKey: string;
+  icon: typeof LayoutDashboard;
+  approvalsBadge?: boolean;
+  requiresAdminOrManager?: boolean;
+  requiresAdmin?: boolean;
+  emptyWhenCollapsed?: boolean;
+};
+
+const MAIN_MENU_DEFS: MainMenuDef[] = [
+  { to: '/', labelKey: 'nav.dashboard', icon: LayoutDashboard },
+  { to: '/tasks', labelKey: 'nav.tasks', icon: ClipboardList },
+  { to: '/calendar', labelKey: 'nav.calendar', icon: CalendarDays },
+  { to: '/contracts', labelKey: 'nav.contracts', icon: FileSignature },
+  { to: '/entry', labelKey: 'nav.addEntry', icon: PlusCircle },
+  { to: '/bulk-rent', labelKey: 'nav.bulkRent', icon: Upload, emptyWhenCollapsed: true },
+  { to: '/amlak-sheets', labelKey: 'nav.amlakSheets', icon: FileSpreadsheet },
+  { to: '/admin/sheets-import', labelKey: 'nav.sheetsImport', icon: FileSpreadsheet, requiresAdmin: true },
+  { to: '/history', labelKey: 'nav.transactions', icon: History },
+  {
+    to: '/approvals',
+    labelKey: 'nav.approvals',
+    icon: Bell,
+    approvalsBadge: true,
+    requiresAdminOrManager: true,
+  },
+];
+
+function allowedMainMenuPaths(isAdmin: boolean, isManager: boolean): string[] {
+  return MAIN_MENU_DEFS.filter(d => {
+    if (d.requiresAdminOrManager && !isAdmin && !isManager) return false;
+    if (d.requiresAdmin && !isAdmin) return false;
+    return true;
+  }).map(d => d.to);
+}
+
+function normalizeMainMenuOrder(raw: string[], allowed: string[]): string[] {
+  const allowSet = new Set(allowed);
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const p of raw) {
+    if (allowSet.has(p) && !seen.has(p)) {
+      out.push(p);
+      seen.add(p);
+    }
+  }
+  for (const p of allowed) {
+    if (!seen.has(p)) {
+      out.push(p);
+      seen.add(p);
+    }
+  }
+  return out;
+}
+
+function loadMainMenuOrder(userId: string, allowed: string[]): string[] {
+  try {
+    const s = localStorage.getItem(`sidebarMainMenu_${userId}`);
+    const parsed = s ? JSON.parse(s) : null;
+    const raw = Array.isArray(parsed) ? parsed.map(String) : [];
+    return normalizeMainMenuOrder(raw, allowed);
+  } catch {
+    return [...allowed];
+  }
+}
+
+function saveMainMenuOrder(userId: string, order: string[]) {
+  try {
+    localStorage.setItem(`sidebarMainMenu_${userId}`, JSON.stringify(order));
+  } catch {
+    /* ignore */
+  }
+}
+
+function reorderMainMenuPaths(order: string[], fromPath: string, toPath: string): string[] {
+  const i = order.indexOf(fromPath);
+  const j = order.indexOf(toPath);
+  if (i < 0 || j < 0 || i === j) return order;
+  const next = [...order];
+  const [item] = next.splice(i, 1);
+  next.splice(j, 0, item);
+  return next;
+}
 
 // ── All nav items for sidebar search ─────────────────────────────────────
 const ALL_NAV_ITEMS: { to: string; labelKey: string; icon: any }[] = [
@@ -48,6 +137,8 @@ const ALL_NAV_ITEMS: { to: string; labelKey: string; icon: any }[] = [
   { to: '/contracts',                 labelKey: 'nav.contracts',          icon: FileSignature },
   { to: '/entry',                     labelKey: 'nav.addEntry',           icon: PlusCircle },
   { to: '/bulk-rent',                 labelKey: 'nav.bulkRent',           icon: Upload },
+  { to: '/amlak-sheets',              labelKey: 'nav.amlakSheets',        icon: FileSpreadsheet },
+  { to: '/admin/sheets-import',      labelKey: 'nav.sheetsImport',       icon: FileSpreadsheet },
   { to: '/history',                   labelKey: 'nav.transactions',       icon: History },
   { to: '/approvals',                 labelKey: 'nav.approvals',          icon: Bell },
   { to: '/customers',                 labelKey: 'nav.customers',          icon: Users },
@@ -90,6 +181,7 @@ const ALL_NAV_ITEMS: { to: string; labelKey: string; icon: any }[] = [
   { to: '/admin/employees',           labelKey: 'nav.staff',              icon: UserCheck },
   { to: '/admin/settings',            labelKey: 'nav.systemSettings',     icon: Settings },
   { to: '/admin/bulk-import',         labelKey: 'nav.bulkImport',         icon: Upload },
+  { to: '/admin/sheets-import',      labelKey: 'nav.sheetsImport',       icon: FileSpreadsheet },
   { to: '/admin/backup',              labelKey: 'nav.localBackup',        icon: FolderOpen },
   { to: '/admin/cloud-backup',        labelKey: 'nav.cloudBackup',        icon: FolderOpen },
   { to: '/admin/books',               labelKey: 'nav.booksPartitions',    icon: BookOpen },
@@ -367,12 +459,15 @@ interface SidebarProps {
   user: User;
   onLogout: () => void;
   onToggleCollapse?: (isCollapsed: boolean) => void;
+  /** From App — avoids a second real-time approvals listener */
+  pendingApprovals?: number;
 }
 
 // NavItem component moved outside to prevent re-creation
 const NavItem = ({ to, icon: Icon, label, badge, isCollapsed }: { to: string, icon: any, label: string, badge?: number, isCollapsed: boolean }) => (
   <NavLink
     to={to}
+    draggable={false}
     onClick={() => SoundService.play('nav')}
     className={({ isActive }) =>
       `nav-item flex items-center gap-3 px-4 py-2.5 rounded-lg transition-all mb-0.5 duration-200 group ${
@@ -436,7 +531,7 @@ const MenuGroup = ({
   );
 };
 
-const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) => {
+const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse, pendingApprovals: pendingApprovalsProp = 0 }) => {
   const navigate = useNavigate();
   const { t, isRTL } = useLanguage();
   const isAdmin = user.role === UserRole.ADMIN;
@@ -444,7 +539,7 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
   const isManager = user.role === UserRole.MANAGER;
   const engineerOnly = isEngineer && !isAdmin; // engineers see only stock
   const [globalSearch, setGlobalSearch] = useState('');
-  const [pendingApprovals, setPendingApprovals] = useState<number>(0);
+  const pendingApprovals = pendingApprovalsProp;
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [userPhotoURL, setUserPhotoURL] = useState<string | null>(null);
   const [bookDropdownOpen, setBookDropdownOpen] = useState(false);
@@ -495,10 +590,38 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
     admin: false,
   });
 
+  const allowedMainPaths = useMemo(
+    () => allowedMainMenuPaths(isAdmin, isManager),
+    [isAdmin, isManager]
+  );
+  const [mainMenuOrder, setMainMenuOrder] = useState<string[]>(() =>
+    loadMainMenuOrder(
+      user.id,
+      allowedMainMenuPaths(
+        user.role === UserRole.ADMIN,
+        user.role === UserRole.MANAGER
+      )
+    )
+  );
+
+  useEffect(() => {
+    setMainMenuOrder(loadMainMenuOrder(user.id, allowedMainPaths));
+  }, [user.id, allowedMainPaths]);
+
+  useEffect(() => {
+    saveMainMenuOrder(user.id, mainMenuOrder);
+  }, [mainMenuOrder, user.id]);
+
+  const mainMenuByTo = useMemo(
+    () => new Map(MAIN_MENU_DEFS.map(d => [d.to, d])),
+    []
+  );
+
+  const mainMenuDragEnabled = !isCollapsed && expandedMenus.menu;
+
   const searchResults = globalSearch.trim()
-    ? ALL_NAV_ITEMS.filter(item =>
-        t(item.labelKey).toLowerCase().includes(globalSearch.trim().toLowerCase()) ||
-        item.to.toLowerCase().includes(globalSearch.trim().toLowerCase())
+    ? ALL_NAV_ITEMS.filter((item) =>
+        matchesAdvancedSearch(globalSearch, `${t(item.labelKey)} ${item.to} ${item.labelKey}`),
       )
     : [];
 
@@ -526,21 +649,6 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
   };
 
   // Notifications removed: no unread count or snapshot listeners
-
-  useEffect(() => {
-    let unsub: any = null;
-    (async () => {
-      try {
-        const svc = await import('../services/firestoreService');
-        if (svc && svc.listenApprovals) {
-          unsub = svc.listenApprovals((arr: any[]) => setPendingApprovals((arr || []).length));
-        }
-      } catch (e) {
-        console.error('Sidebar approvals listener failed', e);
-      }
-    })();
-    return () => { if (typeof unsub === 'function') unsub(); };
-  }, [activeBookId]);
 
   const getInitials = (u: any) => {
     const name = u?.name || u?.email || u?.id || 'U';
@@ -702,16 +810,70 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
 
             {/* Menu Group */}
             <MenuGroup menuKey="menu" label={t('nav.menu')} icon={LayoutDashboard} isExpanded={expandedMenus.menu} isCollapsed={isCollapsed} onToggle={toggleMenu}>
-              <NavItem to="/" icon={LayoutDashboard} label={t('nav.dashboard')} isCollapsed={isCollapsed} />
-              <NavItem to="/tasks" icon={ClipboardList} label={t('nav.tasks')} isCollapsed={isCollapsed} />
-              <NavItem to="/calendar" icon={CalendarDays} label={t('nav.calendar')} isCollapsed={isCollapsed} />
-              <NavItem to="/contracts" icon={FileSignature} label={t('nav.contracts')} isCollapsed={isCollapsed} />
-              <NavItem to="/entry" icon={PlusCircle} label={t('nav.addEntry')} isCollapsed={isCollapsed} />
-              <NavItem to="/bulk-rent" icon={Upload} label={isCollapsed ? '' : t('nav.bulkRent')} isCollapsed={isCollapsed} />
-              <NavItem to="/history" icon={History} label={t('nav.transactions')} isCollapsed={isCollapsed} />
-              {(isAdmin || user.role === 'MANAGER') && (
-                <NavItem to="/approvals" icon={Bell} label={t('nav.approvals')} badge={pendingApprovals} isCollapsed={isCollapsed} />
-              )}
+              {mainMenuOrder.map(path => {
+                const def = mainMenuByTo.get(path);
+                if (!def) return null;
+                if (def.requiresAdminOrManager && !isAdmin && !isManager) return null;
+                if (def.requiresAdmin && !isAdmin) return null;
+                const label =
+                  def.emptyWhenCollapsed && isCollapsed ? '' : t(def.labelKey);
+                return (
+                  <div
+                    key={path}
+                    draggable={mainMenuDragEnabled}
+                    onDragStart={e => {
+                      if (!mainMenuDragEnabled) return;
+                      e.dataTransfer.effectAllowed = 'move';
+                      e.dataTransfer.setData(MAIN_MENU_DRAG_MIME, path);
+                      e.dataTransfer.setData('text/plain', path);
+                    }}
+                    onDragOver={e => {
+                      if (!mainMenuDragEnabled) return;
+                      e.preventDefault();
+                      e.dataTransfer.dropEffect = 'move';
+                    }}
+                    onDrop={e => {
+                      if (!mainMenuDragEnabled) return;
+                      e.preventDefault();
+                      const fromPath =
+                        e.dataTransfer.getData(MAIN_MENU_DRAG_MIME) ||
+                        e.dataTransfer.getData('text/plain');
+                      if (!fromPath || fromPath === path) return;
+                      setMainMenuOrder(prev =>
+                        normalizeMainMenuOrder(
+                          reorderMainMenuPaths(prev, fromPath, path),
+                          allowedMainPaths
+                        )
+                      );
+                      SoundService.play('toggle');
+                    }}
+                    className={`flex items-stretch rounded-lg mb-0.5 transition-colors ${
+                      mainMenuDragEnabled
+                        ? 'cursor-grab active:cursor-grabbing hover:bg-emerald-50/60 dark:hover:bg-gray-800/80'
+                        : ''
+                    }`}
+                  >
+                    {mainMenuDragEnabled && (
+                      <span
+                        className="flex items-center pl-1 pr-0.5 text-slate-300 hover:text-slate-500 dark:text-slate-500 dark:hover:text-slate-400 flex-shrink-0 select-none"
+                        title="Drag to reorder"
+                        aria-hidden
+                      >
+                        <GripVertical size={14} />
+                      </span>
+                    )}
+                    <div className="flex-1 min-w-0">
+                      <NavItem
+                        to={def.to}
+                        icon={def.icon}
+                        label={label}
+                        badge={def.approvalsBadge ? pendingApprovals : undefined}
+                        isCollapsed={isCollapsed}
+                      />
+                    </div>
+                  </div>
+                );
+              })}
             </MenuGroup>
 
             {/* Database Group */}
@@ -731,22 +893,6 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
               <NavItem to="/vat-report" icon={Receipt} label={t('nav.vatReport')} isCollapsed={isCollapsed} />
             </MenuGroup>
 
-            {/* Accounting Group — top-level */}
-            <MenuGroup menuKey="accounting" label={t('nav.accounting')} icon={Calculator} isExpanded={expandedMenus.accounting || false} isCollapsed={isCollapsed} onToggle={toggleMenu}>
-              <NavItem to="/accounting" icon={Calculator} label={t('nav.accountingOverview')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/chart"    icon={BookMarked}    label={t('nav.chartOfAccounts')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/journal"  icon={BookOpen}      label={t('nav.journalEntries')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/ledger"   icon={Layers}        label={t('nav.generalLedger')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/trial"    icon={Scale}         label={t('nav.trialBalance')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/income"   icon={TrendingUp}    label={t('nav.incomeStatement')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/balance"  icon={Landmark}      label={t('nav.balanceSheet')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/cashflow" icon={DollarSign}    label={t('nav.cashFlow')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/payables"     icon={TrendingDown}  label={t('nav.accountsPayable')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/receivables"  icon={TrendingUp}    label={t('nav.accountsReceivable')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/aging"    icon={CalendarDays}  label={t('nav.agingReport')} isCollapsed={isCollapsed} />
-              <NavItem to="/accounting/budget"   icon={BarChart3}     label={t('nav.budgetVsActual')} isCollapsed={isCollapsed} />
-            </MenuGroup>
-
             {/* Operations Group */}
             <MenuGroup menuKey="operations" label={t('nav.operations')} icon={ArrowRightLeft} isExpanded={expandedMenus.operations} isCollapsed={isCollapsed} onToggle={toggleMenu}>
               <NavItem to="/transfers" icon={ArrowRightLeft} label={t('nav.treasury')} isCollapsed={isCollapsed} />
@@ -763,7 +909,7 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
               )}
             </MenuGroup>
 
-            {/* Saudi Compliance */}
+            {/* Saudi Compliance — above Accounting */}
             <MenuGroup menuKey="compliance" label={t('nav.compliance')} icon={ShieldAlert} isExpanded={expandedMenus.compliance || false} isCollapsed={isCollapsed} onToggle={toggleMenu}>
               <NavItem to="/ejar" icon={FileCheck} label={t('nav.ejarPlatform')} isCollapsed={isCollapsed} />
               <NavItem to="/municipality-licenses" icon={Landmark} label={t('nav.municipality')} isCollapsed={isCollapsed} />
@@ -771,8 +917,28 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
               <NavItem to="/absher" icon={MapPin} label={t('nav.absher')} isCollapsed={isCollapsed} />
             </MenuGroup>
 
+            {/* Accounting Group — directly below Saudi Compliance */}
+            <MenuGroup menuKey="accounting" label={t('nav.accounting')} icon={Calculator} isExpanded={expandedMenus.accounting || false} isCollapsed={isCollapsed} onToggle={toggleMenu}>
+              <NavItem to="/accounting" icon={Calculator} label={t('nav.accountingOverview')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/chart"    icon={BookMarked}    label={t('nav.chartOfAccounts')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/journal"  icon={BookOpen}      label={t('nav.journalEntries')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/ledger"   icon={Layers}        label={t('nav.generalLedger')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/trial"    icon={Scale}         label={t('nav.trialBalance')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/income"   icon={TrendingUp}    label={t('nav.incomeStatement')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/balance"  icon={Landmark}      label={t('nav.balanceSheet')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/cashflow" icon={DollarSign}    label={t('nav.cashFlow')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/payables"     icon={TrendingDown}  label={t('nav.accountsPayable')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/receivables"  icon={TrendingUp}    label={t('nav.accountsReceivable')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/aging"    icon={CalendarDays}  label={t('nav.agingReport')} isCollapsed={isCollapsed} />
+              <NavItem to="/accounting/budget"   icon={BarChart3}     label={t('nav.budgetVsActual')} isCollapsed={isCollapsed} />
+            </MenuGroup>
+
             {/* Integrations */}
             <MenuGroup menuKey="integrations" label={t('nav.integrations')} icon={Zap} isExpanded={expandedMenus.integrations || false} isCollapsed={isCollapsed} onToggle={toggleMenu}>
+              <NavItem to="/amlak-sheets" icon={FileSpreadsheet} label={t('nav.amlakSheets')} isCollapsed={isCollapsed} />
+              {isAdmin && (
+                <NavItem to="/admin/sheets-import" icon={FileSpreadsheet} label={t('nav.sheetsImport')} isCollapsed={isCollapsed} />
+              )}
               <NavItem to="/sadad" icon={CreditCard} label={t('nav.sadadBills')} isCollapsed={isCollapsed} />
               <NavItem to="/utilities" icon={Zap} label={t('nav.utilities')} isCollapsed={isCollapsed} />
               <NavItem to="/security-deposits" icon={Shield} label={t('nav.deposits')} isCollapsed={isCollapsed} />
@@ -788,6 +954,7 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse }) =
                   <NavItem to="/admin/employees" icon={UserCheck} label={t('nav.staff')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/settings" icon={Settings} label={t('nav.systemSettings')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/bulk-import" icon={Upload} label={t('nav.bulkImport')} isCollapsed={isCollapsed} />
+                  <NavItem to="/admin/sheets-import" icon={FileSpreadsheet} label={t('nav.sheetsImport')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/backup" icon={FolderOpen} label={t('nav.localBackup')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/cloud-backup" icon={FolderOpen} label={t('nav.cloudBackup')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/books" icon={BookOpen} label={t('nav.booksPartitions')} isCollapsed={isCollapsed} />

@@ -1,7 +1,8 @@
 
 import React, { useState, useEffect } from 'react';
 import { User, UserRole, Building } from '../types';
-import { getUsers, saveUser, deleteUser, getBuildings } from '../services/firestoreService';
+import { getUsers, saveUser, deleteUser, getBuildings, getBuildingsAllBooks, ownerStakeBuildingIdsMatch } from '../services/firestoreService';
+import { useBook } from '../contexts/BookContext';
 import { UserCheck, Plus, Trash2, Edit, Save, X, Lock, Key, Building2, RotateCcw, AlertTriangle, CreditCard, Calendar, Crown } from 'lucide-react';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
@@ -11,9 +12,12 @@ import { useLanguage } from '../i18n';
 
 const EmployeeManager: React.FC = () => {
     const { t, isRTL } = useLanguage();
+    const { activeBookId } = useBook();
     const { showSuccess, showError, showWarning } = useToast();
   const [employees, setEmployees] = useState<User[]>([]);
   const [buildings, setBuildings] = useState<Building[]>([]);
+  /** All books, composite ids — used for Owner's Buildings (stake) only */
+  const [ownerStakeBuildings, setOwnerStakeBuildings] = useState<Building[]>([]);
   const [showDeleted, setShowDeleted] = useState(false);
   const [view, setView_] = useState<'LIST' | 'FORM'>('LIST');
   const setView = (v: 'LIST' | 'FORM') => { SoundService.play('tab'); setView_(v); };
@@ -57,12 +61,31 @@ const EmployeeManager: React.FC = () => {
 
     useEffect(() => {
         const load = async () => {
-            const [usrs, blds] = await Promise.all([getUsers({ includeDeleted: true }), getBuildings()]);
+            const [usrs, blds, stakeBlds] = await Promise.all([
+                getUsers({ includeDeleted: true }),
+                getBuildings(),
+                getBuildingsAllBooks(),
+            ]);
             setEmployees(usrs || []);
             setBuildings(blds || []);
+            setOwnerStakeBuildings(stakeBlds || []);
         };
         load();
-    }, []);
+    }, [activeBookId]);
+
+    const formatOwnerStakeBuildingLabel = (b: Building) => {
+        const bk = (b as any)._sourceBookId as string | undefined;
+        const bookLabel = (b as any)._bookDisplayName as string | undefined;
+        if (bk && bk !== activeBookId) {
+            return `${b.name} — ${bookLabel || bk}`;
+        }
+        return b.name;
+    };
+
+    const resolveOwnerStakeBuildingName = (storedId: string) => {
+        const hit = ownerStakeBuildings.find(x => ownerStakeBuildingIdsMatch(x.id, storedId, activeBookId));
+        return hit ? formatOwnerStakeBuildingLabel(hit) : storedId;
+    };
 
     const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -79,7 +102,9 @@ const EmployeeManager: React.FC = () => {
         finalId = `staff_${Date.now()}`;
     }
 
-    if (formData.hasSystemAccess && !formData.password) {
+    const existingUser = employees.find(e => e.id === finalId);
+    const passwordInput = (formData.password || '').trim();
+    if (formData.hasSystemAccess && !passwordInput && !existingUser) {
         showWarning("Password required for system access");
         return;
     }
@@ -88,12 +113,20 @@ const EmployeeManager: React.FC = () => {
             ? formData.buildingIds
             : (formData.buildingId ? [formData.buildingId] : []);
 
+        /** Stored value is a SHA-256 hash; never show it in the form — blank means "unchanged" on edit. */
+        const resolvedPassword = passwordInput
+            ? passwordInput
+            : existingUser
+                ? String((existingUser as any).password || '')
+                : '';
+
         const newUser: User = {
             ...formData as User,
                         id: finalId,
                         role: (formData.role as UserRole) || UserRole.EMPLOYEE,
                         buildingIds: chosenBuildings,
-                        buildingId: chosenBuildings[0] || formData.buildingId || ''
+                        buildingId: chosenBuildings[0] || formData.buildingId || '',
+                        password: resolvedPassword,
         };
     
                 await saveUser(newUser);
@@ -168,9 +201,11 @@ const EmployeeManager: React.FC = () => {
     };
 
   const handleEdit = (user: User) => {
+        const { password: _storedHash, ...userRest } = user as any;
         setFormData({
-            ...user,
+            ...userRest,
             id: user.id, // Always set id for editing
+            password: '',
             buildingIds: (user as any).buildingIds || (user.buildingId ? [user.buildingId] : []),
             iqamaNo: user.iqamaNo || '',
             iqamaExpiry: user.iqamaExpiry || '',
@@ -441,31 +476,33 @@ const EmployeeManager: React.FC = () => {
                                 <div className="col-span-2">
                                     <label className="block text-xs font-semibold text-amber-700 mb-2">Owner's Buildings (Properties with stake)</label>
                                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 p-3 rounded-xl border border-amber-200 bg-white">
-                                        {buildings.map(b => {
-                                            const checked = (formData.ownerBuildingIds || []).includes(b.id);
+                                        {ownerStakeBuildings.map(b => {
+                                            const prev = formData.ownerBuildingIds || [];
+                                            const checked = prev.some(oid => ownerStakeBuildingIdsMatch(oid, b.id, activeBookId));
                                             return (
                                                 <label key={b.id} className="flex items-center gap-3 text-sm font-medium text-slate-700 cursor-pointer">
                                                     <input
                                                         type="checkbox"
                                                         checked={checked}
                                                         onChange={e => {
-                                                            const prev = formData.ownerBuildingIds || [];
-                                                            const next = e.target.checked ? [...prev, b.id] : prev.filter(id => id !== b.id);
+                                                            const next = e.target.checked
+                                                                ? (checked ? prev : [...prev, b.id])
+                                                                : prev.filter(oid => !ownerStakeBuildingIdsMatch(oid, b.id, activeBookId));
                                                             setFormData({ ...formData, ownerBuildingIds: next });
                                                         }}
                                                         className="w-4 h-4 rounded text-amber-600 focus:ring-amber-500"
                                                     />
-                                                    <span>{b.name}</span>
+                                                    <span>{formatOwnerStakeBuildingLabel(b)}</span>
                                                 </label>
                                             );
                                         })}
-                                        {buildings.length === 0 && <div className="text-slate-400 text-sm">No buildings found.</div>}
+                                        {ownerStakeBuildings.length === 0 && <div className="text-slate-400 text-sm">No buildings found.</div>}
                                     </div>
                                     {formData.ownerBuildingIds && formData.ownerBuildingIds.length > 0 && (
                                         <div className="mt-2 flex flex-wrap gap-2">
                                             {formData.ownerBuildingIds.map(bid => (
                                                 <span key={bid} className="px-2 py-1 bg-amber-100 text-amber-800 border border-amber-200 rounded-lg text-xs font-semibold">
-                                                    {buildings.find(b => b.id === bid)?.name || bid}
+                                                    {resolveOwnerStakeBuildingName(bid)}
                                                 </span>
                                             ))}
                                         </div>
@@ -531,13 +568,21 @@ const EmployeeManager: React.FC = () => {
                                 <div>
                                     <label className="block text-xs font-semibold text-slate-600 mb-2">{t('login.password')}</label>
                                     <input 
-                                        type="text" 
-                                        required={formData.hasSystemAccess}
+                                        type="password"
+                                        autoComplete="new-password"
+                                        required={!!formData.hasSystemAccess && !employees.some(e => e.id === formData.id)}
                                         value={formData.password} 
                                         onChange={e => setFormData({...formData, password: e.target.value})}
                                         className="w-full px-4 py-2 rounded-lg border border-slate-300 focus:ring-2 focus:ring-violet-500 outline-none"
-                                        placeholder="Secret password"
+                                        placeholder={
+                                            employees.some(e => e.id === formData.id)
+                                                ? t('staff.passwordLeaveBlank')
+                                                : t('staff.passwordSetNew')
+                                        }
                                     />
+                                    {formData.hasSystemAccess && employees.some(e => e.id === formData.id) && (
+                                        <p className="text-[10px] text-slate-500 mt-1">{t('staff.passwordLeaveBlankHint')}</p>
+                                    )}
                                 </div>
                             </div>
                         </>

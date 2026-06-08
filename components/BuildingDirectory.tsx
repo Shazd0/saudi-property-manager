@@ -3,6 +3,7 @@ import { Building, Contract, Customer, User, Transaction, TransactionType, Trans
 import { getBuildings, getContracts, getCustomers, getUsers, getTransactions } from '../services/firestoreService';
 import { Building2, Users, Phone, Mail, Calendar, Clock, AlertTriangle, ChevronDown, ChevronRight, Search, FileText, User as UserIcon, Home, Timer, TrendingUp, TrendingDown, DollarSign } from 'lucide-react';
 import { fmtDate } from '../utils/dateFormat';
+import { buildCustomerSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import { formatNameWithRoom } from '../utils/customerDisplay';
 import { useLanguage } from '../i18n';
 
@@ -116,17 +117,33 @@ const BuildingDirectory: React.FC = () => {
     });
   };
 
-  const filteredBuildings = buildingsData.filter(bd => {
-    if (!searchTerm) return true;
-    const lower = searchTerm.toLowerCase();
-    return (
-      bd.building.name.toLowerCase().includes(lower) ||
-      bd.tenants.some(t => 
-        t.customer?.nameEn?.toLowerCase().includes(lower) ||
-        t.customer?.nameAr?.includes(lower) ||
-        t.contract.unitName.toLowerCase().includes(lower)
-      )
-    );
+  const filteredBuildings = buildingsData.filter((bd) => {
+    if (!searchTerm.trim()) return true;
+    const b = bd.building;
+    const parts: string[] = [
+      b.id,
+      b.name,
+      b.bankName || '',
+      b.iban || '',
+      b.waterMeterNumber || '',
+      b.propertyType || '',
+      String(b.vatApplicable ?? ''),
+    ];
+    bd.tenants.forEach((t) => {
+      parts.push(
+        t.contract.unitName,
+        t.contract.contractNo,
+        t.contract.customerName,
+        t.contract.customerId,
+        t.contract.fromDate,
+        fmtDate(t.contract.fromDate),
+        t.contract.toDate,
+        fmtDate(t.contract.toDate),
+        String(t.daysRemaining),
+      );
+      if (t.customer) parts.push(buildCustomerSearchHaystack(t.customer));
+    });
+    return matchesAdvancedSearch(searchTerm, parts.join(' '));
   });
 
   const getExpiryColor = (days: number) => {

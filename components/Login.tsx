@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { User } from '../types';
-import { mockLogin } from '../services/firestoreService';
+import { mockLogin, isOwnerPortalAccount, OWNER_PORTAL_ONLY_LOGIN } from '../services/firestoreService';
 import { Building2, ArrowRight, Lock, User as UserIcon, Fingerprint, Eye, EyeOff, KeyRound, AlertCircle, CheckCircle, Sparkles, Tag } from 'lucide-react';
 import SoundService from '../services/soundService';
 import { useLanguage } from '../i18n';
@@ -14,12 +14,23 @@ interface LoginProps {
   onSwitchToTenant?: () => void;
 }
 
+const OWNER_PORTAL_REDIRECT_MS = 2200;
+
+function ownerPortalEntryUrl(): string {
+  try {
+    return new URL('owner.html', window.location.href).href;
+  } catch {
+    return 'owner.html';
+  }
+}
+
 const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
   const { t, isRTL } = useLanguage();
   const [id, setId] = useState('');
   const [password, setPassword] = useState('');
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [redirectingToOwner, setRedirectingToOwner] = useState(false);
   const [biometricUser, setBiometricUser] = useState<any>(null);
   const [biometricLoading, setBiometricLoading] = useState(false);
   const [showPasswordForm, setShowPasswordForm] = useState(false);
@@ -57,6 +68,18 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
     })();
   }, []);
 
+  const scheduleRedirectToOwnerPortal = () => {
+    setError(
+      isRTL
+        ? 'هذا حساب مالك. يُفتح من بوابة المالك فقط — جاري تحويلك الآن…'
+        : 'This is an owner account. It opens in the Owner Portal only — taking you there now…'
+    );
+    setRedirectingToOwner(true);
+    window.setTimeout(() => {
+      window.location.assign(ownerPortalEntryUrl());
+    }, OWNER_PORTAL_REDIRECT_MS);
+  };
+
   const handleBiometricLogin = async (user?: any) => {
     const targetUser = user || biometricUser;
     if (!targetUser) return;
@@ -68,7 +91,11 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
       const userId = targetUser.id || targetUser.uid;
       const ok = await svc.authenticatePasskey(userId);
       if (ok) {
-        onLogin(targetUser);
+        if (isOwnerPortalAccount(targetUser)) {
+          scheduleRedirectToOwnerPortal();
+        } else {
+          onLogin(targetUser);
+        }
       } else {
         setError('Biometric verification failed. Try again or use password.');
         setShowPasswordForm(true);
@@ -99,6 +126,10 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
         setError('Invalid ID or Password');
       }
     } catch (e: any) {
+      if (e?.message === OWNER_PORTAL_ONLY_LOGIN) {
+        scheduleRedirectToOwnerPortal();
+        return;
+      }
       const msg = e?.message || String(e);
       setError(`System error occurred: ${msg}`);
       console.error('Login error', e);
@@ -270,7 +301,14 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
           </div>
         </div>
       </div>
-      <LoadingOverlay visible={loading || biometricLoading} message="جاري التحقق..." />
+      <LoadingOverlay
+        visible={loading || biometricLoading || redirectingToOwner}
+        message={
+          redirectingToOwner
+            ? (isRTL ? 'جاري فتح بوابة المالك…' : 'Opening Owner Portal…')
+            : 'جاري التحقق...'
+        }
+      />
       <PricingModal open={pricingOpen} onClose={() => setPricingOpen(false)} />
 
       {/* ── Forgot Password Modal ── */}

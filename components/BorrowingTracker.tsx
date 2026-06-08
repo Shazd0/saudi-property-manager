@@ -7,6 +7,7 @@ import SoundService from '../services/soundService';
 import { Wallet, ArrowDownCircle, ArrowUpCircle, UserCircle, Search, ChevronDown, ChevronUp, Plus, TrendingDown, TrendingUp, AlertTriangle, CheckCircle, Printer, X, Banknote, CreditCard, Calendar, FileText, Pencil, Trash2 } from 'lucide-react';
 import { useNavigate } from 'react-router-dom';
 import { fmtDate } from '../utils/dateFormat';
+import { addMoneyFingerprint, buildTransactionSearchHaystack, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { useLanguage } from '../i18n';
 
 interface BorrowingTrackerProps {
@@ -429,8 +430,22 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
       data = data.filter(d => d.employeeId === filterEmployeeId);
     }
     if (search.trim()) {
-      const q = search.toLowerCase();
-      data = data.filter(d => d.employeeName.toLowerCase().includes(q));
+      data = data.filter((d) => {
+        const txHay = (d.transactions || []).map((tx) => buildTransactionSearchHaystack(tx)).join(' ');
+        const rowFp = new Set<string>();
+        addMoneyFingerprint(rowFp, d.totalBorrowed);
+        addMoneyFingerprint(rowFp, d.totalRepaid);
+        addMoneyFingerprint(rowFp, d.outstanding);
+        const h =
+          [
+            d.employeeId,
+            d.employeeName,
+            d.lastBorrowDate,
+            fmtDate(d.lastBorrowDate),
+            txHay,
+          ].join(' ') + moneyFingerprintSuffix(rowFp);
+        return matchesAdvancedSearch(search, h);
+      });
     }
     return data;
   }, [borrowingData, filterStatus, filterEmployeeId, search]);
@@ -487,7 +502,7 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
       <div class="corner corner-bl"></div><div class="corner corner-br"></div>
       <div class="hdr">
         <div class="hdr-left">
-          <div class="logo-circle"><img src="${window.location.origin}/images/logo.png" onerror="this.src='/images/logo.png'"/></div>
+          <div class="logo-circle"><img src="${window.location.origin}/images/cologo.png" onerror="this.src='/images/cologo.png'"/></div>
           <div><div class="co-ar">شركة أملاك العقارية</div><div class="co-en">Borrowing Summary Report</div></div>
         </div>
         <div class="badge">BORROWING</div>
@@ -501,7 +516,7 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
         <thead><tr><th>#</th><th>Employee</th><th style="text-align:right">Borrowed</th><th style="text-align:right">Repaid</th><th style="text-align:right">${t('borrowing.outstanding')}</th><th style="text-align:center">Last Borrow</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
-        <div class="amlak"><img src="${window.location.origin}/images/logo.png" onerror="this.style.display='none'"/><span>Powered by Amlak</span></div>
+        <div class="amlak"><img src="${window.location.origin}/images/cologo.png" onerror="this.style.display='none'"/><span>Powered by Amlak</span></div>
       </div>
       <script>window.onload=function(){setTimeout(function(){var imgs=document.images,c=0,t=imgs.length;if(!t){window.print();return}for(var i=0;i<t;i++){if(imgs[i].complete){if(++c>=t)window.print()}else{imgs[i].onload=imgs[i].onerror=function(){if(++c>=t)window.print()}}}},200);}</script>
     </body></html>`;
@@ -635,7 +650,7 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
         ${showPdfInstructions ? '<div style="background:#f0fdf4;border:1px solid #bbf7d0;color:#166534;padding:10px 18px;border-radius:8px;font-size:15px;font-weight:600;margin-bottom:18px;text-align:center;">To save as PDF, select <b>Save as PDF</b> in the print dialog.</div>' : ''}
         <div class="hdr">
           <div class="hdr-left">
-            <div class="logo-circle"><img src="${window.location.origin}/images/cologo.png" onerror="this.src='/images/logo.png'"/></div>
+            <div class="logo-circle"><img src="${window.location.origin}/images/cologo.png" onerror="this.src='/images/cologo.png'"/></div>
             <div>
               <div class="co-ar">شركة أملاك العقارية</div>
               <div class="co-en">Borrowing Statement</div>
@@ -659,7 +674,7 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
             </tr>
           </tfoot>
         </table>
-        <div class="amlak"><img src="${window.location.origin}/images/logo.png" onerror="this.style.display='none'"/><span>Powered by Amlak</span></div>
+        <div class="amlak"><img src="${window.location.origin}/images/cologo.png" onerror="this.style.display='none'"/><span>Powered by Amlak</span></div>
       </div>
       <script>window.onload=function(){setTimeout(function(){window.print()},200);}</script>
     </body></html>`;

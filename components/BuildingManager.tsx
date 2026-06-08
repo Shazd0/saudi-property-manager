@@ -411,7 +411,7 @@ const BuildingManager: React.FC = () => {
   };
 
     return (
-        <div className="premium-card mobile-tab-shell tab-properties min-h-[600px] animate-fade-in overflow-hidden">
+        <div className="premium-card mobile-tab-shell tab-properties min-h-0 animate-fade-in overflow-x-hidden overflow-y-visible md:min-h-[600px] md:overflow-hidden">
       {/* Header */}
       <div className="p-4 sm:p-5 border-b border-slate-100 flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 bg-slate-50/30">
         <div>

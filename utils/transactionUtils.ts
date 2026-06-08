@@ -1,9 +1,29 @@
 import { PaymentMethod, Transaction, TransactionType } from '../types';
 
+/** Uppercase effective method for ledger splits (treasury rows use originalPaymentMethod when set). */
+export const effectivePaymentMethodUpper = (tx: any): string =>
+  String((tx?.originalPaymentMethod ?? tx?.paymentMethod) || '').trim().toUpperCase();
+
+/**
+ * Bank column for opening/period cash-vs-bank summaries (Dashboard, History).
+ * Treats CHEQUE as bank; uses bankName / fromBankName / toBankName when method is missing or non-standard.
+ */
+export const transactionCountsAsBankForSplit = (tx: any): boolean => {
+  const m = effectivePaymentMethodUpper(tx);
+  if (m === 'BANK' || m === 'CHEQUE') return true;
+  if (m === 'CASH' || m === 'TREASURY') return false;
+  const bankMeta = !!(tx?.bankName || tx?.fromBankName || tx?.toBankName);
+  if (bankMeta) return true;
+  const hints = ['TRANSFER', 'IBAN', 'WIRE', 'MADA', 'VISA', 'MASTER', 'SADAD', 'ONLINE', 'POS'];
+  return hints.some(h => m.includes(h));
+};
+
+/** Cash column complement for {@link transactionCountsAsBankForSplit}. */
+export const transactionCountsAsCashForSplit = (tx: any): boolean => !transactionCountsAsBankForSplit(tx);
+
 /**
  * Normalizes payment method string to standard PaymentMethod enum.
- * CHEQUE is treated as CASH for summary purposes (matches local accounting practice).
- * Only explicit Bank/Transfer methods are counted as BANK.
+ * CHEQUE maps to BANK. Card/transfer-like strings map to BANK; unknown maps to CASH.
  */
 export const normalizePaymentMethod = (method: any): PaymentMethod => {
     const m = String(method || '').toUpperCase();

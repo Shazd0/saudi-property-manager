@@ -359,7 +359,7 @@ const Invoice: React.FC = () => {
             <div className="flex items-center justify-between pt-4 border-t border-slate-100">
               <div className="text-xs text-slate-400">Computer-generated document. No signature required.</div>
               <div className="flex items-center gap-2 opacity-40">
-                <img src="/images/logo.png" className="h-4" alt="Amlak" onError={e => (e.currentTarget.style.display='none')} />
+                <img src="/images/cologo.png" className="h-4" alt="Amlak" onError={e => (e.currentTarget.style.display='none')} />
                 <span className="text-[9px] text-slate-400 uppercase tracking-wider">Powered by Amlak</span>
               </div>
             </div>

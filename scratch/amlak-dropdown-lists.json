@@ -1,0 +1,1829 @@
+{
+  "buildings": [
+    {
+      "id": "0c0ef7c1-58bc-406d-97f7-0f4de1563bdc",
+      "bankName": "JED,PANDA,MAZDI&MESHAL ALRAJHI BANK",
+      "propertyType": "NON_RESIDENTIAL",
+      "units": [
+        {
+          "name": "SHOP-04",
+          "defaultRent": 150000
+        },
+        {
+          "defaultRent": 460000,
+          "meterNumber": "",
+          "name": "SHOP-02&03"
+        },
+        {
+          "name": "SHOP-07",
+          "defaultRent": 150000
+        },
+        {
+          "name": "SHOP-01",
+          "defaultRent": 150000
+        },
+        {
+          "name": "SHOP-05",
+          "defaultRent": 150000
+        },
+        {
+          "name": "SHOP-06",
+          "defaultRent": 150000
+        },
+        {
+          "defaultRent": 260000,
+          "name": "SHOP-08"
+        },
+        {
+          "defaultRent": 150000,
+          "name": "SHOP-10"
+        },
+        {
+          "name": "SHOP-09",
+          "defaultRent": 150000
+        },
+        {
+          "defaultRent": 150000,
+          "name": "SHOP-11"
+        }
+      ],
+      "iban": "SA7680000513608010619153",
+      "lease": {
+        "installmentCount": 16,
+        "totalRent": 6336000,
+        "isLeased": true,
+        "yearlyRent": 1584000,
+        "leaseEndDate": "2030-01-01",
+        "installmentGapMonths": 3,
+        "leaseStartDate": "2026-01-01",
+        "durationYears": 4,
+        "landlordName": "SAAD ABUHUSOON"
+      },
+      "vatApplicable": true,
+      "name": "JEDHAH SHOP-104"
+    },
+    {
+      "id": "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+      "units": [
+        {
+          "name": "101",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "102"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "103"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "104"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "105"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "106"
+        },
+        {
+          "name": "107",
+          "defaultRent": 30000
+        },
+        {
+          "name": "108",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "109"
+        },
+        {
+          "name": "110",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "111"
+        },
+        {
+          "name": "112",
+          "defaultRent": 30000
+        },
+        {
+          "name": "201-1",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "201-2"
+        },
+        {
+          "name": "201-3",
+          "defaultRent": 30000
+        },
+        {
+          "name": "201-4",
+          "defaultRent": 30000
+        },
+        {
+          "name": "201-5",
+          "defaultRent": 30000
+        },
+        {
+          "name": "201-6",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "201-7"
+        }
+      ],
+      "lease": {
+        "installmentCount": 9,
+        "leaseEndDate": "2030-09-20",
+        "isLeased": true,
+        "yearlyRent": 418000,
+        "totalRent": 1881000,
+        "leaseStartDate": "2026-03-20",
+        "landlordName": "NASSER ABUHUSOON",
+        "durationYears": 4.5
+      },
+      "name": "MAZDI-105",
+      "iban": "SA7680000513608010619153"
+    },
+    {
+      "id": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "units": [
+        {
+          "name": "A101-3BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "A102-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A103-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 31000,
+          "name": "A104-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A105-2BHK(F)"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A106-2BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A107-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A108-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A201-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A202-3BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A203-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A204-2BHK"
+        },
+        {
+          "name": "A205-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "A206-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "A207-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A208-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A301-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A302-3BHK"
+        },
+        {
+          "name": "A303-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A304-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A305-2BHK"
+        },
+        {
+          "name": "A306-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "A307-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A308-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A401-BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A402-3BHK"
+        },
+        {
+          "name": "A403-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "A405-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A406-2BHK"
+        },
+        {
+          "name": "A407-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A408-3BHK"
+        },
+        {
+          "name": "A501-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A502-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A503-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A504-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A505-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A506-2BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A507-3BHK"
+        },
+        {
+          "name": "A508-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A601-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A602-3BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A603-2BHK"
+        },
+        {
+          "name": "A604-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "A605-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A606-2BHK"
+        },
+        {
+          "name": "A607-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A608-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A701-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A702-3BHK"
+        },
+        {
+          "name": "A703-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A704-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A705-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A706-2BHK"
+        },
+        {
+          "name": "A707-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A708-3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "name": "A801--3BHK",
+          "defaultRent": 32000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A802-3BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A803-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A804-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "A805-2BHK"
+        },
+        {
+          "name": "A806-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A807-3BHK"
+        },
+        {
+          "defaultRent": 32000,
+          "name": "A808-3BHK"
+        },
+        {
+          "name": "B201-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B202-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B203-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B204-2BHK"
+        },
+        {
+          "name": "B205-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B206-2BHK"
+        },
+        {
+          "name": "B207-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B208-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B301-2BHK"
+        },
+        {
+          "name": "B302-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B303-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B304-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B305-2BHK"
+        },
+        {
+          "name": "B306-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B307-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B308-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B401-2BHK"
+        },
+        {
+          "name": "B402-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B403-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B404-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B405-2BHK"
+        },
+        {
+          "name": "B406--2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B407-2BHK"
+        },
+        {
+          "name": "B408-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B501-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B502-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B503-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B504-2BHK"
+        },
+        {
+          "name": "B505-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B506-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B507-2BHK"
+        },
+        {
+          "name": "B508-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B601-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B602-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B603-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B604-2BHK"
+        },
+        {
+          "name": "B605-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B606-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B607-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B608-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B701-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B702-2BHK"
+        },
+        {
+          "name": "B703-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B704-2BHK"
+        },
+        {
+          "name": "B705-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B706-2BHK"
+        },
+        {
+          "name": "B707-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B708-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B801-2BHK"
+        },
+        {
+          "name": "B802-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B803-2BHK"
+        },
+        {
+          "name": "B804-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C101-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C102-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C103-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C104-2BHK"
+        },
+        {
+          "name": "C105-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C106-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C107-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C108-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C201-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C202-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C204-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C205-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C206-2BHK"
+        },
+        {
+          "name": "C207-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C208-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C301-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C302-2BHK"
+        },
+        {
+          "name": "C303-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C304-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C305-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C306-2BHK"
+        },
+        {
+          "name": "C307-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C308-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C401-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C403-2BHK"
+        },
+        {
+          "name": "C404-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C405-2BHK"
+        },
+        {
+          "name": "C406-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C407-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C408-2BHK"
+        },
+        {
+          "name": "C402-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C501-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C502-2BHK"
+        },
+        {
+          "name": "C503-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C504-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C505-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C506-2BHK"
+        },
+        {
+          "name": "C507-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C508-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C601-2BHK"
+        },
+        {
+          "name": "C602-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C603-2BHK"
+        },
+        {
+          "name": "C604-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C605-2BHK"
+        },
+        {
+          "name": "C606-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C607-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C608-2BHK"
+        },
+        {
+          "name": "C701-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C702-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "C703-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C704-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C705-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C706-2BHK"
+        },
+        {
+          "name": "C707-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C708-2BHK"
+        },
+        {
+          "name": "B101-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B102-2BHK"
+        },
+        {
+          "name": "B103-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B104-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B105-2BHK"
+        },
+        {
+          "defaultRent": 30000,
+          "name": "B106-2BHK"
+        },
+        {
+          "name": "B107-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "name": "B108-2BHK",
+          "defaultRent": 30000
+        },
+        {
+          "defaultRent": 30000,
+          "name": "C203-2BHK"
+        },
+        {
+          "name": "A404-2BHK",
+          "defaultRent": 30000
+        }
+      ],
+      "bankName": "SAAD-ALRAJHI BANK",
+      "name": "SAAD-101",
+      "lease": {
+        "isLeased": true,
+        "yearlyRent": 3240000,
+        "installmentGapMonths": 3,
+        "leaseEndDate": "2031-01-10",
+        "leaseStartDate": "2026-01-10",
+        "durationYears": 5,
+        "landlordName": "SAAD ABUHUSOON",
+        "monthlyRent": 270000,
+        "installmentCount": 20,
+        "totalRent": 16200000
+      },
+      "iban": "SA5580000513608015433253"
+    },
+    {
+      "id": "c1a59cab-8001-4eb9-918b-76f9088f0dc6",
+      "propertyType": "NON_RESIDENTIAL",
+      "bankName": "SAAD-ALRAJHI BANK",
+      "units": [
+        {
+          "defaultRent": 40000,
+          "name": "LAUNDRY"
+        },
+        {
+          "name": "SHOP 3&4",
+          "meterNumber": "",
+          "defaultRent": 170000
+        },
+        {
+          "name": "RESTAURANT",
+          "defaultRent": 250000
+        },
+        {
+          "defaultRent": 180000,
+          "meterNumber": "",
+          "name": "SHOP 904,905&906"
+        },
+        {
+          "name": "SHOP 901,902&903",
+          "meterNumber": "",
+          "defaultRent": 170000
+        },
+        {
+          "name": "SHOP 1&2",
+          "meterNumber": "",
+          "defaultRent": 75500
+        }
+      ],
+      "iban": "SA5580000513608015433253",
+      "lease": {
+        "installmentCount": 16,
+        "totalRent": 2240000,
+        "leaseEndDate": "2030-01-10",
+        "installmentGapMonths": 3,
+        "yearlyRent": 560000,
+        "isLeased": true,
+        "landlordName": "SAAD ABUHUSOON",
+        "durationYears": 4,
+        "leaseStartDate": "2026-01-10"
+      },
+      "name": "SAAD SHOP-101",
+      "vatApplicable": true
+    },
+    {
+      "id": "c99c2505-c746-480b-8122-0af89601d174",
+      "lease": {
+        "leaseStartDate": "2026-05-15",
+        "landlordName": "MISHAL LADIES MARKET",
+        "durationYears": 4.5,
+        "totalRent": 3285000,
+        "yearlyRent": 730000,
+        "isLeased": true,
+        "installmentCount": 9,
+        "leaseEndDate": "2030-11-15"
+      },
+      "name": "MESHAL-106",
+      "iban": "SA7680000513608010619153",
+      "units": [
+        {
+          "defaultRent": 24000,
+          "name": "1"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "2"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "3"
+        },
+        {
+          "name": "4",
+          "defaultRent": 24000
+        },
+        {
+          "name": "5",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "6"
+        },
+        {
+          "name": "7",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "8"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "9",
+          "meterNumber": ""
+        },
+        {
+          "defaultRent": 24000,
+          "name": "10"
+        },
+        {
+          "name": "11",
+          "defaultRent": 24000
+        },
+        {
+          "name": "12",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "13"
+        },
+        {
+          "name": "14",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "15"
+        },
+        {
+          "name": "16",
+          "defaultRent": 24000
+        },
+        {
+          "name": "17",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "18"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "19"
+        },
+        {
+          "name": "20",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "21"
+        },
+        {
+          "name": "22",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "23"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "24"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "25"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "26"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "27"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "28"
+        },
+        {
+          "name": "29",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "30"
+        },
+        {
+          "name": "31",
+          "defaultRent": 24000
+        },
+        {
+          "name": "32",
+          "defaultRent": 24000
+        },
+        {
+          "name": "33",
+          "defaultRent": 24000
+        },
+        {
+          "name": "34",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "35"
+        },
+        {
+          "defaultRent": 24000,
+          "name": "36"
+        },
+        {
+          "name": "37",
+          "defaultRent": 24000
+        },
+        {
+          "name": "38",
+          "defaultRent": 24000
+        },
+        {
+          "name": "39",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "40"
+        },
+        {
+          "name": "41",
+          "defaultRent": 24000
+        },
+        {
+          "defaultRent": 24000,
+          "name": "42"
+        },
+        {
+          "name": "43",
+          "defaultRent": 24000
+        },
+        {
+          "name": "44",
+          "defaultRent": 24000
+        }
+      ]
+    },
+    {
+      "id": "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+      "units": [
+        {
+          "name": "101",
+          "defaultRent": 37000
+        },
+        {
+          "defaultRent": 37000,
+          "name": "102"
+        },
+        {
+          "defaultRent": 37000,
+          "name": "103"
+        },
+        {
+          "name": "104",
+          "defaultRent": 37000
+        },
+        {
+          "name": "105",
+          "defaultRent": 37000
+        },
+        {
+          "defaultRent": 37000,
+          "name": "106"
+        },
+        {
+          "defaultRent": 37000,
+          "name": "107"
+        },
+        {
+          "defaultRent": 45000,
+          "name": "108"
+        },
+        {
+          "defaultRent": 37000,
+          "name": "109"
+        },
+        {
+          "name": "110",
+          "defaultRent": 37000
+        },
+        {
+          "name": "111",
+          "defaultRent": 37000
+        },
+        {
+          "name": "201",
+          "defaultRent": 37000
+        },
+        {
+          "defaultRent": 37000,
+          "name": "202"
+        },
+        {
+          "name": "203",
+          "defaultRent": 37000
+        },
+        {
+          "name": "204",
+          "defaultRent": 37000
+        },
+        {
+          "name": "205",
+          "defaultRent": 37000
+        },
+        {
+          "name": "206",
+          "defaultRent": 37000
+        },
+        {
+          "name": "207",
+          "defaultRent": 37000
+        },
+        {
+          "defaultRent": 45000,
+          "name": "208"
+        },
+        {
+          "name": "209",
+          "defaultRent": 37000
+        },
+        {
+          "name": "210",
+          "defaultRent": 37000
+        },
+        {
+          "name": "211",
+          "defaultRent": 37000
+        },
+        {
+          "defaultRent": 37000,
+          "name": "301"
+        },
+        {
+          "name": "302",
+          "defaultRent": 37000
+        },
+        {
+          "defaultRent": 37000,
+          "name": "303"
+        },
+        {
+          "defaultRent": 37000,
+          "name": "304"
+        }
+      ],
+      "lease": {
+        "totalRent": 1664000,
+        "installmentCount": 16,
+        "durationYears": 4,
+        "leaseStartDate": "2026-01-01",
+        "landlordName": "SAAD ABUHUSOON",
+        "isLeased": true,
+        "yearlyRent": 416000,
+        "installmentGapMonths": 3,
+        "leaseEndDate": "2030-01-01"
+      },
+      "name": "JEDHAH-104",
+      "iban": "SA7680000513608010619153"
+    },
+    {
+      "id": "e19fba50-f958-491b-8f40-c80c084c7437",
+      "iban": "SA7680000513608010619153",
+      "name": "PANDA-103",
+      "lease": {
+        "yearlyRent": 200000,
+        "isLeased": true,
+        "installmentGapMonths": 3,
+        "leaseEndDate": "2027-11-01",
+        "leaseStartDate": "2026-05-01",
+        "landlordName": "MISHAL ",
+        "durationYears": 1.5,
+        "installmentCount": 3,
+        "totalRent": 300000
+      },
+      "units": [
+        {
+          "defaultRent": 28000,
+          "name": "1-2BHK"
+        },
+        {
+          "defaultRent": 12000,
+          "name": "2-1B"
+        },
+        {
+          "name": "3-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "name": "4-1B",
+          "defaultRent": 12000
+        },
+        {
+          "defaultRent": 28000,
+          "name": "5-2BHK"
+        },
+        {
+          "defaultRent": 12000,
+          "name": "6-1B"
+        },
+        {
+          "name": "7-B",
+          "defaultRent": 13000
+        },
+        {
+          "name": "8-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "name": "9-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "name": "10-1B",
+          "defaultRent": 12000
+        },
+        {
+          "defaultRent": 28000,
+          "name": "11-2BHK"
+        },
+        {
+          "name": "12-1B",
+          "defaultRent": 12000
+        },
+        {
+          "defaultRent": 14000,
+          "name": "13-B"
+        },
+        {
+          "defaultRent": 28000,
+          "name": "14-2BHK"
+        },
+        {
+          "defaultRent": 12000,
+          "name": "15-1B"
+        },
+        {
+          "name": "16-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "name": "17-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "defaultRent": 12000,
+          "name": "18-1B"
+        },
+        {
+          "defaultRent": 12000,
+          "name": "19-1B"
+        },
+        {
+          "defaultRent": 28000,
+          "name": "20-2BHK"
+        },
+        {
+          "defaultRent": 28000,
+          "name": "21-2BHK"
+        },
+        {
+          "defaultRent": 12000,
+          "name": "22-1B"
+        },
+        {
+          "name": "23-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "defaultRent": 12000,
+          "name": "24-1B"
+        },
+        {
+          "name": "25-1B",
+          "defaultRent": 14000
+        },
+        {
+          "defaultRent": 28000,
+          "name": "26-2BHK"
+        },
+        {
+          "name": "27-1B",
+          "defaultRent": 12000
+        },
+        {
+          "name": "28-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "name": "29-2BHK",
+          "defaultRent": 28000
+        },
+        {
+          "defaultRent": 12000,
+          "name": "30-1B"
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "Latheef",
+      "iqamaNo": "1234567890",
+      "iqamaExpiry": "2027-01-24",
+      "buildingIds": [
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+        "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+        "c99c2505-c746-480b-8122-0af89601d174",
+        "e19fba50-f958-491b-8f40-c80c084c7437",
+        "0c0ef7c1-58bc-406d-97f7-0f4de1563bdc"
+      ],
+      "password": "e0ea4a8e444cf703b82be5d7350f610a5c7e8e36537429ba9c3927c0ef5da6c8",
+      "isOwner": false,
+      "role": "EMPLOYEE",
+      "baseSalary": 6250,
+      "hasSystemAccess": true,
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "buildingId": "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+      "sharePercentage": 0,
+      "joinedDate": "2026-01-07",
+      "name": "LATHEEF",
+      "phone": "",
+      "email": "abulatheefpm888@gmail.com"
+    },
+    {
+      "id": "admin",
+      "role": "ADMIN",
+      "password": "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918",
+      "createdAt": "2026-04-17T15:30:17.104Z",
+      "name": "Admin",
+      "status": "Active",
+      "hasSystemAccess": true
+    },
+    {
+      "id": "hashim",
+      "email": "hashimpdva93@gmail.com",
+      "joinedDate": "2026-01-07",
+      "phone": "",
+      "name": "STOCK MANAGEMENT",
+      "sharePercentage": 0,
+      "buildingId": "",
+      "status": "Active",
+      "ownerBuildingIds": [],
+      "hasSystemAccess": true,
+      "baseSalary": 2500,
+      "password": "hashim123",
+      "role": "ENGINEER",
+      "isOwner": false,
+      "buildingIds": [],
+      "iqamaExpiry": "",
+      "iqamaNo": ""
+    },
+    {
+      "id": "r1",
+      "hasSystemAccess": true,
+      "ownerBuildingIds": [
+        "c99c2505-c746-480b-8122-0af89601d174",
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+        "e19fba50-f958-491b-8f40-c80c084c7437",
+        "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+        "2bb39d11-5540-4950-9f62-e828f06948bc",
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+        "c1a59cab-8001-4eb9-918b-76f9088f0dc6",
+        "0c0ef7c1-58bc-406d-97f7-0f4de1563bdc",
+        "6XwFZu6Tc7EMZNqDbe8u:2bb39d11-5540-4950-9f62-e828f06948bc"
+      ],
+      "status": "Active",
+      "buildingId": "c1a59cab-8001-4eb9-918b-76f9088f0dc6",
+      "sharePercentage": 50,
+      "phone": "+966 566141038",
+      "name": "Riyas 1",
+      "joinedDate": "2026-02-12",
+      "email": "",
+      "iqamaNo": "",
+      "iqamaExpiry": "",
+      "buildingIds": [
+        "c1a59cab-8001-4eb9-918b-76f9088f0dc6",
+        "0c0ef7c1-58bc-406d-97f7-0f4de1563bdc",
+        "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+        "e19fba50-f958-491b-8f40-c80c084c7437",
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+        "c99c2505-c746-480b-8122-0af89601d174"
+      ],
+      "baseSalary": 30000,
+      "role": "OWNER",
+      "isOwner": true,
+      "password": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"
+    },
+    {
+      "id": "r2",
+      "iqamaNo": "",
+      "iqamaExpiry": "",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+        "e19fba50-f958-491b-8f40-c80c084c7437",
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+        "c99c2505-c746-480b-8122-0af89601d174",
+        "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+        "0c0ef7c1-58bc-406d-97f7-0f4de1563bdc",
+        "c1a59cab-8001-4eb9-918b-76f9088f0dc6"
+      ],
+      "baseSalary": 30000,
+      "isOwner": true,
+      "password": "d4735e3a265e16eee03f59718b9b5d03019c07d8b6c51f90da3a666eec13ab35",
+      "role": "OWNER",
+      "hasSystemAccess": true,
+      "ownerBuildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+        "e19fba50-f958-491b-8f40-c80c084c7437",
+        "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+        "2bb39d11-5540-4950-9f62-e828f06948bc",
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+        "c99c2505-c746-480b-8122-0af89601d174",
+        "c1a59cab-8001-4eb9-918b-76f9088f0dc6",
+        "0c0ef7c1-58bc-406d-97f7-0f4de1563bdc",
+        "6XwFZu6Tc7EMZNqDbe8u:2bb39d11-5540-4950-9f62-e828f06948bc"
+      ],
+      "status": "Active",
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "sharePercentage": 50,
+      "joinedDate": "2026-02-12",
+      "phone": "+966 55 599 3156",
+      "name": "Riyas 2",
+      "email": ""
+    },
+    {
+      "id": "sarfraz",
+      "iqamaNo": "",
+      "iqamaExpiry": "",
+      "buildingIds": [
+        "e19fba50-f958-491b-8f40-c80c084c7437",
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+        "c99c2505-c746-480b-8122-0af89601d174",
+        "3b6352ea-6fd2-49e1-af66-6bdca5f7740b",
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "baseSalary": 6250,
+      "isOwner": false,
+      "password": "12f629764cb6b87c3198c18d4fc63e9d6e4dbfd8d9ecd9f3984a2dd41ba1b3e3",
+      "role": "EMPLOYEE",
+      "hasSystemAccess": true,
+      "status": "Active",
+      "ownerBuildingIds": [],
+      "sharePercentage": 0,
+      "buildingId": "e19fba50-f958-491b-8f40-c80c084c7437",
+      "email": "sarfaraz3257@gmail.com",
+      "name": "SARFRAZ",
+      "phone": "",
+      "joinedDate": "2026-01-07"
+    },
+    {
+      "id": "staff_1767767064507",
+      "email": "",
+      "role": "EMPLOYEE",
+      "password": "",
+      "joinedDate": "2026-01-07",
+      "baseSalary": 1300,
+      "name": "SALEEM",
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "status": "Active",
+      "hasSystemAccess": false
+    },
+    {
+      "id": "staff_1767767158966",
+      "isOwner": false,
+      "password": "",
+      "role": "EMPLOYEE",
+      "baseSalary": 2400,
+      "buildingIds": [
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c"
+      ],
+      "iqamaExpiry": "",
+      "iqamaNo": "",
+      "joinedDate": "2026-01-07",
+      "phone": "",
+      "name": "SHIHAB",
+      "email": "",
+      "buildingId": "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+      "sharePercentage": 0,
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "hasSystemAccess": false
+    },
+    {
+      "id": "staff_1767767186417",
+      "status": "Active",
+      "ownerBuildingIds": [],
+      "hasSystemAccess": false,
+      "email": "",
+      "phone": "",
+      "name": "KOYA",
+      "joinedDate": "2026-01-07",
+      "sharePercentage": 0,
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "iqamaExpiry": "",
+      "iqamaNo": "",
+      "password": "",
+      "isOwner": false,
+      "role": "EMPLOYEE",
+      "baseSalary": 3400,
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ]
+    },
+    {
+      "id": "staff_1767767322752",
+      "iqamaExpiry": "",
+      "iqamaNo": "",
+      "baseSalary": 2500,
+      "password": "",
+      "role": "EMPLOYEE",
+      "isOwner": false,
+      "buildingIds": [],
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "hasSystemAccess": false,
+      "phone": "",
+      "joinedDate": "2026-01-07",
+      "name": "HASHIRALI",
+      "email": "",
+      "buildingId": "",
+      "sharePercentage": 0
+    },
+    {
+      "id": "staff_1767810206545",
+      "hasSystemAccess": false,
+      "status": "Active",
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "email": "",
+      "password": "",
+      "role": "EMPLOYEE",
+      "name": "SATHAR",
+      "joinedDate": "2026-01-07",
+      "baseSalary": 1300
+    },
+    {
+      "id": "staff_1771602483231",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "baseSalary": 4000,
+      "password": "",
+      "role": "EMPLOYEE",
+      "isOwner": false,
+      "iqamaNo": "",
+      "iqamaExpiry": "",
+      "sharePercentage": 0,
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "email": "",
+      "name": "AFRAH",
+      "joinedDate": "2026-02-20",
+      "phone": "",
+      "hasSystemAccess": false,
+      "status": "Active",
+      "ownerBuildingIds": []
+    },
+    {
+      "id": "staff_1771602552729",
+      "buildingId": "dfd49b1e-b8c3-4d2b-b314-329d67e2517c",
+      "sharePercentage": 0,
+      "name": "SAUDI SALARY ",
+      "phone": "",
+      "joinedDate": "2026-02-20",
+      "email": "",
+      "hasSystemAccess": false,
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "buildingIds": [
+        "dfd49b1e-b8c3-4d2b-b314-329d67e2517c"
+      ],
+      "baseSalary": 3500,
+      "password": "",
+      "role": "EMPLOYEE",
+      "isOwner": false,
+      "iqamaNo": "",
+      "iqamaExpiry": ""
+    },
+    {
+      "id": "staff_1771606875060",
+      "iqamaNo": "",
+      "iqamaExpiry": "",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "baseSalary": 2500,
+      "password": "",
+      "role": "EMPLOYEE",
+      "isOwner": false,
+      "hasSystemAccess": false,
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "sharePercentage": 0,
+      "name": "HASHIM",
+      "joinedDate": "2026-02-20",
+      "phone": "",
+      "email": ""
+    },
+    {
+      "id": "staff_1772352780798",
+      "sharePercentage": 0,
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "email": "",
+      "joinedDate": "2026-03-01",
+      "phone": "",
+      "name": "RAMEES",
+      "hasSystemAccess": false,
+      "status": "Active",
+      "ownerBuildingIds": [],
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "baseSalary": 0,
+      "password": "",
+      "role": "EMPLOYEE",
+      "isOwner": false,
+      "iqamaNo": "",
+      "iqamaExpiry": ""
+    },
+    {
+      "id": "staff_1772352801800",
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "sharePercentage": 0,
+      "phone": "",
+      "name": "RAYEES",
+      "joinedDate": "2026-03-01",
+      "email": "",
+      "hasSystemAccess": false,
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "baseSalary": 0,
+      "role": "EMPLOYEE",
+      "password": "",
+      "isOwner": false,
+      "iqamaNo": "",
+      "iqamaExpiry": ""
+    },
+    {
+      "id": "staff_1772352831996",
+      "baseSalary": 0,
+      "password": "",
+      "isOwner": false,
+      "role": "EMPLOYEE",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b"
+      ],
+      "iqamaExpiry": "",
+      "iqamaNo": "",
+      "joinedDate": "2026-03-01",
+      "name": "YOUNUS",
+      "phone": "",
+      "email": "",
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "sharePercentage": 0,
+      "ownerBuildingIds": [],
+      "status": "Active",
+      "hasSystemAccess": false
+    },
+    {
+      "id": "ummer",
+      "buildingIds": [
+        "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+        "c1a59cab-8001-4eb9-918b-76f9088f0dc6"
+      ],
+      "baseSalary": 7250,
+      "password": "d76632abcf40359d453903f4069d3ee7f267ed1723a96fd7a9c8b3676d55bd20",
+      "role": "EMPLOYEE",
+      "isOwner": false,
+      "iqamaNo": "",
+      "iqamaExpiry": "",
+      "sharePercentage": 0,
+      "buildingId": "7cfd05fe-ea83-4033-b549-c1b9319cfc5b",
+      "email": "ummerkutty134@gmail.com",
+      "joinedDate": "2026-01-07",
+      "phone": "",
+      "name": "UMMER",
+      "hasSystemAccess": true,
+      "status": "Active",
+      "ownerBuildingIds": []
+    }
+  ],
+  "banks": [
+    {
+      "id": "ALRAJHI",
+      "iban": "SA513000010006085433287",
+      "name": "ALRAJHI"
+    },
+    {
+      "id": "HEAD OFFICE",
+      "iban": "SA0780000513608015477185",
+      "name": "HEAD OFFICE"
+    },
+    {
+      "id": "HUMAID NCB",
+      "name": "HUMAID NCB",
+      "iban": "SA1610000001400009040108"
+    },
+    {
+      "id": "HUMAID-NCB",
+      "name": "HUMAID-NCB",
+      "iban": "SA1610000001400009040108"
+    },
+    {
+      "id": "JED,PANDA,MAZDI&MESHAL ALRAJHI BANK",
+      "name": "JED,PANDA,MAZDI&MESHAL ALRAJHI BANK",
+      "iban": "SA7680000513608010619153"
+    },
+    {
+      "id": "SAAD NCB",
+      "name": "SAAD NCB",
+      "iban": "SA1610000001400009040104"
+    },
+    {
+      "id": "SAAD-ALRAJHI BANK",
+      "iban": "SA5580000513608015433253",
+      "name": "SAAD-ALRAJHI BANK"
+    }
+  ]
+}

@@ -152,6 +152,7 @@ export function storeBiometricUserData(user: any) {
     email: user.email,
     displayName: user.displayName,
     role: user.role,
+    isOwner: !!user.isOwner,
     buildingId: user.buildingId,
     buildingIds: user.buildingIds,
     emailVerified: user.emailVerified,

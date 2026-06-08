@@ -76,8 +76,12 @@ export interface Transaction {
   buildingId?: string;
   buildingName?: string;
   unitNumber?: string;
+  customerName?: string;
+  /** Set on contract-linked income for filtering / reporting */
+  customerId?: string;
   contractId?: string;
   expectedAmount?: number; // For tracking debt
+  dueDate?: string; // Installment due date when payment is posted from Amlak Sheets
   vatAmount?: number;
   totalWithVat?: number;
   
@@ -92,6 +96,30 @@ export interface Transaction {
   zatcaQRCode?: string; // ZATCA QR code for invoice
   isCreditNote?: boolean; // True if this is a credit note (cancellation)
   originalInvoiceId?: string; // Reference to original invoice if credit note
+  vatReportSnapshot?: {
+    date?: string;
+    type?: TransactionType;
+    vatInvoiceNumber?: string;
+    customerName?: string;
+    customerVATNumber?: string;
+    vendorName?: string;
+    vendorVATNumber?: string;
+    paymentMethod?: PaymentMethod;
+    bankName?: string;
+    buildingId?: string;
+    buildingName?: string;
+    unitNumber?: string;
+    details?: string;
+    amount?: number;
+    amountExcludingVAT?: number;
+    amountIncludingVAT?: number;
+    totalWithVat?: number;
+    vatAmount?: number;
+    vatRate?: number;
+    isCreditNote?: boolean;
+    originalInvoiceId?: string;
+    lockedAt?: string;
+  }; // Frozen values used by VAT Report after ZATCA submission
   
   // Expense specific
   expenseCategory?: string;
@@ -136,6 +164,10 @@ export interface Transaction {
 
   // VAT Report only — transactions imported from PDF that should ONLY appear in the VAT Report tab
   vatReportOnly?: boolean;
+  /** Non-residential fee entry stored separately from VAT rent/sales. */
+  feesEntry?: boolean;
+  feeInvoiceNo?: string;
+  vendorRefNo?: string;
 
   details: string;
   createdAt: number;
@@ -143,6 +175,118 @@ export interface Transaction {
   createdByName: string;
   lastModifiedAt?: number;
   electricityMeter?: string;
+}
+
+export type AmlakCellValue = string | number | boolean | null;
+
+export type AmlakCellType = 'text' | 'number' | 'date' | 'boolean' | 'formula' | 'empty' | 'error';
+export type AmlakSheetKind = 'rentalIncome' | 'otherIncome' | 'expense' | 'ownerExpense' | 'vatIncome' | 'vatExpense' | 'fees' | 'income';
+export type AmlakSheetRowStatus = 'draft' | 'ready' | 'posted' | 'error';
+
+export interface AmlakCellPostingMeta {
+  postedTransactionId?: string;
+  postedAt?: number;
+  postedBy?: string;
+  postingStatus?: 'draft' | 'posted' | 'error';
+  postingError?: string;
+}
+
+export interface AmlakCell {
+  address: string;
+  raw: string;
+  value?: AmlakCellValue;
+  formula?: string;
+  type?: AmlakCellType;
+  error?: string;
+  style?: {
+    bold?: boolean;
+    italic?: boolean;
+    align?: 'left' | 'center' | 'right';
+    backgroundColor?: string;
+    textColor?: string;
+  };
+  posting?: AmlakCellPostingMeta;
+}
+
+export interface AmlakSheetRowMeta {
+  row: number;
+  status: AmlakSheetRowStatus;
+  enteredBy: string;
+  enteredByName: string;
+  enteredAt: number;
+  updatedAt: number;
+  postedTransactionId?: string;
+  postedAt?: number;
+  postedBy?: string;
+  postedByName?: string;
+  error?: string;
+}
+
+export type AmlakSheetPostType = 'RENT' | 'EXPENSE' | 'SALARY' | 'BORROWING' | 'OWNER_EXPENSE' | 'OTHER_INCOME';
+
+export interface AmlakSheetColumnMapping {
+  date?: string;
+  postType?: string;
+  building?: string;
+  unit?: string;
+  dueAmount?: string;
+  customerVAT?: string;
+  customer?: string;
+  category?: string;
+  subCategory?: string;
+  details?: string;
+  paymentMethod?: string;
+  bank?: string;
+  amount?: string;
+  extra?: string;
+  discount?: string;
+  vendor?: string;
+  vendorVAT?: string;
+  vendorRefNo?: string;
+  employee?: string;
+  owner?: string;
+  related?: string;
+}
+
+export interface AmlakSheetPostingConfig {
+  headerRow: number;
+  startRow: number;
+  endRow?: number;
+  defaultPostType: AmlakSheetPostType;
+  mapping: AmlakSheetColumnMapping;
+}
+
+export interface AmlakWorksheet {
+  id: string;
+  name: string;
+  sheetKind?: AmlakSheetKind;
+  buildingId?: string;
+  buildingName?: string;
+  rowCount: number;
+  colCount: number;
+  cells: Record<string, AmlakCell>;
+  rowsMeta?: Record<string, AmlakSheetRowMeta>;
+  columnWidths?: Record<string, number>;
+  rowHeights?: Record<string, number>;
+  postingConfig?: AmlakSheetPostingConfig;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface AmlakWorkbook {
+  id: string;
+  name: string;
+  buildingId?: string;
+  buildingName?: string;
+  sheets: AmlakWorksheet[];
+  activeSheetId?: string;
+  createdAt: number;
+  updatedAt: number;
+  createdBy: string;
+  createdByName: string;
+  lastOpenedAt?: number;
+  sharedWithUserIds?: string[];
+  deleted?: boolean;
 }
 
 export interface Customer {
@@ -220,7 +364,12 @@ export interface Contract {
   createdBy: string;
   staffEditCount?: number;
   renewedFromId?: string; // Set on renewal contracts, points to the previous contract's id
-  
+  /** Snapshot when this contract was created via “renew”: balance still owed on the prior lease. */
+  priorLeaseOutstandingAtRenewal?: number;
+  priorLeaseContractNoAtRenewal?: string;
+  priorLeasePaidAtRenewal?: number;
+  priorLeaseEffectiveTotalAtRenewal?: number;
+
   // NEW FIELDS
   parkingFee: number;
   managementFee: number;
@@ -496,10 +645,13 @@ export interface BankStatement {
 export interface ReconciliationRecord {
     id: string;
     bankStatementId: string;
-    transactionId?: string;    // Matched system transaction
+    transactionId?: string;    // Matched system transaction (first / legacy)
+    transactionIds?: string[]; // Split deposit: multiple system transactions
+    allocatedAmounts?: number[];
     status: 'Matched' | 'Unmatched' | 'Disputed' | 'Ignored';
-    matchType?: 'Auto' | 'Manual';
+    matchType?: 'Auto' | 'Manual' | 'Split';
     matchConfidence?: number;  // 0-100 for auto-match
+    matchReasons?: string[];
     notes?: string;
     reconciledBy?: string;
     reconciledAt?: number;

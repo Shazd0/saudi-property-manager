@@ -1,10 +1,23 @@
-﻿import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo } from 'react';
 import { User, Building, Transaction, TransactionType, TransactionStatus, PaymentMethod, Contract, ExpenseCategory } from '../types';
-import { getUsers, getTransactions, getBuildings, getContracts, setUserScope, saveTransaction, deleteTransaction, getTransfers } from '../services/firestoreService';
+import {
+  getUsers,
+  getTransactionsAllBooks,
+  getBuildingsAllBooks,
+  getContractsAllBooks,
+  setUserScope,
+  saveTransaction,
+  saveTransactionInBook,
+  deleteTransaction,
+  getTransfersAllBooks,
+  getCurrentBookId,
+  ownerStakeBuildingIdsMatch,
+} from '../services/firestoreService';
 import {
   Crown, Building2, TrendingUp, TrendingDown, DollarSign, Percent,
   Users, Wallet, Home, FileSignature, Sparkles, Plus, Trash2, X,
   Clock, Calendar, CreditCard, FileText, Printer, Download, ChevronDown, ChevronUp,
+  Edit3,
 } from 'lucide-react';
 import { useToast } from './Toast';
 import { fmtDate } from '../utils/dateFormat';
@@ -71,6 +84,7 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
   const [obPaymentMethod, setObPaymentMethod] = useState<PaymentMethod>(PaymentMethod.CASH);
   const [obDetails, setObDetails] = useState('');
   const [obSaving, setObSaving] = useState(false);
+  const [editingOBTx, setEditingOBTx] = useState<Transaction | null>(null);
   const [deletingOBTx, setDeletingOBTx] = useState<Transaction | null>(null);
 
   const { showSuccess, showError } = useToast();
@@ -81,7 +95,7 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
       try {
         setUserScope({ role: 'ADMIN', buildingIds: [] });
         const [usrs, blds, txs, ctrs, trfs] = await Promise.all([
-          getUsers(), getBuildings(), getTransactions(), getContracts(), getTransfers(),
+          getUsers(), getBuildingsAllBooks(), getTransactionsAllBooks(), getContractsAllBooks(), getTransfersAllBooks(),
         ]);
         const ownerList = (usrs || []).filter((u: User) => u.isOwner || (u as any).role === 'OWNER');
         setOwners(ownerList);
@@ -115,12 +129,43 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
     return { total, transactions: txs };
   }, [transactions, selectedOwnerId]);
 
-  const handleAddOpeningBalance = async () => {
+  const resetOpeningBalanceForm = () => {
+    setObAmount('');
+    setObDetails('');
+    setObDate(new Date().toISOString().slice(0, 10));
+    setObPaymentMethod(PaymentMethod.CASH);
+    setEditingOBTx(null);
+  };
+
+  const openAddOpeningBalance = () => {
+    resetOpeningBalanceForm();
+    setShowOBModal(true);
+  };
+
+  const openEditOpeningBalance = (tx: Transaction) => {
+    setEditingOBTx(tx);
+    setObAmount(String(Number(tx.amount) || 0));
+    setObDate(tx.date || new Date().toISOString().slice(0, 10));
+    setObPaymentMethod(tx.paymentMethod || PaymentMethod.CASH);
+    setObDetails(tx.details && tx.details !== 'Owner Opening Balance' ? tx.details : '');
+    setShowOBModal(true);
+  };
+
+  const closeOpeningBalanceModal = () => {
+    setShowOBModal(false);
+    resetOpeningBalanceForm();
+  };
+
+  const handleSaveOpeningBalance = async () => {
     if (!selectedOwnerId || !obAmount || Number(obAmount) <= 0) return;
     setObSaving(true);
     try {
-      await saveTransaction({
-        id: crypto.randomUUID(),
+      const now = Date.now();
+      const selectedOwnerName = owners.find(o => o.id === selectedOwnerId)?.name || '';
+      const { _sourceBookId, ...existingTxData } = (editingOBTx || {}) as any;
+      const openingBalanceTx = {
+        ...existingTxData,
+        id: editingOBTx?.id || crypto.randomUUID(),
         date: obDate,
         type: TransactionType.EXPENSE,
         amount: Number(obAmount),
@@ -130,20 +175,22 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
         isOwnerOpeningBalance: true,
         borrowingType: 'OPENING_BALANCE',
         ownerId: selectedOwnerId,
-        ownerName: owners.find(o => o.id === selectedOwnerId)?.name || '',
+        ownerName: selectedOwnerName,
         status: TransactionStatus.APPROVED,
-        createdAt: Date.now(),
-        createdBy: 'ADMIN',
-        createdByName: 'Admin',
-      } as any);
-      const txs = await getTransactions();
+        createdAt: editingOBTx?.createdAt || now,
+        createdBy: editingOBTx?.createdBy || 'ADMIN',
+        createdByName: editingOBTx?.createdByName || 'Admin',
+        lastModifiedAt: editingOBTx ? now : undefined,
+      } as any;
+      if (editingOBTx && _sourceBookId) {
+        await saveTransactionInBook(_sourceBookId, openingBalanceTx);
+      } else {
+        await saveTransaction(openingBalanceTx);
+      }
+      const txs = await getTransactionsAllBooks();
       setTransactions(txs || []);
-      setObAmount('');
-      setObDetails('');
-      setObDate(new Date().toISOString().slice(0, 10));
-      setObPaymentMethod(PaymentMethod.CASH);
-      setShowOBModal(false);
-      showSuccess('Opening balance added successfully.');
+      closeOpeningBalanceModal();
+      showSuccess(editingOBTx ? 'Opening balance updated successfully.' : 'Opening balance added successfully.');
     } catch (e) {
       showError('Failed to save opening balance.');
     }
@@ -154,7 +201,7 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
     if (!window.confirm(`Delete opening balance of ${Number(tx.amount).toLocaleString()} SAR on ${fmtDate(tx.date)}?`)) return;
     try {
       await deleteTransaction(tx.id);
-      const txs = await getTransactions();
+      const txs = await getTransactionsAllBooks();
       setTransactions(txs || []);
       showSuccess('Opening balance entry deleted.');
     } catch (e) {
@@ -185,14 +232,19 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
     () => selectedOwner?.ownerBuildingIds || (selectedOwner as any)?.buildingIds || [],
     [selectedOwner],
   );
-  const ownerBuildings = useMemo(
-    () => buildings.filter(b => ownerBuildingIds.includes(b.id)),
-    [buildings, ownerBuildingIds],
-  );
+  const ownerBuildings = useMemo(() => {
+    const activeBookId = getCurrentBookId();
+    return buildings.filter(b =>
+      ownerBuildingIds.some(oid => ownerStakeBuildingIdsMatch(oid, b.id, activeBookId)),
+    );
+  }, [buildings, ownerBuildingIds]);
 
   const ownerScopedTransactions = useMemo(() => {
+    const activeBookId = getCurrentBookId();
     return filteredTransactions.filter(t => {
-      const inOwnerBuilding = ownerBuildingIds.includes(t.buildingId || '');
+      const inOwnerBuilding = ownerBuildingIds.some(oid =>
+        ownerStakeBuildingIdsMatch(oid, t.buildingId || '', activeBookId),
+      );
       const isOwnerExpense =
         t.type === TransactionType.EXPENSE &&
         OWNER_EXPENSE_CATEGORIES.includes((t.expenseCategory || '') as any) &&
@@ -815,7 +867,7 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
           </div>
           {(!currentUser || (currentUser as any).role === 'ADMIN') && (
             <button
-              onClick={() => setShowOBModal(true)}
+              onClick={openAddOpeningBalance}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-600 text-white text-[10px] font-bold rounded-lg hover:bg-amber-700 transition-colors shadow-sm"
             >
               <Plus size={13} /> Add Entry
@@ -823,7 +875,7 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
           )}
         </div>
 
-        {ownerOpeningBalanceData.total > 0 ? (
+        {ownerOpeningBalanceData.transactions.length > 0 ? (
           <>
             <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 text-center mb-4 inline-block">
               <div className="text-[10px] text-amber-600 font-bold uppercase tracking-wide mb-1">Total Opening Balance</div>
@@ -845,13 +897,22 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
                       )}
                     </div>
                     {(!currentUser || (currentUser as any).role === 'ADMIN') && (
-                      <button
-                        onClick={() => handleDeleteOpeningBalance(tx)}
-                        className="p-1.5 text-rose-500 hover:text-rose-700 bg-rose-50 rounded-lg hover:bg-rose-100 transition"
-                        title={t('common.delete')}
-                      >
-                        <Trash2 size={14} />
-                      </button>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => openEditOpeningBalance(tx)}
+                          className="p-1.5 text-amber-600 hover:text-amber-800 bg-amber-50 rounded-lg hover:bg-amber-100 transition"
+                          title="Edit opening balance"
+                        >
+                          <Edit3 size={14} />
+                        </button>
+                        <button
+                          onClick={() => handleDeleteOpeningBalance(tx)}
+                          className="p-1.5 text-rose-500 hover:text-rose-700 bg-rose-50 rounded-lg hover:bg-rose-100 transition"
+                          title={t('common.delete')}
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
                     )}
                   </div>
                 ))}
@@ -869,8 +930,8 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-start justify-center pt-[12vh] p-4">
           <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-sm w-full animate-slide-up">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-base font-black text-slate-800">Add Owner Opening Balance</h3>
-              <button onClick={() => setShowOBModal(false)} className="p-1.5 rounded-lg hover:bg-slate-100">
+              <h3 className="text-base font-black text-slate-800">{editingOBTx ? 'Edit Owner Opening Balance' : 'Add Owner Opening Balance'}</h3>
+              <button onClick={closeOpeningBalanceModal} className="p-1.5 rounded-lg hover:bg-slate-100">
                 <X size={16} className="text-slate-400" />
               </button>
             </div>
@@ -932,16 +993,16 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
             <div className="flex gap-3 mt-5">
               <button
                 type="button"
-                onClick={() => setShowOBModal(false)}
+                onClick={closeOpeningBalanceModal}
                 className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50 text-sm"
               >{t('common.cancel')}</button>
               <button
                 type="button"
                 disabled={obSaving || !obAmount || Number(obAmount) <= 0}
-                onClick={handleAddOpeningBalance}
+                onClick={handleSaveOpeningBalance}
                 className="flex-1 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold shadow-sm text-sm disabled:opacity-50"
               >
-                {obSaving ? 'Saving…' : 'Save'}
+                {obSaving ? 'Saving...' : editingOBTx ? 'Update' : 'Save'}
               </button>
             </div>
           </div>

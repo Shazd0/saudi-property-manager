@@ -8,7 +8,8 @@ export default defineConfig(({ mode }) => {
     base: './',
     server: {
       host: '0.0.0.0',
-      port: 5200,
+      // Default 5220 so another app can keep using 5200 on the same machine.
+      port: Number(env.VITE_DEV_SERVER_PORT) || 5220,
       strictPort: true,
       open: false,
     },
@@ -27,6 +28,7 @@ export default defineConfig(({ mode }) => {
       'process.env.GEMINI_API_KEY': JSON.stringify(env.GEMINI_API_KEY)
     },
     resolve: {
+      dedupe: ['react', 'react-dom', 'firebase', '@firebase/app', '@firebase/firestore', '@firebase/auth'],
       alias: {
         '@': path.resolve(__dirname, '.'),
       }

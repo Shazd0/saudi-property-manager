@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
-import { User, Building, UserRole, Transaction, TransactionType } from '../types';
-import { getBuildings, getTransfers, saveTransfer, getBanks, deleteTransfer, getTransactions, getUsers, saveTransaction, getDataFromBook } from '../services/firestoreService';
-import { ArrowRightLeft, Building2, Landmark, TrendingDown, TrendingUp, Plus, Download, Calendar, Trash2, Check, X, RotateCcw, Wallet, UserCircle, Pencil, Shuffle, FileText } from 'lucide-react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
+import { createPortal } from 'react-dom';
+import { User, Building, UserRole, Transaction, TransactionType, ExpenseCategory } from '../types';
+import { getBuildings, getTransfers, saveTransfer, getBanks, deleteTransfer, getTransactions, getUsersAcrossBooks, saveTransaction, saveTransactionInBook, getDataFromBook } from '../services/firestoreService';
+import { ArrowRightLeft, Building2, Landmark, TrendingDown, TrendingUp, Plus, Download, Upload, Calendar, Trash2, Check, X, RotateCcw, Wallet, UserCircle, Pencil, Shuffle, FileText, Sparkles, ChevronDown, Eye } from 'lucide-react';
 import { Bank } from '../types';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
@@ -9,12 +10,37 @@ import SoundService from '../services/soundService';
 import { fmtDate, fmtDateTime } from '../utils/dateFormat';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
+import SearchableSelect from './SearchableSelect';
+import * as XLSX from 'xlsx';
 
 // Building enriched with the book it belongs to. For the active book the `id`
 // stays the raw building id so existing transfers keep resolving correctly.
 // For other books we use a composite id `${bookId}:${buildingId}` to keep it
 // unambiguous across books (two books can coincidentally share a building id).
 type BookBuilding = Building & { bookId: string; bookName: string; rawId: string };
+
+const TREASURY_CONVERSION_OWNER_EXPENSE = 'OWNER_EXPENSE' as const;
+
+function isOwnerExpenseCategory(tx: any): boolean {
+  const cat = String((tx as any).expenseCategory || '').trim();
+  const catLo = cat.toLowerCase();
+  return (
+    cat === ExpenseCategory.OWNER_EXPENSE ||
+    catLo === 'owner expense' ||
+    cat === 'Owner Profit Withdrawal' ||
+    cat === 'OWNER_EXPENSE'
+  );
+}
+
+/** Display name for Treasury owner pickers / labels (supports legacy Firestore fields). */
+function treasuryUserLabel(u: any): string {
+  if (!u) return '';
+  return String(u.name || u.displayName || u.fullName || u.email || u.id || '').trim() || String(u.id || '');
+}
+
+function normalizeOwnerLookupKey(s: string): string {
+  return String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
+}
 
 interface Transfer {
   id: string;
@@ -73,22 +99,55 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   // Filters
   const [filterFromDate, setFilterFromDate] = useState('');
   const [filterToDate, setFilterToDate] = useState('');
+  const [datePreset, setDatePreset] = useState<'ALL' | 'THIS_MONTH' | 'LAST_MONTH' | 'CUSTOM'>('ALL');
   const [filterStatus, setFilterStatus] = useState<'ALL' | 'PENDING' | 'COMPLETED' | 'CANCELLED'>('ALL');
   // 'ALL' | 'HEAD_OFFICE' | building-id
   const [filterAccount, setFilterAccount] = useState<string>('ALL');
+  const [filterFromType, setFilterFromType] = useState<'ALL' | 'BUILDING' | 'HEAD_OFFICE' | 'BANK' | 'OWNER'>('ALL');
+  const [filterToType, setFilterToType] = useState<'ALL' | 'BUILDING' | 'HEAD_OFFICE' | 'BANK' | 'OWNER'>('ALL');
+  const [filterBuildingIds, setFilterBuildingIds] = useState<string[]>([]);
+  /** When on, Treasury loads buildings + transactions from every book (Admin / Head / Owner / Manager). */
+  const [includeOtherBooksInTreasury, setIncludeOtherBooksInTreasury] = useState(() => {
+    try {
+      const v = localStorage.getItem('treasuryIncludeOtherBooks');
+      if (v === '0') return false;
+      return true;
+    } catch {
+      return true;
+    }
+  });
+  const [showBuildingPicker, setShowBuildingPicker] = useState(false);
+  const buildingTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const buildingPickerRef = useRef<HTMLDivElement | null>(null);
+  const [buildingPickerRect, setBuildingPickerRect] = useState<{ top: number; left: number; width: number } | null>(null);
+  const [buildingPickerSearch, setBuildingPickerSearch] = useState('');
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmMessage, setConfirmMessage] = useState('');
   const [confirmTitle, setConfirmTitle] = useState('Confirm');
   const [confirmDanger, setConfirmDanger] = useState(false);
   const [confirmAction, setConfirmAction] = useState<null | (() => void)>(null);
 
+  // Bulk import (CSV/XLSX)
+  const [showImportModal, setShowImportModal] = useState(false);
+  const [importBusy, setImportBusy] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
   // Edit transfer state
   const [showEditTransferModal, setShowEditTransferModal] = useState(false);
   const [editTransferItem, setEditTransferItem] = useState<Transfer | null>(null);
   const [editTransferDate, setEditTransferDate] = useState('');
+  const [editTransferFromType, setEditTransferFromType] = useState<Transfer['fromType']>('BUILDING');
+  const [editTransferToType, setEditTransferToType] = useState<Transfer['toType']>('HEAD_OFFICE');
+  const [editTransferFromId, setEditTransferFromId] = useState('');
+  const [editTransferToId, setEditTransferToId] = useState('');
+  const [editTransferAmount, setEditTransferAmount] = useState('');
+  const [editTransferPurpose, setEditTransferPurpose] = useState('');
+  const [editTransferNotes, setEditTransferNotes] = useState('');
+  const [editTransferStatus, setEditTransferStatus] = useState<Transfer['status']>('COMPLETED');
   const [editTransferPaymentMethod, setEditTransferPaymentMethod] = useState<'CASH' | 'BANK' | 'CHEQUE'>('CASH');
   const [editTransferFromBank, setEditTransferFromBank] = useState('');
   const [editTransferToBank, setEditTransferToBank] = useState('');
+  const [detailEntry, setDetailEntry] = useState<any | null>(null);
 
   // Opening balance edit state
   const [editingOpeningBal, setEditingOpeningBal] = useState(false);
@@ -107,26 +166,495 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     setConfirmAction(null);
   };
 
+  const isAdmin = currentUser.role === UserRole.ADMIN;
+  const isAdminOrHead = currentUser.role === UserRole.ADMIN || (currentUser as any).role === 'HEAD';
+
+  const normalize = (s: any) => String(s ?? '').trim();
+  const normalizeUpper = (s: any) => normalize(s).toUpperCase();
+
+  const resolveBuildingId = (raw: string): string | null => {
+    const v = normalize(raw);
+    if (!v) return null;
+    const byId = buildings.find(b => b.id === v);
+    if (byId) return byId.id;
+    const low = v.toLowerCase();
+    const byRawId = buildings.find(b => String((b as any).rawId || '').toLowerCase() === low);
+    if (byRawId) return byRawId.id;
+    const byName = buildings.find(b => String(b.name || '').toLowerCase() === low);
+    if (byName) return byName.id;
+    return null;
+  };
+
+  const resolveOwnerId = (raw: string): string | null => {
+    const v = normalize(raw);
+    if (!v) return null;
+    const stripped = rawOf(v);
+    const byId = owners.find(o => String(o.id) === v || String(o.id) === stripped);
+    if (byId) return String(byId.id);
+    const vNorm = normalizeOwnerLookupKey(v);
+    const low = v.toLowerCase();
+    const byName = owners.find(o => normalizeOwnerLookupKey(treasuryUserLabel(o)) === vNorm);
+    if (byName) return String(byName.id);
+    const byEmail = owners.find(o => String((o as any).email || '').toLowerCase().trim() === low);
+    if (byEmail) return String(byEmail.id);
+    return null;
+  };
+
+  const parseCsv = (text: string): string[][] => {
+    // Minimal CSV parser (quoted fields supported).
+    const rows: string[][] = [];
+    let i = 0;
+    let cur = '';
+    let row: string[] = [];
+    let inQuotes = false;
+    while (i < text.length) {
+      const ch = text[i];
+      if (ch === '"') {
+        const next = text[i + 1];
+        if (inQuotes && next === '"') { cur += '"'; i += 2; continue; }
+        inQuotes = !inQuotes; i += 1; continue;
+      }
+      if (!inQuotes && ch === ',') { row.push(cur); cur = ''; i += 1; continue; }
+      if (!inQuotes && (ch === '\n' || ch === '\r')) {
+        if (ch === '\r' && text[i + 1] === '\n') i += 1;
+        row.push(cur);
+        const isEmpty = row.every(c => String(c ?? '').trim() === '');
+        if (!isEmpty) rows.push(row.map(c => String(c ?? '')));
+        row = [];
+        cur = '';
+        i += 1;
+        continue;
+      }
+      cur += ch;
+      i += 1;
+    }
+    if (cur.length || row.length) {
+      row.push(cur);
+      const isEmpty = row.every(c => String(c ?? '').trim() === '');
+      if (!isEmpty) rows.push(row.map(c => String(c ?? '')));
+    }
+    return rows;
+  };
+
+  const downloadImportTemplate = () => {
+    const headers = [
+      'Date',
+      'FromType',
+      'FromId',
+      'ToType',
+      'ToId',
+      'Amount',
+      'Purpose',
+      'Notes',
+      'PaymentMethod',
+      'FromBankName',
+      'ToBankName',
+      'Status',
+    ];
+    const sample = [
+      [
+        new Date().toISOString().split('T')[0],
+        'HEAD_OFFICE',
+        'HEAD_OFFICE',
+        'OWNER',
+        owners[0]?.id || 'owner-id',
+        '1000',
+        'Owner withdrawal',
+        '',
+        'CASH',
+        '',
+        '',
+        'COMPLETED',
+      ],
+    ];
+    const csv = [headers, ...sample].map(r => r.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], { type: 'text/csv' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `treasury_import_template_${new Date().toISOString().split('T')[0]}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const importTransfersFromRows = async (records: any[]) => {
+    if (records.length === 0) { showError('No rows found to import.'); return; }
+    setImportBusy(true);
+    try {
+      let ok = 0;
+      const errors: string[] = [];
+
+      for (let idx = 0; idx < records.length; idx++) {
+        const r = records[idx] || {};
+        const rowNo = idx + 2; // assumes header at 1
+
+        const dateStr = normalize(r.Date);
+        const fromType = normalizeUpper(r.FromType) as any;
+        const toType = normalizeUpper(r.ToType) as any;
+        const rawFromId = normalize(r.FromId);
+        const rawToId = normalize(r.ToId);
+        const amt = Number(String(r.Amount ?? '').replace(/,/g, '').trim());
+        const purpose = normalize(r.Purpose) || 'Transfer';
+        const notes = normalize(r.Notes);
+        const paymentMethod = normalizeUpper(r.PaymentMethod) as any;
+        const fromBankName = normalize(r.FromBankName);
+        const toBankName = normalize(r.ToBankName);
+        const status = normalizeUpper(r.Status) as any;
+
+        if (!dateStr) { errors.push(`Row ${rowNo}: missing Date`); continue; }
+        if (!fromType || !toType) { errors.push(`Row ${rowNo}: missing FromType/ToType`); continue; }
+        if (!Number.isFinite(amt) || amt <= 0) { errors.push(`Row ${rowNo}: invalid Amount`); continue; }
+
+        let fromIdResolved = rawFromId;
+        let toIdResolved = rawToId;
+
+        if (fromType === 'HEAD_OFFICE') fromIdResolved = 'HEAD_OFFICE';
+        if (toType === 'HEAD_OFFICE') toIdResolved = 'HEAD_OFFICE';
+
+        if (fromType === 'BUILDING') {
+          const id = resolveBuildingId(rawFromId);
+          if (!id) { errors.push(`Row ${rowNo}: FromId building not found: "${rawFromId}"`); continue; }
+          fromIdResolved = id;
+        }
+        if (toType === 'BUILDING') {
+          const id = resolveBuildingId(rawToId);
+          if (!id) { errors.push(`Row ${rowNo}: ToId building not found: "${rawToId}"`); continue; }
+          toIdResolved = id;
+        }
+        if (fromType === 'OWNER') {
+          const id = resolveOwnerId(rawFromId);
+          if (!id) { errors.push(`Row ${rowNo}: FromId owner not found: "${rawFromId}"`); continue; }
+          fromIdResolved = id;
+        }
+        if (toType === 'OWNER') {
+          const id = resolveOwnerId(rawToId);
+          if (!id) { errors.push(`Row ${rowNo}: ToId owner not found: "${rawToId}"`); continue; }
+          toIdResolved = id;
+        }
+        if (fromType === 'BANK') {
+          const m = banks.find(b => String(b.name || '').toLowerCase() === normalize(rawFromId).toLowerCase());
+          if (!m) { errors.push(`Row ${rowNo}: FromId bank not found: "${rawFromId}"`); continue; }
+          fromIdResolved = m.name;
+        }
+        if (toType === 'BANK') {
+          const m = banks.find(b => String(b.name || '').toLowerCase() === normalize(rawToId).toLowerCase());
+          if (!m) { errors.push(`Row ${rowNo}: ToId bank not found: "${rawToId}"`); continue; }
+          toIdResolved = m.name;
+        }
+
+        const pm = (paymentMethod === 'BANK' || paymentMethod === 'CHEQUE' || paymentMethod === 'CASH') ? paymentMethod : 'CASH';
+        const st = (status === 'PENDING' || status === 'COMPLETED' || status === 'CANCELLED') ? status : 'COMPLETED';
+
+        try {
+          await saveTransfer({
+            date: dateStr,
+            fromType,
+            toType,
+            fromId: fromIdResolved,
+            toId: toIdResolved,
+            amount: amt,
+            purpose,
+            notes: notes || undefined,
+            paymentMethod: pm,
+            fromBankName: (pm === 'BANK' || pm === 'CHEQUE') ? (fromBankName || undefined) : undefined,
+            toBankName: (pm === 'BANK' || pm === 'CHEQUE') ? (toBankName || undefined) : undefined,
+            status: st,
+            createdBy: currentUser.id,
+            createdAt: Date.now(),
+          } as any);
+          ok++;
+        } catch (e: any) {
+          errors.push(`Row ${rowNo}: failed to import (${e?.message || 'unknown error'})`);
+        }
+      }
+
+      if (errors.length) {
+        showToast(`Imported ${ok}/${records.length}. Errors: ${errors.slice(0, 6).join(' · ')}${errors.length > 6 ? ` (+${errors.length - 6} more)` : ''}`, 'warning');
+      } else {
+        showSuccess(`Imported ${ok} transfer(s).`);
+      }
+
+      setTransfers(await getTransfers({ includeDeleted: true }));
+      setShowImportModal(false);
+    } finally {
+      setImportBusy(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
+
+  const handleImportFile = async (file: File | null) => {
+    if (!file) return;
+    const name = file.name.toLowerCase();
+    try {
+      setImportBusy(true);
+      const data = await file.arrayBuffer();
+      let rows: any[] = [];
+
+      if (name.endsWith('.xlsx') || name.endsWith('.xls')) {
+        const wb = XLSX.read(data, { type: 'array' });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        rows = XLSX.utils.sheet_to_json(ws, { defval: '' }) as any[];
+      } else {
+        const text = new TextDecoder().decode(data);
+        const grid = parseCsv(text);
+        if (grid.length < 2) { showError('CSV must include header row + data rows.'); return; }
+        const header = grid[0].map(h => normalize(h));
+        rows = grid.slice(1).map(r => {
+          const obj: any = {};
+          header.forEach((h, i) => { obj[h] = r[i] ?? ''; });
+          return obj;
+        });
+      }
+
+      const normalized = rows.map((r: any) => ({
+        Date: r.Date ?? r.date ?? r.DATE ?? '',
+        FromType: r.FromType ?? r.fromType ?? r.FROMTYPE ?? '',
+        FromId: r.FromId ?? r.fromId ?? r.FROMID ?? '',
+        ToType: r.ToType ?? r.toType ?? r.TOTYPE ?? '',
+        ToId: r.ToId ?? r.toId ?? r.TOID ?? '',
+        Amount: r.Amount ?? r.amount ?? r.AMOUNT ?? '',
+        Purpose: r.Purpose ?? r.purpose ?? r.PURPOSE ?? '',
+        Notes: r.Notes ?? r.notes ?? r.NOTES ?? '',
+        PaymentMethod: r.PaymentMethod ?? r.paymentMethod ?? r.PAYMENTMETHOD ?? '',
+        FromBankName: r.FromBankName ?? r.fromBankName ?? r.FROMBANKNAME ?? '',
+        ToBankName: r.ToBankName ?? r.toBankName ?? r.TOBANKNAME ?? '',
+        Status: r.Status ?? r.status ?? r.STATUS ?? '',
+      }));
+
+      await importTransfersFromRows(normalized);
+    } catch (e: any) {
+      showError(e?.message || 'Failed to import file.');
+    } finally {
+      setImportBusy(false);
+    }
+  };
+
+  const ownerExpenseTxs = useMemo(() => {
+    return (allTransactions || []).filter((tx: any) => {
+      if (!tx) return false;
+      const ty = String(tx.type || '').toUpperCase();
+      if (ty !== String(TransactionType.EXPENSE)) return false;
+      if ((tx as any).deleted) return false;
+      if ((tx as any).treasuryConverted) return false;
+      return isOwnerExpenseCategory(tx);
+    });
+  }, [allTransactions]);
+
+  /** Owner expense rows already converted to Treasury (visible across books when merged). */
+  const ownerExpenseConvertedTxs = useMemo(() => {
+    return (allTransactions || [])
+      .filter((tx: any) => {
+        if (!tx || (tx as any).deleted) return false;
+        if (!(tx as any).treasuryConverted) return false;
+        const ty = String(tx.type || '').toUpperCase();
+        if (ty !== String(TransactionType.EXPENSE)) return false;
+        const kind = String((tx as any).treasuryConversionKind || '').trim();
+        if (kind === TREASURY_CONVERSION_OWNER_EXPENSE) return true;
+        // Legacy: only rows without a kind still count if they look like owner expense.
+        if (!kind && isOwnerExpenseCategory(tx)) return true;
+        return false;
+      })
+      .sort((a: any, b: any) => String(b.date || '').localeCompare(String(a.date || '')));
+  }, [allTransactions]);
+
+  const filteredOwnerExpenseConverted = useMemo(() => {
+    return ownerExpenseConvertedTxs.filter((tx: any) => {
+      if (filterFromDate && (tx.date || '') < filterFromDate) return false;
+      if (filterToDate && (tx.date || '') > filterToDate) return false;
+      if (filterBuildingIds.length > 0) {
+        const rawBid = String((tx as any).buildingId || '').trim();
+        if (!rawBid || rawBid === 'HEAD_OFFICE') return false;
+        const txBook = String((tx as any)._bookId || activeBookId);
+        const lookup = rawBid.includes(':') ? rawBid : txBook === activeBookId ? rawBid : `${txBook}:${rawBid}`;
+        let b = buildings.find((bb) => bb.id === lookup);
+        if (!b && lookup.includes(':')) {
+          const [bookId, rawId] = lookup.split(':');
+          b = buildings.find((bb) => bb.bookId === bookId && bb.rawId === rawId);
+        }
+        if (!b) b = buildings.find((bb) => bb.rawId === rawBid || bb.id === rawBid);
+        if (!b || !filterBuildingIds.includes(b.id)) return false;
+      }
+      return true;
+    });
+  }, [ownerExpenseConvertedTxs, filterFromDate, filterToDate, filterBuildingIds, buildings, activeBookId]);
+
+  const ownerExpenseConvertedFromOtherBooks = useMemo(
+    () =>
+      filteredOwnerExpenseConverted.filter(
+        (tx: any) => String((tx as any)._bookId || activeBookId) !== String(activeBookId),
+      ),
+    [filteredOwnerExpenseConverted, activeBookId],
+  );
+
+  const convertedOtherBooksTotalSar = useMemo(
+    () =>
+      ownerExpenseConvertedFromOtherBooks.reduce(
+        (s, tx: any) => s + Math.abs(Number(tx.amountIncludingVAT || tx.totalWithVat || tx.amount || 0)),
+        0,
+      ),
+    [ownerExpenseConvertedFromOtherBooks],
+  );
+
+  const canFixOwnerExpense =
+    isAdminOrHead || currentUser.role === UserRole.MANAGER;
+
+  const handleConvertOwnerExpensesToTreasury = () => {
+    if (!canFixOwnerExpense) return;
+    const count = ownerExpenseTxs.length;
+    if (count === 0) {
+      showToast('No Owner Expense transactions found to convert.', 'info');
+      return;
+    }
+    openConfirm(
+      `Convert ${count} Owner Expense transaction(s) into Treasury transfers?\n\nEach transfer will be Building → Owner (same building as on the expense), the History row will be marked converted, and future fixes will skip it.`,
+      async () => {
+        setImportBusy(true);
+        try {
+          let ok = 0;
+          let skippedNoOwner = 0;
+          let skippedNoBuilding = 0;
+          let skippedAmount = 0;
+          for (const tx of ownerExpenseTxs as any[]) {
+            const ownerId =
+              String((tx as any).ownerId || '').trim() ||
+              (tx.ownerName ? resolveOwnerId(String(tx.ownerName)) || '' : '');
+            if (!ownerId) {
+              skippedNoOwner++;
+              continue;
+            }
+            const rawBuilding = String((tx as any).buildingId || '').trim();
+            if (!rawBuilding || rawBuilding === 'HEAD_OFFICE') {
+              skippedNoBuilding++;
+              continue;
+            }
+            const txBook = String((tx as any)._bookId || activeBookId);
+            const lookupKey = rawBuilding.includes(':')
+              ? rawBuilding
+              : txBook === String(activeBookId)
+                ? rawBuilding
+                : `${txBook}:${rawBuilding}`;
+            const fromId = resolveBuildingId(lookupKey) || resolveBuildingId(rawBuilding);
+            if (!fromId) {
+              skippedNoBuilding++;
+              continue;
+            }
+            const pm = String((tx as any).paymentMethod || '').toUpperCase();
+            const paymentMethod = pm === 'BANK' || pm === 'CHEQUE' || pm === 'CASH' ? pm : 'CASH';
+            const amt = Math.abs(Number((tx as any).amountIncludingVAT || (tx as any).totalWithVat || tx.amount || 0));
+            if (!amt) {
+              skippedAmount++;
+              continue;
+            }
+
+            const created: any = {
+              date: tx.date || new Date().toISOString().split('T')[0],
+              fromType: 'BUILDING',
+              fromId,
+              toType: 'OWNER',
+              toId: ownerId,
+              amount: amt,
+              purpose: 'Owner Expense (converted)',
+              notes: `Converted from transaction ${tx.id}`,
+              paymentMethod,
+              status: 'COMPLETED',
+              createdBy: currentUser.id,
+              createdAt: Date.now(),
+            };
+            await saveTransfer(created);
+            const payload = {
+              ...(tx as any),
+              treasuryConverted: true,
+              treasuryConversionKind: TREASURY_CONVERSION_OWNER_EXPENSE,
+            } as any;
+            if (txBook === String(activeBookId)) {
+              await saveTransaction(payload);
+            } else {
+              await saveTransactionInBook(txBook, payload);
+            }
+            ok++;
+          }
+          await loadData();
+          const parts = [`Converted ${ok} transaction(s) into Treasury transfers.`];
+          if (skippedNoOwner) parts.push(`Skipped ${skippedNoOwner} (no owner).`);
+          if (skippedNoBuilding) parts.push(`Skipped ${skippedNoBuilding} (no building on file).`);
+          if (skippedAmount) parts.push(`Skipped ${skippedAmount} (zero amount).`);
+          showSuccess(parts.join(' '));
+          closeConfirm();
+          setShowImportModal(false);
+        } catch (e: any) {
+          showError(e?.message || 'Failed to convert owner expenses.');
+        } finally {
+          setImportBusy(false);
+        }
+      },
+      { title: 'Convert Owner Expenses', danger: false }
+    );
+  };
+
+  const rawOf = (v?: string) => (v && String(v).includes(':')) ? String(v).slice(String(v).indexOf(':') + 1) : (v || '');
+  /** Normalize transfer endpoint types (Firestore / imports may use different casing). */
+  const treTy = (t?: any) => String(t ?? '').trim().toUpperCase();
+  const matchesAnyBuilding = (t: any, ids: string[]) => {
+    if (!ids || ids.length === 0) return true;
+    const from = String(t?.fromId || '');
+    const to = String(t?.toId || '');
+    const fromRaw = rawOf(from);
+    const toRaw = rawOf(to);
+    return ids.some((id) => {
+      const want = String(id || '');
+      const wantRaw = rawOf(want);
+      return want === from || want === to || (wantRaw && (wantRaw === fromRaw || wantRaw === toRaw));
+    });
+  };
+
+  // Popover positioning + close-on-outside-click
+  useEffect(() => {
+    if (!showBuildingPicker) return;
+    const updatePos = () => {
+      const rect = buildingTriggerRef.current?.getBoundingClientRect();
+      if (rect) setBuildingPickerRect({ top: rect.bottom, left: rect.left, width: rect.width });
+    };
+    updatePos();
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node | null;
+      if (!target) return;
+      if (buildingPickerRef.current?.contains(target)) return;
+      if (buildingTriggerRef.current?.contains(target)) return;
+      setShowBuildingPicker(false);
+    };
+    const onEsc = (e: KeyboardEvent) => { if (e.key === 'Escape') setShowBuildingPicker(false); };
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('keydown', onEsc);
+    window.addEventListener('resize', updatePos);
+    window.addEventListener('scroll', updatePos, true);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('keydown', onEsc);
+      window.removeEventListener('resize', updatePos);
+      window.removeEventListener('scroll', updatePos, true);
+    };
+  }, [showBuildingPicker]);
+
   useEffect(() => {
     loadData();
     // Re-load whenever the list of books (or the active book) changes so
     // that newly created books surface their buildings immediately.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [books.length, activeBookId]);
+  }, [books.length, activeBookId, includeOtherBooksInTreasury]);
 
   const loadData = async () => {
-    // Admin/Head/Owner see buildings from every book; staff remain scoped to
-    // the active book (getBuildings honours their building-scope filters).
-    const canSeeAllBooks =
+    const canCrossBookTreasury =
       currentUser.role === UserRole.ADMIN ||
       currentUser.role === 'HEAD' ||
-      currentUser.role === UserRole.OWNER;
+      currentUser.role === UserRole.OWNER ||
+      currentUser.role === UserRole.MANAGER;
+    const mergeOtherBooks = canCrossBookTreasury && includeOtherBooksInTreasury;
 
     const bookList = books && books.length > 0 ? books : [{ id: 'default', name: 'Main Book' } as any];
     const activeName = (bookList.find((b: any) => b.id === activeBookId)?.name) || 'Main Book';
 
     let merged: BookBuilding[] = [];
-    if (canSeeAllBooks) {
+    if (mergeOtherBooks) {
       const perBook = await Promise.all(
         bookList.map(async (bk: any) => {
           try {
@@ -155,19 +683,107 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
         }
       });
     } catch { /* ignore */ }
+
+    // Without "all books", Treasury lists only the active book's buildings.
+    if (!mergeOtherBooks) {
+      merged = merged.filter(b => b.bookId === activeBookId);
+    }
+    // Same rule as `filterByScope` in firestoreService: only ADMIN, MANAGER, HEAD, OWNER
+    // bypass per-building assignment. Everyone else (staff) only sees assigned building(s)
+    // in the active book.
+    const isAssignmentScoped =
+      currentUser.role !== UserRole.ADMIN &&
+      currentUser.role !== UserRole.MANAGER &&
+      currentUser.role !== 'HEAD' &&
+      currentUser.role !== UserRole.OWNER;
+    if (isAssignmentScoped) {
+      const allowed = new Set(
+        (currentUser.buildingIds && currentUser.buildingIds.length > 0
+          ? currentUser.buildingIds
+          : (currentUser.buildingId ? [currentUser.buildingId] : [])) as string[],
+      );
+      merged = allowed.size > 0
+        ? merged.filter(b => allowed.has(b.rawId) || allowed.has(b.id))
+        : [];
+    }
+
     setBuildings(merged);
     setBanks(await getBanks());
-    setTransfers(await getTransfers({ includeDeleted: true }));
-    // Fetch owners
-    const allUsers = await getUsers();
-    setOwners((allUsers || []).filter((u: User) => u.role === 'OWNER'));
-    // Fetch all transactions to find HEAD_OFFICE expenses
-    const allTx = await getTransactions({ role: 'ADMIN', includeDeleted: true } as any);
-    setAllTransactions(allTx || []);
-    const hoExpenses = (allTx || []).filter((t: Transaction) => 
-      t.type === TransactionType.EXPENSE && 
-      t.buildingId === 'HEAD_OFFICE' &&
-      !(t as any).deleted
+    const transfersList = await getTransfers({ includeDeleted: true });
+    setTransfers(transfersList);
+    const allUsers = await getUsersAcrossBooks();
+    let allTx: any[] = (await getTransactions({ role: 'ADMIN', includeDeleted: true } as any)) || [];
+    allTx = allTx.map((t: any) => ({ ...t, _bookId: (t as any)._bookId || activeBookId }));
+    if (mergeOtherBooks) {
+      const seen = new Set(allTx.map((t: any) => `${(t as any)._bookId}:${t.id}`));
+      for (const bk of bookList) {
+        if (bk.id === activeBookId) continue;
+        try {
+          const data = await getDataFromBook(bk.id);
+          for (const t of data.transactions || []) {
+            const key = `${bk.id}:${t.id}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            if ((t as any).deleted) continue;
+            allTx.push({ ...t, _bookId: bk.id });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    setAllTransactions(allTx);
+
+    const roleKey = (r: any) => String(r || '').trim().toUpperCase();
+    const isLikelyOwnerProfile = (u: any) => {
+      if (!u) return false;
+      if (roleKey(u.role) === roleKey(UserRole.OWNER)) return true;
+      if (u.isOwner === true || String(u.isOwner).toLowerCase() === 'true') return true;
+      if (Array.isArray(u.ownerBuildingIds) && u.ownerBuildingIds.length > 0) return true;
+      const sp = Number(u.sharePercentage);
+      return Number.isFinite(sp) && sp > 0;
+    };
+
+    const refOwnerIds = new Set<string>();
+    const addRefOwner = (id?: string) => {
+      const s = String(id || '').trim();
+      if (s) refOwnerIds.add(s);
+    };
+    for (const tr of transfersList || []) {
+      const ft = String((tr as any)?.fromType || '').toUpperCase();
+      const tt = String((tr as any)?.toType || '').toUpperCase();
+      if (ft === 'OWNER') addRefOwner((tr as any).fromId);
+      if (tt === 'OWNER') addRefOwner((tr as any).toId);
+    }
+    for (const t of allTx || []) {
+      addRefOwner((t as any).ownerId);
+    }
+
+    const byOwnerId = new Map<string, any>();
+    for (const u of allUsers || []) {
+      if (!isLikelyOwnerProfile(u)) continue;
+      byOwnerId.set(String(u.id), u);
+    }
+    for (const rid of refOwnerIds) {
+      const full = String(rid).trim();
+      if (!full || byOwnerId.has(full)) continue;
+      const stripped = rawOf(full);
+      const match =
+        (allUsers || []).find((x: any) => String(x.id) === full) ||
+        (stripped && stripped !== full ? (allUsers || []).find((x: any) => String(x.id) === stripped) : undefined);
+      if (match) byOwnerId.set(String(match.id), match);
+    }
+    const uniqOwners = Array.from(byOwnerId.values());
+    uniqOwners.sort((a: any, b: any) =>
+      treasuryUserLabel(a).localeCompare(treasuryUserLabel(b), undefined, { sensitivity: 'base' }),
+    );
+    setOwners(uniqOwners as any);
+    const hoExpenses = (allTx || []).filter(
+      (t: Transaction) =>
+        t.type === TransactionType.EXPENSE &&
+        t.buildingId === 'HEAD_OFFICE' &&
+        !(t as any).deleted &&
+        String((t as any)._bookId || activeBookId) === String(activeBookId),
     );
     setHeadOfficeExpenses(hoExpenses);
   };
@@ -217,8 +833,6 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       if (fromId === toId) { showError('Source and destination buildings must be different'); return; }
     }
 
-    const isAdminOrHead = currentUser.role === UserRole.ADMIN || currentUser.role === 'HEAD';
-    
     const transfer: Transfer = {
       id: crypto.randomUUID(),
       date,
@@ -263,6 +877,16 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     return match;
   };
 
+  const labelOwnerExpenseBuilding = (tx: any): string => {
+    const txBook = String((tx as any)._bookId || activeBookId);
+    const rawBid = String((tx as any).buildingId || '').trim();
+    if (!rawBid || rawBid === 'HEAD_OFFICE') return 'Head Office';
+    const id = txBook === activeBookId ? rawBid : `${txBook}:${rawBid}`;
+    const b = findBookBuilding(id);
+    if (b) return b.bookId === activeBookId ? String(b.name || b.rawId) : `${b.name} · ${b.bookName}`;
+    return String((tx as any).buildingName || rawBid);
+  };
+
   // Build option groups for building dropdowns, with the active book first and
   // other books (if any) rendered as separate <optgroup>s.
   const renderBuildingOptions = () => {
@@ -305,11 +929,31 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     return label;
   };
 
+  const getOwnerDisplayName = (id?: string): string => {
+    const v = String(id || '').trim();
+    if (!v) return '';
+    const stripped = rawOf(v) || v;
+    const candidates = Array.from(new Set([v, stripped].filter(Boolean)));
+    for (const cand of candidates) {
+      const o = owners.find((x: any) => String(x.id) === cand);
+      const nm = treasuryUserLabel(o);
+      if (nm) return nm;
+    }
+    const resolved = resolveOwnerId(v) || resolveOwnerId(stripped);
+    if (resolved) {
+      const o = owners.find((x: any) => String(x.id) === resolved);
+      const lab = treasuryUserLabel(o);
+      if (lab) return lab;
+    }
+    return v;
+  };
+
   const getBuildingName = (id?: string, type?: string) => {
     if (!id || id === 'HEAD_OFFICE') return 'Head Office';
-    if (type === 'OWNER') {
-      const owner = owners.find(o => o.id === id);
-      return owner ? owner.name : id;
+    const ty = treTy(type);
+    const idStripped = rawOf(String(id));
+    if (ty === 'OWNER') {
+      return getOwnerDisplayName(id);
     }
     const b = findBookBuilding(id);
     if (b) {
@@ -318,9 +962,13 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     }
     const bank = banks.find(x => x.name === id);
     if (bank) return bank.name;
-    // Check if it's an owner ID
-    const owner = owners.find(o => o.id === id);
-    if (owner) return owner.name;
+    // Owner id stored without OWNER type (legacy / imports)
+    const ownerGuess = owners.find((o: any) => String(o.id) === String(id) || String(o.id) === String(idStripped));
+    if (ownerGuess) return treasuryUserLabel(ownerGuess);
+    if (ty !== 'BUILDING' && ty !== 'BANK' && ty !== 'HEAD_OFFICE') {
+      const guessName = getOwnerDisplayName(id);
+      if (guessName && guessName !== id) return guessName;
+    }
     return id;
   };
 
@@ -423,8 +1071,20 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   };
 
   const handleEditTransferOpen = (transfer: Transfer) => {
+    if (!isAdmin) {
+      showError('Only administrators can edit treasury transfers.');
+      return;
+    }
     setEditTransferItem(transfer);
     setEditTransferDate(transfer.date);
+    setEditTransferFromType(transfer.fromType);
+    setEditTransferToType(transfer.toType);
+    setEditTransferFromId(transfer.fromId || '');
+    setEditTransferToId(transfer.toId || '');
+    setEditTransferAmount(String(transfer.amount || ''));
+    setEditTransferPurpose(transfer.purpose || '');
+    setEditTransferNotes(transfer.notes || '');
+    setEditTransferStatus(transfer.status || 'COMPLETED');
     setEditTransferPaymentMethod(transfer.paymentMethod || 'CASH');
     setEditTransferFromBank(transfer.fromBankName || transfer.bankName || '');
     setEditTransferToBank(transfer.toBankName || '');
@@ -432,7 +1092,38 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   };
 
   const handleEditTransferSubmit = () => {
+    if (!isAdmin) {
+      showError('Only administrators can edit treasury transfers.');
+      return;
+    }
     if (!editTransferItem || !editTransferDate) return;
+    const nextAmount = parseFloat(editTransferAmount);
+    if (!nextAmount || nextAmount <= 0) {
+      showError('Enter a valid amount');
+      return;
+    }
+    const normalizedFromId = editTransferFromType === 'HEAD_OFFICE' ? 'HEAD_OFFICE' : editTransferFromId;
+    const normalizedToId = editTransferToType === 'HEAD_OFFICE' ? 'HEAD_OFFICE' : editTransferToId;
+    if (editTransferFromType !== 'HEAD_OFFICE' && !normalizedFromId) {
+      showError('Select the source account');
+      return;
+    }
+    if (editTransferToType !== 'HEAD_OFFICE' && !normalizedToId) {
+      showError('Select the destination account');
+      return;
+    }
+    if (editTransferFromType === editTransferToType && normalizedFromId === normalizedToId) {
+      showError('Source and destination must be different');
+      return;
+    }
+    if (!editTransferPurpose.trim()) {
+      showError('Enter a purpose');
+      return;
+    }
+    if (!editTransferNotes.trim()) {
+      showError('Enter notes');
+      return;
+    }
     const needsBanks = editTransferPaymentMethod === 'BANK' || editTransferPaymentMethod === 'CHEQUE';
     if (needsBanks && (!editTransferFromBank || !editTransferToBank)) {
       showError('Select both From Bank and To Bank');
@@ -440,11 +1131,16 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     }
     const pmLabel: Record<string, string> = { BANK: 'Bank Transfer', CASH: 'Cash', CHEQUE: 'Cheque' };
     const lines = [
-      '⚠ Please verify before saving:',
+      'Please verify before saving:',
       '',
       `Date: ${editTransferDate}`,
+      `From: ${getBuildingName(normalizedFromId, editTransferFromType)}`,
+      `To: ${getBuildingName(normalizedToId, editTransferToType)}`,
+      `Amount: ${nextAmount.toLocaleString()} SAR`,
+      `Purpose: ${editTransferPurpose.trim()}`,
       `Payment Method: ${pmLabel[editTransferPaymentMethod] || editTransferPaymentMethod}`,
       ...(needsBanks ? [`From Bank: ${editTransferFromBank}`, `To Bank: ${editTransferToBank}`] : []),
+      `Status: ${editTransferStatus}`,
       '',
       'Is this information correct?',
     ];
@@ -452,6 +1148,14 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       const updated: Transfer = {
         ...editTransferItem!,
         date: editTransferDate,
+        fromType: editTransferFromType,
+        toType: editTransferToType,
+        fromId: normalizedFromId,
+        toId: normalizedToId,
+        amount: nextAmount,
+        purpose: editTransferPurpose.trim(),
+        notes: editTransferNotes.trim(),
+        status: editTransferStatus,
         paymentMethod: editTransferPaymentMethod,
         bankName: needsBanks ? editTransferFromBank : undefined,
         fromBankName: needsBanks ? editTransferFromBank : undefined,
@@ -475,11 +1179,41 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     await loadData();
   };
 
-  const isAdminOrHead = currentUser.role === UserRole.ADMIN || currentUser.role === 'HEAD';
-
   // Get staff's assigned buildings
   const userBuildingIds = currentUser.buildingIds || (currentUser.buildingId ? [currentUser.buildingId] : []);
   const isStaff = !isAdminOrHead && currentUser.role !== UserRole.OWNER;
+
+  const canCrossBookTreasuryControls =
+    currentUser.role === UserRole.ADMIN ||
+    (currentUser as any).role === 'HEAD' ||
+    currentUser.role === UserRole.OWNER ||
+    currentUser.role === UserRole.MANAGER;
+
+  // ── Date presets (Treasury list) ───────────────────────────────────────────
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  const startOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth(), 1);
+  const endOfMonth = (d: Date) => new Date(d.getFullYear(), d.getMonth() + 1, 0);
+  const applyDatePreset = (preset: 'ALL' | 'THIS_MONTH' | 'LAST_MONTH' | 'CUSTOM') => {
+    setDatePreset(preset);
+    const now = new Date();
+    if (preset === 'ALL') {
+      setFilterFromDate('');
+      setFilterToDate('');
+      return;
+    }
+    if (preset === 'THIS_MONTH') {
+      setFilterFromDate(iso(startOfMonth(now)));
+      setFilterToDate(iso(endOfMonth(now)));
+      return;
+    }
+    if (preset === 'LAST_MONTH') {
+      const last = new Date(now.getFullYear(), now.getMonth() - 1, 15);
+      setFilterFromDate(iso(startOfMonth(last)));
+      setFilterToDate(iso(endOfMonth(last)));
+      return;
+    }
+    // CUSTOM: keep current values
+  };
 
   const filteredTransfers = transfers.filter(t => {
     // First filter by deleted status
@@ -487,11 +1221,14 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     if (filterStatus !== 'ALL' && t.status !== filterStatus) return false;
     if (filterFromDate && t.date < filterFromDate) return false;
     if (filterToDate && t.date > filterToDate) return false;
+    if (filterFromType !== 'ALL' && treTy(t.fromType) !== filterFromType) return false;
+    if (filterToType !== 'ALL' && treTy(t.toType) !== filterToType) return false;
+    if (!matchesAnyBuilding(t, filterBuildingIds)) return false;
 
     // Account / Building filter
     if (filterAccount !== 'ALL') {
       if (filterAccount === 'HEAD_OFFICE') {
-        if (t.fromType !== 'HEAD_OFFICE' && t.toType !== 'HEAD_OFFICE') return false;
+        if (treTy(t.fromType) !== 'HEAD_OFFICE' && treTy(t.toType) !== 'HEAD_OFFICE') return false;
       } else {
         // building id
         if (t.fromId !== filterAccount && t.toId !== filterAccount) return false;
@@ -514,8 +1251,8 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   const officeOpeningBalance = transfers.filter(t => t.isOfficeOpeningBalance && !(t as any).deleted).reduce((s, t) => s + t.amount, 0);
   
   // Exclude office opening balance from transfer totals
-  const totalIn = filteredTransfers.filter(t => t.toType === 'HEAD_OFFICE' && !t.isOfficeOpeningBalance).reduce((s, t) => s + t.amount, 0);
-  const totalOut = filteredTransfers.filter(t => t.fromType === 'HEAD_OFFICE' && !t.isOfficeOpeningBalance).reduce((s, t) => s + t.amount, 0);
+  const totalIn = filteredTransfers.filter(t => treTy(t.toType) === 'HEAD_OFFICE' && !t.isOfficeOpeningBalance).reduce((s, t) => s + t.amount, 0);
+  const totalOut = filteredTransfers.filter(t => treTy(t.fromType) === 'HEAD_OFFICE' && !t.isOfficeOpeningBalance).reduce((s, t) => s + t.amount, 0);
   
   // Calculate HEAD_OFFICE expenses (filtered by date range if set)
   const filteredHOExpenses = headOfficeExpenses.filter(t => {
@@ -529,7 +1266,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   const netBalance = officeOpeningBalance + totalIn - totalOut - totalHOExpenses;
 
   // Inter-building transfer totals (do not affect Head Office balance)
-  const interBuildingTransfers = filteredTransfers.filter(t => t.fromType === 'BUILDING' && t.toType === 'BUILDING');
+  const interBuildingTransfers = filteredTransfers.filter(t => treTy(t.fromType) === 'BUILDING' && treTy(t.toType) === 'BUILDING');
   const interBuildingTotal = interBuildingTransfers.reduce((s, t) => s + t.amount, 0);
 
   const handleSaveOpeningBalance = async () => {
@@ -574,21 +1311,25 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     originalExpense: exp
   }));
 
+  /** Single-line From → To for table, CSV, and mobile. */
+  const transferRouteText = (tx: any): string => {
+    if (tx.isOfficeOpeningBalance) return 'Old System → Head Office';
+    if ((tx as any).isHOExpense) return `Head Office → ${String(tx.toId || 'Expense')}`;
+    return `${getBuildingName(tx.fromId, tx.fromType)} → ${getBuildingName(tx.toId, tx.toType)}`;
+  };
+
   // Combined entries: transfers + HO expenses, sorted by date descending
   const combinedEntries = [...filteredTransfers.map(tx => ({ ...tx, isHOExpense: false })), ...hoExpenseEntries]
     .sort((a, b) => b.date.localeCompare(a.date));
 
   const handleExportCSV = () => {
-    const headers = ['Date', 'Type', 'From', 'To', 'Amount (SAR)', 'Purpose', 'Status', 'Payment Method'];
+    const headers = ['Date', 'From → To', 'Amount (SAR)', 'Purpose', 'Status'];
     const rows = combinedEntries.map(tx => [
       tx.date,
-      (tx as any).isHOExpense ? 'Expense' : 'Transfer',
-      getBuildingName(tx.fromId, tx.fromType),
-      (tx as any).isHOExpense ? tx.toId : getBuildingName(tx.toId, tx.toType),
+      `"${transferRouteText(tx).replace(/"/g, '""')}"`,
       tx.amount.toLocaleString(),
       tx.purpose,
-      tx.status,
-      `"${formatPaymentMethod(tx).replace(/"/g, '""')}"`
+      (tx as any).isHOExpense ? 'EXPENSE' : tx.status,
     ]);
     const csv = [headers, ...rows].map(r => r.join(',')).join('\n');
     const blob = new Blob([csv], { type: 'text/csv' });
@@ -629,7 +1370,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     // Helper: does a transfer/expense entry belong to this account?
     const belongsToAccount = (tx: any): boolean => {
       if (accountKey === 'ALL') return true;
-      if (accountKey === 'HEAD_OFFICE') return tx.fromType === 'HEAD_OFFICE' || tx.toType === 'HEAD_OFFICE' || tx.fromId === 'HEAD_OFFICE' || tx.toId === 'HEAD_OFFICE';
+      if (accountKey === 'HEAD_OFFICE') return treTy(tx.fromType) === 'HEAD_OFFICE' || treTy(tx.toType) === 'HEAD_OFFICE' || tx.fromId === 'HEAD_OFFICE' || tx.toId === 'HEAD_OFFICE';
       return tx.fromId === accountKey || tx.toId === accountKey;
     };
 
@@ -650,7 +1391,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
         };
       }
       const isSource = (accountKey === 'HEAD_OFFICE')
-        ? (tx.fromType === 'HEAD_OFFICE' || tx.fromId === 'HEAD_OFFICE')
+        ? (treTy(tx.fromType) === 'HEAD_OFFICE' || tx.fromId === 'HEAD_OFFICE')
         : tx.fromId === accountKey;
       if (isSource) {
         return { debit: amt, credit: 0, counterparty: getBuildingName(tx.toId, tx.toType) };
@@ -685,7 +1426,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       if (filterStatus !== 'ALL' && t.status !== filterStatus) return false;
       if (filterAccount !== 'ALL') {
         if (filterAccount === 'HEAD_OFFICE') {
-          if (t.fromType !== 'HEAD_OFFICE' && t.toType !== 'HEAD_OFFICE') return false;
+          if (treTy(t.fromType) !== 'HEAD_OFFICE' && treTy(t.toType) !== 'HEAD_OFFICE') return false;
         } else {
           if (t.fromId !== filterAccount && t.toId !== filterAccount) return false;
         }
@@ -1071,7 +1812,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
 
       <div class="footer">
         <div class="footer-text">Computer-generated account statement. For internal records only.</div>
-        <div class="footer-badge"><img src="${window.location.origin}/images/logo.png" alt="" onerror="this.style.display='none'"/> Powered by Amlak</div>
+        <div class="footer-badge"><img src="${window.location.origin}/images/cologo.png" alt="" onerror="this.style.display='none'"/> Powered by Amlak</div>
       </div>
     </div>
 
@@ -1115,11 +1856,22 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
 
       {view === 'FORM' || isStaff ? (
         <form onSubmit={handleSubmit} className="ios-card premium-card p-5 sm:p-6 space-y-6">
-          <div className="flex justify-between items-center pb-4 border-b border-slate-100">
+          <div className="flex justify-between items-start gap-3 pb-4 border-b border-slate-100">
             <div>
               <h2 className="text-xl font-bold text-slate-900">New Money Transfer</h2>
               <p className="text-xs font-medium text-slate-500 mt-1">Move funds between buildings, head office, and owners — including inter-building transfers (separate books).</p>
             </div>
+
+            {isAdminOrHead && (
+              <button
+                type="button"
+                onClick={() => setShowImportModal(true)}
+                className="shrink-0 px-3 py-2 bg-slate-900 text-white rounded-xl text-xs sm:text-sm font-black flex items-center gap-2 hover:bg-slate-800 shadow-sm"
+                title="Bulk import transfers (CSV/XLSX)"
+              >
+                <Upload size={16} /> Bulk Import
+              </button>
+            )}
           </div>
 
           {/* Office Opening Balance Toggle - ADMIN only */}
@@ -1217,30 +1969,58 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
               
               <div className="space-y-2">
                 <label className="text-[11px] font-bold text-slate-500 uppercase">Source Type</label>
-                <select value={fromType} onChange={e => { setFromType(e.target.value as any); setFromId(''); }} className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500">
-                  <option value="BUILDING">{t('entry.building')}</option>
-                  <option value="HEAD_OFFICE">Head Office</option>
-                  <option value="OWNER">Owner</option>
-                </select>
+                <SearchableSelect
+                  options={[
+                    { value: 'BUILDING', label: t('entry.building') as any },
+                    { value: 'HEAD_OFFICE', label: 'Head Office' },
+                    { value: 'OWNER', label: 'Owner' },
+                  ]}
+                  value={fromType}
+                  onChange={(v) => { setFromType((v || 'BUILDING') as any); setFromId(''); }}
+                  className="font-bold"
+                />
               </div>
 
               {fromType === 'BUILDING' && (
                 <div className="space-y-2">
-                  <label className="text-[11px] font-bold text-slate-500 uppercase">Select Building</label>
-                  <select value={fromId} onChange={e => setFromId(e.target.value)} required className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500">
-                    <option value="">Choose building...</option>
-                    {renderBuildingOptions()}
-                  </select>
+                  <label className="text-[11px] font-bold text-slate-500 uppercase">Which building?</label>
+                  <SearchableSelect
+                    options={buildings.map((b) => ({ value: b.id, label: b.name || b.rawId || b.id, sublabel: b.bookName ? `${b.bookName}${b.bookId === activeBookId ? ' (current)' : ''}` : '' }))}
+                    value={fromId}
+                    onChange={(v) => setFromId(v)}
+                    className="font-bold"
+                    placeholder="Select source building..."
+                  />
+                  {!fromId && <p className="text-[10px] text-rose-600 font-bold">Select the source building.</p>}
                 </div>
               )}
 
               {fromType === 'OWNER' && (
                 <div className="space-y-2">
-                  <label className="text-[11px] font-bold text-slate-500 uppercase">Select Owner</label>
-                  <select value={fromId} onChange={e => setFromId(e.target.value)} required className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500">
-                    <option value="">Choose owner...</option>
-                    {owners.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
-                  </select>
+                  <label className="text-[11px] font-bold text-slate-500 uppercase">Which owner?</label>
+                  <SearchableSelect
+                    options={[
+                      ...(fromId && !owners.some((o: any) => String(o.id) === String(fromId))
+                        ? [{ value: String(fromId), label: getOwnerDisplayName(fromId) }]
+                        : []),
+                      ...owners.map((o: any) => ({
+                        value: String(o.id),
+                        label: treasuryUserLabel(o) || String(o.id),
+                        sublabel: o.email && treasuryUserLabel(o) !== String(o.email) ? String(o.email) : undefined,
+                      })),
+                    ]}
+                    value={fromId}
+                    onChange={(v) => setFromId(v)}
+                    className="font-bold"
+                    placeholder="Select owner..."
+                  />
+                  {fromId ? (
+                    <p className="text-[11px] font-bold text-purple-800">
+                      Owner: <span className="text-slate-800">{getOwnerDisplayName(fromId)}</span>
+                    </p>
+                  ) : (
+                    <p className="text-[10px] text-rose-600 font-bold">Select the source owner.</p>
+                  )}
                 </div>
               )}
             </div>
@@ -1250,30 +2030,58 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
               
               <div className="space-y-2">
                 <label className="text-[11px] font-bold text-slate-500 uppercase">Destination Type</label>
-                <select value={toType} onChange={e => { setToType(e.target.value as any); setToId(''); }} className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500">
-                  <option value="BUILDING">{t('entry.building')}</option>
-                  <option value="HEAD_OFFICE">Head Office</option>
-                  <option value="OWNER">Owner</option>
-                </select>
+                <SearchableSelect
+                  options={[
+                    { value: 'BUILDING', label: t('entry.building') as any },
+                    { value: 'HEAD_OFFICE', label: 'Head Office' },
+                    { value: 'OWNER', label: 'Owner' },
+                  ]}
+                  value={toType}
+                  onChange={(v) => { setToType((v || 'BUILDING') as any); setToId(''); }}
+                  className="font-bold"
+                />
               </div>
 
               {toType === 'BUILDING' && (
                 <div className="space-y-2">
-                  <label className="text-[11px] font-bold text-slate-500 uppercase">Select Building</label>
-                  <select value={toId} onChange={e => setToId(e.target.value)} required className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500">
-                    <option value="">Choose building...</option>
-                    {renderBuildingOptions()}
-                  </select>
+                  <label className="text-[11px] font-bold text-slate-500 uppercase">Which building?</label>
+                  <SearchableSelect
+                    options={buildings.map((b) => ({ value: b.id, label: b.name || b.rawId || b.id, sublabel: b.bookName ? `${b.bookName}${b.bookId === activeBookId ? ' (current)' : ''}` : '' }))}
+                    value={toId}
+                    onChange={(v) => setToId(v)}
+                    className="font-bold"
+                    placeholder="Select destination building..."
+                  />
+                  {!toId && <p className="text-[10px] text-rose-600 font-bold">Select the destination building.</p>}
                 </div>
               )}
 
               {toType === 'OWNER' && (
                 <div className="space-y-2">
-                  <label className="text-[11px] font-bold text-slate-500 uppercase">Select Owner</label>
-                  <select value={toId} onChange={e => setToId(e.target.value)} required className="w-full px-4 py-3 bg-white border border-slate-300 rounded-xl text-sm font-bold outline-none focus:ring-2 focus:ring-blue-500">
-                    <option value="">Choose owner...</option>
-                    {owners.map(o => <option key={o.id} value={o.id}>{o.name}</option>)}
-                  </select>
+                  <label className="text-[11px] font-bold text-slate-500 uppercase">Which owner?</label>
+                  <SearchableSelect
+                    options={[
+                      ...(toId && !owners.some((o: any) => String(o.id) === String(toId))
+                        ? [{ value: String(toId), label: getOwnerDisplayName(toId) }]
+                        : []),
+                      ...owners.map((o: any) => ({
+                        value: String(o.id),
+                        label: treasuryUserLabel(o) || String(o.id),
+                        sublabel: o.email && treasuryUserLabel(o) !== String(o.email) ? String(o.email) : undefined,
+                      })),
+                    ]}
+                    value={toId}
+                    onChange={(v) => setToId(v)}
+                    className="font-bold"
+                    placeholder="Select owner..."
+                  />
+                  {toId ? (
+                    <p className="text-[11px] font-bold text-purple-800">
+                      Owner: <span className="text-slate-800">{getOwnerDisplayName(toId)}</span>
+                    </p>
+                  ) : (
+                    <p className="text-[10px] text-rose-600 font-bold">Select the destination owner.</p>
+                  )}
                 </div>
               )}
             </div>
@@ -1395,77 +2203,288 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
         </form>
       ) : (
         <div className="space-y-6">
-          <div className="grid grid-cols-2 md:grid-cols-6 gap-4 md:gap-6">
-            <div className="ios-card p-4 md:p-6 bg-gradient-to-br from-amber-50 to-orange-50 border border-amber-200">
-              <div className="text-xs font-bold text-amber-700 uppercase mb-2 flex items-center gap-1"><Wallet size={12} /> Opening Balance</div>
-              <div className="text-2xl md:text-3xl font-black text-amber-600">{officeOpeningBalance.toLocaleString()} <span className="text-sm text-amber-400">{t('common.sar')}</span></div>
+          {/* stat-card (not ios-card): global .light .ios-card div { color !important } was overriding amount colors */}
+          <div className="grid grid-cols-1 min-[400px]:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-6 gap-3 sm:gap-4">
+            <div className="stat-card stat-card-amber min-w-0 bg-gradient-to-br from-amber-50/95 to-orange-50/90 dark:from-amber-950/35 dark:to-orange-950/25 border-amber-200/80 dark:border-amber-500/25 shadow-sm hover:shadow-md transition-shadow">
+              <div className="stat-label !opacity-100 flex items-center gap-1.5 text-amber-900 dark:text-amber-200">
+                <Wallet size={14} className="shrink-0 opacity-90" aria-hidden />
+                Opening Balance
+              </div>
+              <div className="stat-value text-2xl md:text-3xl tabular-nums text-amber-700 dark:text-amber-300">
+                {officeOpeningBalance.toLocaleString()}
+                <span className="text-[0.55em] font-bold text-amber-600 dark:text-amber-400 ml-1">{t('common.sar')}</span>
+              </div>
             </div>
-            <div className="ios-card p-4 md:p-6">
-              <div className="text-xs font-bold text-slate-500 uppercase mb-2">Transfers In</div>
-              <div className="text-2xl md:text-3xl font-black text-emerald-600">{totalIn.toLocaleString()} <span className="text-sm text-slate-400">{t('common.sar')}</span></div>
+            <div className="stat-card stat-card-emerald min-w-0 dark:border-emerald-500/20 shadow-sm hover:shadow-md transition-shadow">
+              <div className="stat-label !opacity-100 text-emerald-900 dark:text-emerald-200">Transfers In</div>
+              <div className="stat-value text-2xl md:text-3xl tabular-nums text-emerald-700 dark:text-emerald-300">
+                {totalIn.toLocaleString()}
+                <span className="text-[0.55em] font-bold text-emerald-600 dark:text-emerald-400 ml-1">{t('common.sar')}</span>
+              </div>
             </div>
-            <div className="ios-card p-4 md:p-6">
-              <div className="text-xs font-bold text-slate-500 uppercase mb-2">Transfers Out</div>
-              <div className="text-2xl md:text-3xl font-black text-rose-600">{totalOut.toLocaleString()} <span className="text-sm text-slate-400">{t('common.sar')}</span></div>
+            <div className="stat-card stat-card-rose min-w-0 dark:border-rose-500/20 shadow-sm hover:shadow-md transition-shadow">
+              <div className="stat-label !opacity-100 text-rose-900 dark:text-rose-200">Transfers Out</div>
+              <div className="stat-value text-2xl md:text-3xl tabular-nums text-rose-700 dark:text-rose-300">
+                {totalOut.toLocaleString()}
+                <span className="text-[0.55em] font-bold text-rose-600 dark:text-rose-400 ml-1">{t('common.sar')}</span>
+              </div>
             </div>
-            <div className="ios-card p-4 md:p-6 bg-gradient-to-br from-indigo-50 to-violet-50 border border-indigo-200">
-              <div className="text-xs font-bold text-indigo-700 uppercase mb-2 flex items-center gap-1"><Shuffle size={12} /> Inter-Building</div>
-              <div className="text-2xl md:text-3xl font-black text-indigo-600">{interBuildingTotal.toLocaleString()} <span className="text-sm text-indigo-400">{t('common.sar')}</span></div>
-              <div className="text-[10px] text-indigo-500 mt-1">{interBuildingTransfers.length} transfer(s)</div>
+            <div className="stat-card stat-card-indigo min-w-0 bg-gradient-to-br from-indigo-50/95 to-violet-50/90 dark:from-indigo-950/35 dark:to-violet-950/25 border-indigo-200/80 dark:border-indigo-500/25 shadow-sm hover:shadow-md transition-shadow">
+              <div className="stat-label !opacity-100 flex items-center gap-1.5 text-indigo-900 dark:text-indigo-200">
+                <Shuffle size={14} className="shrink-0 opacity-90" aria-hidden />
+                Inter-Building
+              </div>
+              <div className="stat-value text-2xl md:text-3xl tabular-nums text-indigo-700 dark:text-indigo-300">
+                {interBuildingTotal.toLocaleString()}
+                <span className="text-[0.55em] font-bold text-indigo-600 dark:text-indigo-400 ml-1">{t('common.sar')}</span>
+              </div>
+              <div className="stat-sub !opacity-100 text-indigo-700 dark:text-indigo-400 mt-1">{interBuildingTransfers.length} transfer(s)</div>
             </div>
-            <div className="ios-card p-4 md:p-6">
-              <div className="text-xs font-bold text-slate-500 uppercase mb-2">Expenses</div>
-              <div className="text-2xl md:text-3xl font-black text-amber-600">{totalHOExpenses.toLocaleString()} <span className="text-sm text-slate-400">{t('common.sar')}</span></div>
+            <div className="stat-card stat-card-violet min-w-0 dark:border-violet-500/20 shadow-sm hover:shadow-md transition-shadow">
+              <div className="stat-label !opacity-100 text-violet-900 dark:text-violet-200">Expenses</div>
+              <div className="stat-value text-2xl md:text-3xl tabular-nums text-orange-700 dark:text-orange-300">
+                {totalHOExpenses.toLocaleString()}
+                <span className="text-[0.55em] font-bold text-orange-600 dark:text-orange-400 ml-1">{t('common.sar')}</span>
+              </div>
             </div>
-            <div className="ios-card p-4 md:p-6">
-              <div className="text-xs font-bold text-slate-500 uppercase mb-2">Net Balance</div>
-              <div className={`text-2xl md:text-3xl font-black ${netBalance >= 0 ? 'text-slate-800' : 'text-rose-600'}`}>{netBalance.toLocaleString()} <span className="text-sm text-slate-400">{t('common.sar')}</span></div>
+            <div className="stat-card stat-card-slate min-w-0 dark:border-slate-500/30 shadow-sm hover:shadow-md transition-shadow ring-1 ring-slate-900/5 dark:ring-white/10">
+              <div className="stat-label !opacity-100 text-slate-700 dark:text-slate-300">Net Balance</div>
+              <div className={`stat-value text-2xl md:text-3xl tabular-nums ${netBalance >= 0 ? 'text-slate-900 dark:text-slate-100' : 'text-rose-700 dark:text-rose-300'}`}>
+                {netBalance.toLocaleString()}
+                <span className={`text-[0.55em] font-bold ml-1 ${netBalance >= 0 ? 'text-slate-600 dark:text-slate-400' : 'text-rose-600 dark:text-rose-400'}`}>{t('common.sar')}</span>
+              </div>
             </div>
           </div>
 
           <div className="ios-card p-6">
             <div className="flex flex-wrap gap-2 sm:gap-3 items-center mb-6">
-              <input type="date" value={filterFromDate} onChange={e => setFilterFromDate(e.target.value)} className="px-3 py-2 border rounded-xl text-sm" placeholder={t('invoice.from')} />
-              <input type="date" value={filterToDate} onChange={e => setFilterToDate(e.target.value)} className="px-3 py-2 border rounded-xl text-sm" placeholder="To" />
-              <select value={filterAccount} onChange={e => setFilterAccount(e.target.value)} className="px-3 py-2 border rounded-xl text-sm font-semibold bg-white" title="Filter by account">
-                <option value="ALL">All Accounts</option>
-                <option value="HEAD_OFFICE">Head Office</option>
-                {(() => {
-                  const groups = new Map<string, { bookName: string; items: BookBuilding[] }>();
-                  buildings.forEach(b => {
-                    if (!groups.has(b.bookId)) groups.set(b.bookId, { bookName: b.bookName, items: [] });
-                    groups.get(b.bookId)!.items.push(b);
-                  });
-                  const ordered = Array.from(groups.entries()).sort((a, b) => {
-                    if (a[0] === activeBookId) return -1;
-                    if (b[0] === activeBookId) return 1;
-                    return a[1].bookName.localeCompare(b[1].bookName);
-                  });
-                  if (ordered.length <= 1) {
-                    return (
-                      <optgroup label="Buildings">
-                        {(ordered[0]?.items || buildings).map(b => (
-                          <option key={b.id} value={b.id}>{b.name}</option>
-                        ))}
-                      </optgroup>
-                    );
-                  }
-                  return ordered.map(([bookId, g]) => (
-                    <optgroup key={bookId} label={`${g.bookName}${bookId === activeBookId ? ' (current)' : ''}`}>
-                      {g.items.map(b => (
-                        <option key={b.id} value={b.id}>{b.name}</option>
-                      ))}
-                    </optgroup>
-                  ));
-                })()}
-              </select>
-              <select value={filterStatus} onChange={e => setFilterStatus(e.target.value as any)} className="px-3 py-2 border rounded-xl text-sm">
-                <option value="ALL">{t('history.allStatus')}</option>
-                <option value="PENDING">{t('common.pending')}</option>
-                <option value="COMPLETED">Completed</option>
-                <option value="CANCELLED">Cancelled</option>
-              </select>
-              <button onClick={() => { setFilterFromDate(''); setFilterToDate(''); setFilterStatus('ALL'); setFilterAccount('ALL'); }} className="px-3 py-2 bg-slate-100 rounded-xl text-sm">{t('common.reset')}</button>
+              {canCrossBookTreasuryControls && (books || []).length > 1 && (
+                <label className="flex items-center gap-2 px-3 py-2 rounded-xl border border-violet-200 bg-violet-50/90 cursor-pointer select-none shrink-0">
+                  <input
+                    type="checkbox"
+                    className="w-4 h-4 rounded border-slate-300 text-violet-600 focus:ring-violet-500"
+                    checked={includeOtherBooksInTreasury}
+                    onChange={(e) => {
+                      const v = e.target.checked;
+                      setIncludeOtherBooksInTreasury(v);
+                      try {
+                        localStorage.setItem('treasuryIncludeOtherBooks', v ? '1' : '0');
+                      } catch {
+                        /* ignore */
+                      }
+                    }}
+                  />
+                  <span className="text-[11px] font-black text-violet-900 leading-tight">
+                    All books: buildings &amp; data
+                  </span>
+                </label>
+              )}
+              <div className="flex items-center gap-1.5 bg-slate-50 border border-slate-200 rounded-xl p-1">
+                <button
+                  type="button"
+                  onClick={() => applyDatePreset('ALL')}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition-all ${datePreset === 'ALL' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-white'}`}
+                >
+                  All
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyDatePreset('THIS_MONTH')}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition-all ${datePreset === 'THIS_MONTH' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-white'}`}
+                >
+                  This month
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyDatePreset('LAST_MONTH')}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition-all ${datePreset === 'LAST_MONTH' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-white'}`}
+                >
+                  Last month
+                </button>
+                <button
+                  type="button"
+                  onClick={() => applyDatePreset('CUSTOM')}
+                  className={`px-2.5 py-1.5 rounded-lg text-[11px] font-black transition-all ${datePreset === 'CUSTOM' ? 'bg-slate-900 text-white shadow' : 'text-slate-600 hover:bg-white'}`}
+                  title="Use custom From/To dates"
+                >
+                  Custom
+                </button>
+              </div>
+
+              <input
+                type="date"
+                value={filterFromDate}
+                onChange={e => { setFilterFromDate(e.target.value); setDatePreset('CUSTOM'); }}
+                className="px-3 py-2 border rounded-xl text-sm"
+                placeholder={t('invoice.from')}
+              />
+              <input
+                type="date"
+                value={filterToDate}
+                onChange={e => { setFilterToDate(e.target.value); setDatePreset('CUSTOM'); }}
+                className="px-3 py-2 border rounded-xl text-sm"
+                placeholder="To"
+              />
+              <SearchableSelect
+                options={[
+                  { value: 'ALL', label: 'From: All' },
+                  { value: 'BUILDING', label: 'From: Building' },
+                  { value: 'HEAD_OFFICE', label: 'From: Head Office' },
+                  { value: 'OWNER', label: 'From: Owner' },
+                  { value: 'BANK', label: 'From: Bank' },
+                ]}
+                value={filterFromType}
+                onChange={(v) => setFilterFromType((v || 'ALL') as any)}
+                placeholder="From"
+                className="min-w-[160px]"
+              />
+              <SearchableSelect
+                options={[
+                  { value: 'ALL', label: 'To: All' },
+                  { value: 'BUILDING', label: 'To: Building' },
+                  { value: 'HEAD_OFFICE', label: 'To: Head Office' },
+                  { value: 'OWNER', label: 'To: Owner' },
+                  { value: 'BANK', label: 'To: Bank' },
+                ]}
+                value={filterToType}
+                onChange={(v) => setFilterToType((v || 'ALL') as any)}
+                placeholder="To"
+                className="min-w-[160px]"
+              />
+              <div className="relative">
+                <button
+                  ref={buildingTriggerRef}
+                  type="button"
+                  onClick={() => setShowBuildingPicker(v => !v)}
+                  className={`group flex items-center gap-2 px-3 py-2 bg-white border rounded-xl text-sm font-semibold shadow-sm transition-all ${
+                    showBuildingPicker ? 'border-violet-400 ring-2 ring-violet-200' : 'border-slate-200 hover:border-violet-300'
+                  }`}
+                  title="Filter by multiple buildings"
+                >
+                  <Building2 size={16} className={`${filterBuildingIds.length > 0 ? 'text-violet-600' : 'text-slate-400'}`} />
+                  <span className={`${filterBuildingIds.length > 0 ? 'text-slate-800' : 'text-slate-600'}`}>
+                    {filterBuildingIds.length === 0 ? 'Buildings: All' : `Buildings: ${filterBuildingIds.length}`}
+                  </span>
+                </button>
+                {showBuildingPicker && buildingPickerRect && typeof document !== 'undefined' && createPortal(
+                  <div
+                    ref={buildingPickerRef}
+                    style={{
+                      position: 'fixed',
+                      top: Math.min(buildingPickerRect.top + 6, window.innerHeight - 420),
+                      left: Math.max(8, Math.min(buildingPickerRect.left, window.innerWidth - Math.max(buildingPickerRect.width, 320) - 8)),
+                      width: Math.max(buildingPickerRect.width, 320),
+                      zIndex: 100000,
+                    }}
+                    className="rounded-2xl border border-violet-200 bg-white shadow-2xl overflow-hidden"
+                  >
+                    <div className="p-3 border-b border-slate-100 bg-gradient-to-r from-violet-50 to-indigo-50 flex items-center gap-2">
+                      <div className="text-xs font-black text-violet-700 uppercase tracking-widest">Select buildings</div>
+                      <div className="ml-auto flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => setFilterBuildingIds([])}
+                          className="px-2 py-1 rounded-lg text-[10px] font-black bg-white border border-slate-200 text-slate-600 hover:bg-slate-50"
+                        >
+                          Clear
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setFilterBuildingIds(buildings.map(b => b.id))}
+                          className="px-2 py-1 rounded-lg text-[10px] font-black bg-violet-600 text-white hover:bg-violet-700"
+                        >
+                          Select all
+                        </button>
+                      </div>
+                    </div>
+                    <div className="p-2 border-b border-slate-100">
+                      <input
+                        value={buildingPickerSearch}
+                        onChange={(e) => setBuildingPickerSearch(e.target.value)}
+                        placeholder="Search building..."
+                        className="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-semibold outline-none focus:ring-2 focus:ring-violet-200 focus:border-violet-300"
+                      />
+                    </div>
+                    <div className="max-h-[340px] overflow-auto p-2">
+                      {buildings.length === 0 && (
+                        <div className="p-4 text-xs text-slate-500 font-bold">No buildings</div>
+                      )}
+                      {buildings
+                        .filter((b) => {
+                          const q = buildingPickerSearch.trim().toLowerCase();
+                          if (!q) return true;
+                          const name = String(b.name || '').toLowerCase();
+                          const raw = String(b.rawId || '').toLowerCase();
+                          const book = String(b.bookName || '').toLowerCase();
+                          return name.includes(q) || raw.includes(q) || book.includes(q);
+                        })
+                        .map((b) => {
+                          const checked = filterBuildingIds.includes(b.id);
+                          return (
+                            <button
+                              key={b.id}
+                              type="button"
+                              onClick={() => {
+                                setFilterBuildingIds((prev) => checked ? prev.filter(x => x !== b.id) : [b.id, ...prev]);
+                              }}
+                              className={`w-full flex items-center gap-2 px-3 py-2 rounded-xl text-left transition-all ${
+                                checked ? 'bg-violet-50 border border-violet-200' : 'hover:bg-slate-50'
+                              }`}
+                            >
+                              <span className={`w-5 h-5 rounded-md border flex items-center justify-center ${checked ? 'bg-violet-600 border-violet-600' : 'bg-white border-slate-200'}`}>
+                                {checked && <Check size={14} className="text-white" />}
+                              </span>
+                              <div className="min-w-0 flex-1">
+                                <div className="text-sm font-bold text-slate-800 truncate">{b.name || b.rawId || b.id}</div>
+                                <div className="text-[10px] text-slate-500 truncate">{b.bookName}{b.bookId === activeBookId ? ' (current)' : ''}</div>
+                              </div>
+                            </button>
+                          );
+                        })}
+                    </div>
+                  </div>,
+                  document.body
+                )}
+              </div>
+              <SearchableSelect
+                options={[
+                  { value: 'ALL', label: 'All Accounts' },
+                  { value: 'HEAD_OFFICE', label: 'Head Office' },
+                  ...buildings.map((b) => ({ value: b.id, label: `${b.bookName ? b.bookName + ' · ' : ''}${b.name || b.rawId || b.id}` })),
+                ]}
+                value={filterAccount}
+                onChange={(v) => setFilterAccount(v || 'ALL')}
+                placeholder="Account"
+                className="min-w-[220px]"
+              />
+              <SearchableSelect
+                options={[
+                  { value: 'ALL', label: t('history.allStatus') as any },
+                  { value: 'PENDING', label: t('common.pending') as any },
+                  { value: 'COMPLETED', label: 'Completed' },
+                  { value: 'CANCELLED', label: 'Cancelled' },
+                ]}
+                value={filterStatus}
+                onChange={(v) => setFilterStatus((v || 'ALL') as any)}
+                placeholder="Status"
+                className="min-w-[160px]"
+              />
+              <button
+                onClick={() => {
+                  setFilterFromDate('');
+                  setFilterToDate('');
+                  setDatePreset('ALL');
+                  setFilterStatus('ALL');
+                  setFilterAccount('ALL');
+                  setFilterFromType('ALL');
+                  setFilterToType('ALL');
+                  setFilterBuildingIds([]);
+                  setBuildingPickerSearch('');
+                }}
+                className="px-3 py-2 bg-slate-100 rounded-xl text-sm"
+              >
+                {t('common.reset')}
+              </button>
               <button 
                 onClick={() => setShowDeleted(!showDeleted)}
                 className={`px-3 py-2 rounded-xl text-sm font-bold flex items-center gap-2 ${showDeleted ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-slate-100 text-slate-600'}`}
@@ -1479,6 +2498,13 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                 </>
               )}
               <div className="ml-auto flex items-center gap-2">
+                <button
+                  onClick={() => setShowImportModal(true)}
+                  className="px-4 py-2 bg-slate-900 text-white rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-slate-800 shadow-sm"
+                  title="Bulk import transfers (CSV/XLSX)"
+                >
+                  <Upload size={16} /> Bulk Import
+                </button>
                 <button onClick={handleExportPDF} title="Export as Account Statement PDF" className="px-4 py-2 bg-violet-600 text-white rounded-xl text-sm font-bold flex items-center gap-2 hover:bg-violet-700 shadow-sm shadow-violet-200">
                   <FileText size={16} /> Account Statement PDF
                 </button>
@@ -1486,10 +2512,72 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
               </div>
             </div>
 
+            {!isStaff && filteredOwnerExpenseConverted.length > 0 && (
+              <details className="group mb-6 rounded-xl border border-slate-200 bg-slate-50/60 open:bg-slate-50">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-3 py-2.5 text-left [&::-webkit-details-marker]:hidden">
+                  <span className="flex min-w-0 flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-2">
+                    <span className="flex items-center gap-2 text-xs font-black text-slate-800">
+                      <FileText size={14} className="shrink-0 text-slate-500" />
+                      <span className="truncate">Converted owner expenses (History)</span>
+                      <span className="rounded-md bg-slate-200/80 px-1.5 py-0.5 text-[10px] font-black text-slate-600">
+                        {filteredOwnerExpenseConverted.length}
+                      </span>
+                    </span>
+                    {includeOtherBooksInTreasury && ownerExpenseConvertedFromOtherBooks.length > 0 && (
+                      <span className="text-[10px] font-bold text-slate-500 sm:ml-1">
+                        Other books: {ownerExpenseConvertedFromOtherBooks.length} · {convertedOtherBooksTotalSar.toLocaleString()}{' '}
+                        {t('common.sar')}
+                      </span>
+                    )}
+                  </span>
+                  <ChevronDown className="h-4 w-4 shrink-0 text-slate-400 transition-transform group-open:rotate-180" aria-hidden />
+                </summary>
+                <div className="border-t border-slate-200 px-2 pb-3 pt-2">
+                  <p className="mb-2 px-1 text-[10px] text-slate-500">
+                    Rows marked by &quot;Fix Owner Expense&quot; with kind {TREASURY_CONVERSION_OWNER_EXPENSE}. Uses the same date and building filters as the table below.
+                  </p>
+                  <div className="overflow-x-auto rounded-lg border border-slate-200 bg-white">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="bg-slate-50 text-left text-[10px] font-black uppercase tracking-wider text-slate-500">
+                          <th className="px-3 py-2.5">Date</th>
+                          <th className="px-3 py-2.5">Building</th>
+                          <th className="px-3 py-2.5 text-right">Amount</th>
+                          <th className="px-3 py-2.5">Details</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {filteredOwnerExpenseConverted.map((tx: any) => {
+                          const txBook = String(tx._bookId || activeBookId);
+                          const amt = Math.abs(Number(tx.amountIncludingVAT || tx.totalWithVat || tx.amount || 0));
+                          return (
+                            <tr key={`${txBook}:${tx.id}`} className="border-t border-slate-100 hover:bg-slate-50/80">
+                              <td className="whitespace-nowrap px-3 py-2.5 font-bold text-slate-700">{fmtDate(tx.date)}</td>
+                              <td className="px-3 py-2.5 font-medium text-slate-800">{labelOwnerExpenseBuilding(tx)}</td>
+                              <td className="px-3 py-2.5 text-right font-black tabular-nums text-slate-800">
+                                {amt.toLocaleString()} <span className="text-[10px] font-bold text-slate-500">{t('common.sar')}</span>
+                              </td>
+                              <td className="max-w-[220px] truncate px-3 py-2.5 text-xs text-slate-600" title={tx.details || ''}>
+                                {tx.details || tx.description || '—'}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </details>
+            )}
+
             {/* Mobile Cards */}
             <div className="md:hidden space-y-3">
               {combinedEntries.map(tx => (
-                <div key={tx.id} className={`border rounded-xl p-3 shadow-sm space-y-2 ${tx.isOfficeOpeningBalance ? 'border-amber-200 bg-amber-50' : (tx as any).isHOExpense ? 'border-rose-200 bg-rose-50' : 'border-slate-200 bg-white'}`}>
+                <div
+                  key={tx.id}
+                  onClick={() => setDetailEntry(tx)}
+                  className={`border rounded-xl p-3 shadow-sm space-y-2 cursor-pointer ${tx.isOfficeOpeningBalance ? 'border-amber-200 bg-amber-50' : (tx as any).isHOExpense ? 'border-rose-200 bg-rose-50' : 'border-slate-200 bg-white'}`}
+                >
                   <div className="flex justify-between items-start gap-2">
                     <div>
                       <div className="text-[11px] font-mono text-slate-500">{fmtDate(tx.date)}</div>
@@ -1501,19 +2589,17 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                       ) : (tx as any).isHOExpense ? (
                         <>
                           <div className="font-bold text-rose-800 text-sm flex items-center gap-1"><TrendingDown size={14} /> EXPENSE</div>
-                          <div className="text-[11px] text-rose-600">Head Office - {tx.toId}</div>
+                          <div className="text-[11px] text-rose-600 font-bold">{transferRouteText(tx)}</div>
                           <div className="text-[11px] text-slate-500">{formatPaymentMethod(tx)}</div>
                         </>
                       ) : (
                         <>
                           <div className="font-bold text-slate-800 text-sm">{tx.purpose || 'Transfer'}</div>
-                          <div className="text-[11px] text-slate-500 flex items-center gap-1">
-                            {tx.fromType === 'OWNER' && <UserCircle size={12} className="text-purple-500" />}
-                            From: {getBuildingName(tx.fromId, tx.fromType)}
-                          </div>
-                          <div className="text-[11px] text-slate-500 flex items-center gap-1">
-                            {tx.toType === 'OWNER' && <UserCircle size={12} className="text-purple-500" />}
-                            To: {getBuildingName(tx.toId, tx.toType)}
+                          <div className="text-[11px] text-slate-600 font-bold flex flex-wrap items-center gap-1">
+                            {treTy(tx.fromType) === 'OWNER' || treTy(tx.toType) === 'OWNER' ? (
+                              <UserCircle size={12} className="text-purple-500 shrink-0" />
+                            ) : null}
+                            <span>{transferRouteText(tx)}</span>
                           </div>
                           {((tx as any).paymentMethod || (tx as any).fromBankName) && (
                             <div className="text-[10px] mt-1">
@@ -1522,15 +2608,20 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                               </span>
                             </div>
                           )}
+                          {tx.notes && (
+                            <div className="mt-1 text-[11px] font-semibold text-slate-500 line-clamp-2">
+                              Notes: {tx.notes}
+                            </div>
+                          )}
                         </>
                       )}
                     </div>
                     <div className="text-right space-y-1">
-                      {tx.isOfficeOpeningBalance && editingOpeningBal ? (
-                        <div className="flex items-center gap-1">
-                          <input type="number" value={openingBalInput} onChange={e => setOpeningBalInput(e.target.value)} className="w-24 px-2 py-1 border rounded-lg text-sm font-bold text-amber-700" autoFocus />
-                          <button onClick={handleSaveOpeningBalance} className="p-1 bg-emerald-500 text-white rounded-lg"><Check size={14} /></button>
-                          <button onClick={() => setEditingOpeningBal(false)} className="p-1 bg-slate-200 text-slate-600 rounded-lg"><X size={14} /></button>
+	                      {tx.isOfficeOpeningBalance && editingOpeningBal ? (
+	                        <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+	                          <input type="number" value={openingBalInput} onChange={e => setOpeningBalInput(e.target.value)} className="w-24 px-2 py-1 border rounded-lg text-sm font-bold text-amber-700" autoFocus />
+	                          <button onClick={handleSaveOpeningBalance} className="p-1 bg-emerald-500 text-white rounded-lg"><Check size={14} /></button>
+	                          <button onClick={() => setEditingOpeningBal(false)} className="p-1 bg-slate-200 text-slate-600 rounded-lg"><X size={14} /></button>
                         </div>
                       ) : (
                         <div className={`text-sm font-black ${(tx as any).isHOExpense ? 'text-rose-700' : 'text-slate-800'}`}>{tx.amount.toLocaleString()} <span className="text-[10px] text-slate-500">{t('common.sar')}</span></div>
@@ -1541,30 +2632,33 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                     </div>
                   </div>
                   {!(tx as any).isHOExpense && (
-                  <div className="flex gap-2 justify-end pt-1">
-                    {showDeleted ? (
-                      <>
-                        {!tx.isOfficeOpeningBalance && (
-                          <>
+	                  <div className="flex gap-2 justify-end pt-1" onClick={(e) => e.stopPropagation()}>
+	                    {showDeleted ? (
+	                      <>
+	                        {!tx.isOfficeOpeningBalance && (
+	                          <>
                             <button onClick={() => handleRestore(tx.id)} className="p-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-[11px] font-bold">{t('history.restore')}</button>
                             <button onClick={() => handlePermanentDelete(tx.id)} className="p-1.5 bg-rose-50 text-rose-600 rounded-lg text-[11px] font-bold">{t('common.delete')}</button>
                           </>
                         )}
                       </>
-                    ) : (
-                      <>
-                        {isAdminOrHead && tx.status === 'PENDING' && (
-                          <>
-                            <button onClick={() => handleApprove(tx as any)} className="p-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-[11px] font-bold">{t('approval.approve')}</button>
-                            <button onClick={() => handleReject(tx as any)} className="p-1.5 bg-rose-50 text-rose-600 rounded-lg text-[11px] font-bold">{t('approval.reject')}</button>
-                          </>
-                        )}
-                        {isAdminOrHead && !tx.isOfficeOpeningBalance && (
-                          <button onClick={() => handleEditTransferOpen(tx as any)} className="p-1.5 bg-blue-50 text-blue-600 rounded-lg text-[11px] font-bold">{t('common.edit')}</button>
-                        )}
-                        {isAdminOrHead && tx.isOfficeOpeningBalance && (
-                          <button onClick={() => { setOpeningBalInput(String(tx.amount)); setEditingOpeningBal(true); }} className="p-1.5 bg-amber-50 text-amber-600 rounded-lg text-[11px] font-bold">{t('common.edit')}</button>
-                        )}
+	                    ) : (
+	                      <>
+	                        <button onClick={() => setDetailEntry(tx)} className="p-1.5 bg-violet-50 text-violet-600 rounded-lg text-[11px] font-bold flex items-center gap-1">
+	                          <Eye size={13} /> Details
+	                        </button>
+	                        {isAdminOrHead && tx.status === 'PENDING' && (
+	                          <>
+	                            <button onClick={() => handleApprove(tx as any)} className="p-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-[11px] font-bold">{t('approval.approve')}</button>
+	                            <button onClick={() => handleReject(tx as any)} className="p-1.5 bg-rose-50 text-rose-600 rounded-lg text-[11px] font-bold">{t('approval.reject')}</button>
+	                          </>
+	                        )}
+	                        {isAdmin && !tx.isOfficeOpeningBalance && (
+	                          <button onClick={() => handleEditTransferOpen(tx as any)} className="p-1.5 bg-blue-50 text-blue-600 rounded-lg text-[11px] font-bold">{t('common.edit')}</button>
+	                        )}
+	                        {isAdmin && tx.isOfficeOpeningBalance && (
+	                          <button onClick={() => { setOpeningBalInput(String(tx.amount)); setEditingOpeningBal(true); }} className="p-1.5 bg-amber-50 text-amber-600 rounded-lg text-[11px] font-bold">{t('common.edit')}</button>
+	                        )}
                         {!tx.isOfficeOpeningBalance && (isAdminOrHead || tx.createdBy === currentUser.id) && (
                           <button onClick={() => handleDelete(tx.id)} className="p-1.5 bg-slate-100 text-slate-700 rounded-lg text-[11px] font-bold">{t('history.trash')}</button>
                         )}
@@ -1585,8 +2679,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                 <thead>
                   <tr className="border-b border-slate-200">
                     <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">{t('common.date')}</th>
-                    <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">{t('invoice.from')}</th>
-                    <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">To</th>
+                    <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">From → To</th>
                     <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">{t('common.amount')}</th>
                     <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">Purpose</th>
                     <th className="px-4 py-3 text-xs font-bold text-slate-500 uppercase">{t('common.status')}</th>
@@ -1595,62 +2688,60 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {combinedEntries.map(tx => (
-                    <tr key={tx.id} className={`hover:bg-slate-50 ${tx.isOfficeOpeningBalance ? 'bg-amber-50' : (tx as any).isHOExpense ? 'bg-rose-50' : (tx.fromType === 'BUILDING' && tx.toType === 'BUILDING') ? 'bg-indigo-50/40' : ''}`}>
+                    <tr
+                      key={tx.id}
+                      onClick={() => setDetailEntry(tx)}
+                      className={`cursor-pointer hover:bg-slate-50 ${tx.isOfficeOpeningBalance ? 'bg-amber-50' : (tx as any).isHOExpense ? 'bg-rose-50' : (treTy(tx.fromType) === 'BUILDING' && treTy(tx.toType) === 'BUILDING') ? 'bg-indigo-50/40' : ''}`}
+                    >
                       <td className="px-4 py-4 text-sm font-mono">{fmtDate(tx.date)}</td>
-                      <td className="px-4 py-4 text-sm">
+                      <td className="px-4 py-4 text-sm min-w-[12rem] max-w-xl">
                         {tx.isOfficeOpeningBalance ? (
-                          <div className="flex items-center gap-2">
-                            <Wallet size={14} className="text-amber-600" />
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <Wallet size={14} className="text-amber-600 shrink-0" />
                             <span className="font-bold text-amber-700">Old System</span>
-                          </div>
-                        ) : (tx as any).isHOExpense ? (
-                          <div className="flex items-center gap-2">
-                            <TrendingDown size={14} className="text-rose-500" />
-                            <span className="font-bold text-rose-700">Head Office</span>
-                          </div>
-                        ) : (
-                        <div className="flex items-center gap-2">
-                          {tx.fromType === 'BUILDING' ? <Building2 size={14} className="text-violet-500" /> : tx.fromType === 'BANK' ? <Landmark size={14} className="text-blue-500" /> : tx.fromType === 'OWNER' ? <UserCircle size={14} className="text-purple-500" /> : <Building2 size={14} className="text-slate-500" />}
-                          <span className="font-bold">{getBuildingName(tx.fromId, tx.fromType)}</span>
-                        </div>
-                        )}
-                      </td>
-                      <td className="px-4 py-4 text-sm">
-                        {tx.isOfficeOpeningBalance ? (
-                          <div className="flex items-center gap-2">
-                            <Building2 size={14} className="text-amber-600" />
+                            <ArrowRightLeft size={12} className="text-slate-400 shrink-0" aria-hidden />
+                            <Building2 size={14} className="text-amber-600 shrink-0" />
                             <span className="font-bold text-amber-700">Head Office</span>
                           </div>
                         ) : (tx as any).isHOExpense ? (
-                          <div className="flex items-center gap-2">
+                          <div className="flex flex-wrap items-center gap-1.5">
+                            <TrendingDown size={14} className="text-rose-500 shrink-0" />
+                            <span className="font-bold text-rose-700">Head Office</span>
+                            <ArrowRightLeft size={12} className="text-slate-400 shrink-0" aria-hidden />
                             <span className="font-bold text-rose-700">{tx.toId}</span>
                             <span className="text-[10px] px-1.5 py-0.5 bg-slate-100 rounded text-slate-500" title={formatPaymentMethod(tx)}>{formatPaymentMethod(tx)}</span>
                           </div>
                         ) : (
-                        <div className="flex items-center gap-2">
-                          {tx.toType === 'BUILDING' ? <Building2 size={14} className="text-violet-500" /> : tx.toType === 'BANK' ? <Landmark size={14} className="text-blue-500" /> : tx.toType === 'OWNER' ? <UserCircle size={14} className="text-purple-500" /> : <Building2 size={14} className="text-slate-500" />}
-                          <span className="font-bold">{getBuildingName(tx.toId, tx.toType)}</span>
-                        </div>
+                          <div className="flex flex-wrap items-center gap-1.5 text-slate-800">
+                            <span className="font-bold break-words">{getBuildingName(tx.fromId, tx.fromType)}</span>
+                            <ArrowRightLeft size={12} className="text-slate-400 shrink-0" aria-hidden />
+                            <span className="font-bold break-words">{getBuildingName(tx.toId, tx.toType)}</span>
+                          </div>
                         )}
                       </td>
                       <td className={`px-4 py-4 text-sm font-bold ${(tx as any).isHOExpense ? 'text-rose-700' : 'text-slate-800'}`}>
-                        {tx.isOfficeOpeningBalance && editingOpeningBal ? (
-                          <div className="flex items-center gap-1">
-                            <input type="number" value={openingBalInput} onChange={e => setOpeningBalInput(e.target.value)} className="w-28 px-2 py-1 border rounded-lg text-sm font-bold text-amber-700" autoFocus />
-                            <button onClick={handleSaveOpeningBalance} className="p-1 bg-emerald-500 text-white rounded-lg"><Check size={14} /></button>
-                            <button onClick={() => setEditingOpeningBal(false)} className="p-1 bg-slate-200 text-slate-600 rounded-lg"><X size={14} /></button>
+	                        {tx.isOfficeOpeningBalance && editingOpeningBal ? (
+	                          <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
+	                            <input type="number" value={openingBalInput} onChange={e => setOpeningBalInput(e.target.value)} className="w-28 px-2 py-1 border rounded-lg text-sm font-bold text-amber-700" autoFocus />
+	                            <button onClick={handleSaveOpeningBalance} className="p-1 bg-emerald-500 text-white rounded-lg"><Check size={14} /></button>
+	                            <button onClick={() => setEditingOpeningBal(false)} className="p-1 bg-slate-200 text-slate-600 rounded-lg"><X size={14} /></button>
                           </div>
                         ) : (
                           <>{tx.amount.toLocaleString()} SAR</>
                         )}
                       </td>
                       <td className="px-4 py-4 text-sm text-slate-600">
-                        {tx.fromType === 'BUILDING' && tx.toType === 'BUILDING' && !(tx as any).isHOExpense && (
+                        {treTy(tx.fromType) === 'BUILDING' && treTy(tx.toType) === 'BUILDING' && !(tx as any).isHOExpense && (
                           <span className="mr-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-indigo-100 text-indigo-700 border border-indigo-200 text-[10px] font-bold uppercase tracking-wider">
                             <Shuffle size={10} /> Inter-Bldg
                           </span>
                         )}
                         <span>{tx.purpose}</span>
+                        {tx.notes && (
+                          <div className="mt-1 max-w-md text-xs font-medium text-slate-500 line-clamp-2" title={tx.notes}>
+                            Notes: {tx.notes}
+                          </div>
+                        )}
                         {!(tx as any).isHOExpense && ((tx as any).paymentMethod || (tx as any).fromBankName) && (
                           <div className="mt-0.5 text-[10px]">
                             <span className="px-1.5 py-0.5 rounded-md bg-blue-50 border border-blue-200 text-blue-700 font-bold" title={formatPaymentMethod(tx)}>
@@ -1664,7 +2755,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                           {(tx as any).isHOExpense ? 'EXPENSE' : tx.status}
                         </span>
                       </td>
-                      <td className="px-4 py-4">
+                      <td className="px-4 py-4" onClick={(e) => e.stopPropagation()}>
                         {!(tx as any).isHOExpense && (
                         <div className="flex items-center gap-2">
                           {showDeleted ? (
@@ -1680,11 +2771,14 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                                 </>
                               )}
                             </>
-                          ) : (
-                            <>
-                              {isAdminOrHead && tx.status === 'PENDING' && (
-                                <>
-                                  <button onClick={() => handleApprove(tx as any)} className="p-1.5 rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100" title={t('approval.approve')}>
+	                          ) : (
+	                            <>
+                              <button onClick={() => setDetailEntry(tx)} className="p-1.5 rounded-lg bg-violet-50 text-violet-600 hover:bg-violet-100" title="View details">
+                                <Eye size={16} />
+                              </button>
+	                              {isAdminOrHead && tx.status === 'PENDING' && (
+	                                <>
+	                                  <button onClick={() => handleApprove(tx as any)} className="p-1.5 rounded-lg bg-emerald-50 text-emerald-600 hover:bg-emerald-100" title={t('approval.approve')}>
                                     <Check size={16} />
                                   </button>
                                   <button onClick={() => handleReject(tx as any)} className="p-1.5 rounded-lg bg-rose-50 text-rose-600 hover:bg-rose-100" title={t('approval.reject')}>
@@ -1692,14 +2786,14 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                                   </button>
                                 </>
                               )}
-                              {isAdminOrHead && !tx.isOfficeOpeningBalance && (
-                                <button onClick={() => handleEditTransferOpen(tx as any)} className="p-1.5 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100" title="Edit Date / Payment Method">
-                                  <Pencil size={16} />
-                                </button>
-                              )}
-                              {isAdminOrHead && tx.isOfficeOpeningBalance && (
-                                <button onClick={() => { setOpeningBalInput(String(tx.amount)); setEditingOpeningBal(true); }} className="p-1.5 rounded-lg bg-amber-50 text-amber-600 hover:bg-amber-100" title="Edit Opening Balance">
-                                  <Pencil size={16} />
+	                              {isAdmin && !tx.isOfficeOpeningBalance && (
+	                                <button onClick={() => handleEditTransferOpen(tx as any)} className="p-1.5 rounded-lg bg-blue-50 text-blue-600 hover:bg-blue-100" title="Admin: Edit transfer">
+	                                  <Pencil size={16} />
+	                                </button>
+	                              )}
+	                              {isAdmin && tx.isOfficeOpeningBalance && (
+	                                <button onClick={() => { setOpeningBalInput(String(tx.amount)); setEditingOpeningBal(true); }} className="p-1.5 rounded-lg bg-amber-50 text-amber-600 hover:bg-amber-100" title="Edit Opening Balance">
+	                                  <Pencil size={16} />
                                 </button>
                               )}
                               {!tx.isOfficeOpeningBalance && (isAdminOrHead || tx.createdBy === currentUser.id) && (
@@ -1716,7 +2810,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                   ))}
                   {combinedEntries.length === 0 && (
                     <tr>
-                      <td colSpan={7} className="px-4 py-12 text-center text-slate-400">No entries found</td>
+                      <td colSpan={6} className="px-4 py-12 text-center text-slate-400">No entries found</td>
                     </tr>
                   )}
                 </tbody>
@@ -1725,18 +2819,189 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
           </div>
         </div>
       )}
+      {/* Details Modal */}
+      {detailEntry && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-start justify-center pt-[10vh] p-4">
+          <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-2xl w-full animate-slide-up border border-slate-100">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div className="min-w-0">
+                <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
+                  <Eye size={18} className="shrink-0 text-violet-600" />
+                  Treasury Details
+                </h3>
+                <p className="text-xs text-slate-500 font-semibold mt-1 truncate">
+                  {detailEntry.isOfficeOpeningBalance ? 'Opening Balance' : (detailEntry as any).isHOExpense ? 'Head Office Expense' : detailEntry.purpose || 'Treasury Transfer'}
+                </p>
+              </div>
+              <button onClick={() => setDetailEntry(null)} className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-200 bg-slate-50/80 p-4 mb-4">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">{t('common.amount')}</div>
+                  <div className={`text-2xl font-black tabular-nums ${(detailEntry as any).isHOExpense ? 'text-rose-700' : 'text-slate-900'}`}>
+                    {Number(detailEntry.amount || 0).toLocaleString()} <span className="text-sm text-slate-500">{t('common.sar')}</span>
+                  </div>
+                </div>
+                <span className={`px-3 py-1.5 rounded-full text-xs font-black ${(detailEntry as any).isHOExpense ? 'bg-rose-100 text-rose-700' : detailEntry.status === 'COMPLETED' ? 'bg-emerald-50 text-emerald-700' : detailEntry.status === 'PENDING' ? 'bg-amber-50 text-amber-700' : 'bg-rose-50 text-rose-700'}`}>
+                  {(detailEntry as any).isHOExpense ? 'EXPENSE' : detailEntry.status}
+                </span>
+              </div>
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-sm font-bold text-slate-800">
+                <span>{detailEntry.isOfficeOpeningBalance ? 'Old System' : getBuildingName(detailEntry.fromId, detailEntry.fromType)}</span>
+                <ArrowRightLeft size={14} className="text-slate-400" />
+                <span>{(detailEntry as any).isHOExpense ? String(detailEntry.toId || 'Expense') : detailEntry.isOfficeOpeningBalance ? 'Head Office' : getBuildingName(detailEntry.toId, detailEntry.toType)}</span>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-sm">
+              {[
+                ['Date', fmtDate(detailEntry.date)],
+                ['Type', detailEntry.isOfficeOpeningBalance ? 'Office Opening Balance' : (detailEntry as any).isHOExpense ? 'Head Office Expense' : treTy(detailEntry.fromType) === 'BUILDING' && treTy(detailEntry.toType) === 'BUILDING' ? 'Inter-Building Transfer' : 'Treasury Transfer'],
+                ['Purpose', detailEntry.purpose || '—'],
+                ['Payment Method', formatPaymentMethod(detailEntry) || '—'],
+                ['From Type', detailEntry.fromType || '—'],
+                ['To Type', detailEntry.toType || '—'],
+                ['Created By', detailEntry.createdBy || '—'],
+                ['Reference', (detailEntry as any).isHOExpense ? String((detailEntry as any).originalExpense?.id || detailEntry.id).replace(/^ho-exp-/, '') : detailEntry.id],
+              ].map(([label, value]) => (
+                <div key={label} className="rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">{label}</div>
+                  <div className="mt-1 font-bold text-slate-800 break-words">{value || '—'}</div>
+                </div>
+              ))}
+            </div>
+
+            <div className="mt-3 rounded-xl border border-slate-200 bg-white p-3">
+              <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">{t('common.notes')}</div>
+              <div className="mt-1 text-sm font-semibold text-slate-700 whitespace-pre-wrap break-words">
+                {detailEntry.notes || (detailEntry as any).originalExpense?.details || (detailEntry as any).originalExpense?.description || '—'}
+              </div>
+            </div>
+
+            <div className="flex justify-end gap-3 mt-5">
+              <button type="button" onClick={() => setDetailEntry(null)} className="px-4 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50">{t('common.close') || 'Close'}</button>
+              {isAdmin && !(detailEntry as any).isHOExpense && !detailEntry.isOfficeOpeningBalance && !showDeleted && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    const tx = detailEntry as Transfer;
+                    setDetailEntry(null);
+                    handleEditTransferOpen(tx);
+                  }}
+                  className="px-4 py-2.5 rounded-xl text-white font-bold shadow-lg bg-blue-600 hover:bg-blue-700 shadow-blue-200 flex items-center gap-2"
+                >
+                  <Pencil size={16} /> {t('common.edit')}
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Edit Transfer Modal */}
       {showEditTransferModal && editTransferItem && (
         <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-start justify-center pt-[12vh] p-4">
-          <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-md w-full animate-slide-up">
+          <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-3xl w-full animate-slide-up max-h-[86vh] overflow-y-auto">
             <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Pencil size={18} className="text-blue-600" /> Edit Transfer</h3>
+              <h3 className="text-lg font-bold text-slate-800 flex items-center gap-2"><Pencil size={18} className="text-blue-600" /> Admin Edit Transfer</h3>
               <button onClick={() => setShowEditTransferModal(false)} className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg"><X size={16} /></button>
             </div>
             <div className="space-y-4">
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                <div>
+                  <label className="text-xs font-bold text-slate-500 block mb-1">{t('common.date')}</label>
+                  <input type="date" className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferDate} onChange={e => setEditTransferDate(e.target.value)} required />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-500 block mb-1">{t('entry.amount')}</label>
+                  <input type="number" min="0" step="0.01" className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferAmount} onChange={e => setEditTransferAmount(e.target.value)} required />
+                </div>
+                <div>
+                  <label className="text-xs font-bold text-slate-500 block mb-1">{t('common.status')}</label>
+                  <select className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferStatus} onChange={e => setEditTransferStatus(e.target.value as Transfer['status'])}>
+                    <option value="PENDING">{t('common.pending')}</option>
+                    <option value="COMPLETED">Completed</option>
+                    <option value="CANCELLED">Cancelled</option>
+                  </select>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="rounded-xl border border-slate-200 p-3 space-y-3">
+                  <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">From</div>
+                  <select className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferFromType} onChange={e => { setEditTransferFromType(e.target.value as Transfer['fromType']); setEditTransferFromId(e.target.value === 'HEAD_OFFICE' ? 'HEAD_OFFICE' : ''); }}>
+                    <option value="BUILDING">{t('entry.building')}</option>
+                    <option value="HEAD_OFFICE">Head Office</option>
+                    <option value="OWNER">Owner</option>
+                    <option value="BANK">Bank</option>
+                  </select>
+                  {editTransferFromType === 'BUILDING' && (
+                    <SearchableSelect
+                      options={buildings.map((b) => ({ value: b.id, label: b.name || b.rawId || b.id, sublabel: b.bookName ? `${b.bookName}${b.bookId === activeBookId ? ' (current)' : ''}` : '' }))}
+                      value={editTransferFromId}
+                      onChange={(v) => setEditTransferFromId(v)}
+                      placeholder="Select source building..."
+                    />
+                  )}
+                  {editTransferFromType === 'OWNER' && (
+                    <SearchableSelect
+                      options={owners.map((o: any) => ({ value: String(o.id), label: treasuryUserLabel(o) || String(o.id), sublabel: o.email }))}
+                      value={editTransferFromId}
+                      onChange={(v) => setEditTransferFromId(v)}
+                      placeholder="Select source owner..."
+                    />
+                  )}
+                  {editTransferFromType === 'BANK' && (
+                    <select className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferFromId} onChange={e => setEditTransferFromId(e.target.value)}>
+                      <option value="">Select source bank...</option>
+                      {banks.map((b, i) => <option key={`ebf-${i}`} value={b.name}>{b.name}</option>)}
+                    </select>
+                  )}
+                  {editTransferFromType === 'HEAD_OFFICE' && <div className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-sm font-bold text-slate-700">Head Office</div>}
+                </div>
+                <div className="rounded-xl border border-slate-200 p-3 space-y-3">
+                  <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">To</div>
+                  <select className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferToType} onChange={e => { setEditTransferToType(e.target.value as Transfer['toType']); setEditTransferToId(e.target.value === 'HEAD_OFFICE' ? 'HEAD_OFFICE' : ''); }}>
+                    <option value="BUILDING">{t('entry.building')}</option>
+                    <option value="HEAD_OFFICE">Head Office</option>
+                    <option value="OWNER">Owner</option>
+                    <option value="BANK">Bank</option>
+                  </select>
+                  {editTransferToType === 'BUILDING' && (
+                    <SearchableSelect
+                      options={buildings.map((b) => ({ value: b.id, label: b.name || b.rawId || b.id, sublabel: b.bookName ? `${b.bookName}${b.bookId === activeBookId ? ' (current)' : ''}` : '' }))}
+                      value={editTransferToId}
+                      onChange={(v) => setEditTransferToId(v)}
+                      placeholder="Select destination building..."
+                    />
+                  )}
+                  {editTransferToType === 'OWNER' && (
+                    <SearchableSelect
+                      options={owners.map((o: any) => ({ value: String(o.id), label: treasuryUserLabel(o) || String(o.id), sublabel: o.email }))}
+                      value={editTransferToId}
+                      onChange={(v) => setEditTransferToId(v)}
+                      placeholder="Select destination owner..."
+                    />
+                  )}
+                  {editTransferToType === 'BANK' && (
+                    <select className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferToId} onChange={e => setEditTransferToId(e.target.value)}>
+                      <option value="">Select destination bank...</option>
+                      {banks.map((b, i) => <option key={`ebt-${i}`} value={b.name}>{b.name}</option>)}
+                    </select>
+                  )}
+                  {editTransferToType === 'HEAD_OFFICE' && <div className="rounded-lg bg-slate-50 border border-slate-200 px-3 py-2 text-sm font-bold text-slate-700">Head Office</div>}
+                </div>
+              </div>
               <div>
-                <label className="text-xs font-bold text-slate-500 block mb-1">{t('common.date')}</label>
-                <input type="date" className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferDate} onChange={e => setEditTransferDate(e.target.value)} required />
+                <label className="text-xs font-bold text-slate-500 block mb-1">Purpose</label>
+                <input className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferPurpose} onChange={e => setEditTransferPurpose(e.target.value)} />
+              </div>
+              <div>
+                <label className="text-xs font-bold text-slate-500 block mb-1">{t('common.notes')}</label>
+                <textarea rows={3} className="w-full border border-slate-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-blue-300 outline-none" value={editTransferNotes} onChange={e => setEditTransferNotes(e.target.value)} />
               </div>
               <div>
                 <label className="text-xs font-bold text-slate-500 block mb-1">{t('entry.paymentMethod')}</label>
@@ -1768,6 +3033,108 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
             <div className="flex gap-3 mt-6">
               <button type="button" onClick={() => setShowEditTransferModal(false)} className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50">{t('common.cancel')}</button>
               <button type="button" onClick={handleEditTransferSubmit} className="flex-1 py-2.5 rounded-xl text-white font-bold shadow-lg bg-blue-600 hover:bg-blue-700 shadow-blue-200">Save Changes</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Bulk Import Modal */}
+      {showImportModal && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-start justify-center pt-[10vh] p-4">
+          <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-lg w-full animate-slide-up border border-slate-100">
+            <div className="flex items-start justify-between gap-3 mb-4">
+              <div className="min-w-0">
+                <h3 className="text-lg font-black text-slate-900 flex items-center gap-2">
+                  <Upload size={18} className="shrink-0 text-slate-700" aria-hidden />
+                  Import CSV / Excel
+                </h3>
+                <p className="text-xs text-slate-500 font-semibold mt-1 leading-relaxed">
+                  Bulk create Treasury transfers from a file — use the template for the correct columns (.csv, .xlsx).
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => { if (!importBusy) setShowImportModal(false); }}
+                className="p-1.5 text-slate-400 hover:text-slate-700 hover:bg-slate-100 rounded-lg shrink-0"
+                aria-label={t('common.close') || 'Close'}
+              >
+                <X size={16} />
+              </button>
+            </div>
+
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".csv,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+              className="hidden"
+              onChange={(e) => handleImportFile(e.target.files?.[0] || null)}
+            />
+            <div className="flex flex-wrap gap-2">
+              <button
+                type="button"
+                onClick={() => fileInputRef.current?.click()}
+                disabled={importBusy}
+                className={`px-4 py-2.5 rounded-xl text-xs font-black flex items-center gap-2 ${
+                  importBusy ? 'bg-slate-200 text-slate-500' : 'bg-slate-900 text-white hover:bg-slate-800 shadow-sm'
+                }`}
+              >
+                <Upload size={14} aria-hidden /> {importBusy ? 'Importing…' : 'Choose file'}
+              </button>
+              <button
+                type="button"
+                onClick={downloadImportTemplate}
+                disabled={importBusy}
+                className="px-4 py-2.5 rounded-xl bg-white border border-slate-200 text-slate-700 text-xs font-black hover:bg-slate-50 flex items-center gap-2 disabled:opacity-50"
+              >
+                <Download size={14} aria-hidden /> Download template
+              </button>
+              {canFixOwnerExpense && (
+                <button
+                  type="button"
+                  onClick={handleConvertOwnerExpensesToTreasury}
+                  disabled={importBusy}
+                  className={`px-4 py-2.5 rounded-xl text-xs font-black flex items-center gap-2 ${
+                    importBusy
+                      ? 'bg-slate-200 text-slate-500'
+                      : ownerExpenseTxs.length > 0
+                      ? 'bg-amber-500 text-white hover:bg-amber-600 shadow-sm'
+                      : 'bg-amber-50 text-amber-700 border border-amber-200 hover:bg-amber-100'
+                  }`}
+                  title="Convert past Owner Expense entries to Treasury transfers"
+                >
+                  <Sparkles size={14} aria-hidden />
+                  Fix Owner Expense ({ownerExpenseTxs.length})
+                </button>
+              )}
+            </div>
+
+            <div className="mt-4 rounded-xl border border-slate-200 bg-slate-50/80 p-3.5 space-y-2">
+              <div className="text-[10px] font-black uppercase tracking-wider text-slate-500">Template columns (header row)</div>
+              <p className="font-mono text-[10px] text-slate-700 leading-relaxed break-words">
+                Date, FromType, FromId, ToType, ToId, Amount, Purpose, Notes, PaymentMethod, FromBankName, ToBankName, Status
+              </p>
+              <p className="text-[11px] text-slate-600 leading-snug border-t border-slate-200/80 pt-2">
+                <span className="font-bold text-slate-800">FromType / ToType</span>
+                {' — '}
+                BUILDING, HEAD_OFFICE, OWNER, or BANK. Use{' '}
+                <span className="font-bold">HEAD_OFFICE</span> for both type and id when the office is an endpoint. For BANK, put the{' '}
+                <span className="font-bold">exact bank name</span> from your Banks list in FromId / ToId. For BUILDING / OWNER, id or display name is accepted.
+                {' '}
+                <span className="font-bold">PaymentMethod</span> CASH, BANK, or CHEQUE; with BANK/CHEQUE set FromBankName / ToBankName when needed.
+                {' '}
+                <span className="font-bold">Status</span> PENDING, COMPLETED, or CANCELLED — defaults to COMPLETED if omitted.
+              </p>
+            </div>
+
+            <div className="flex gap-3 mt-4">
+              <button
+                type="button"
+                onClick={() => setShowImportModal(false)}
+                disabled={importBusy}
+                className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50 disabled:opacity-60"
+              >
+                {t('common.close') || 'Close'}
+              </button>
             </div>
           </div>
         </div>

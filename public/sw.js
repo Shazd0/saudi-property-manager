@@ -22,6 +22,7 @@ const APP_SHELL = [
   '/manifest.webmanifest',
   '/index.css',
   '/images/logo.png',
+  '/images/amlak-sheets-icon.svg',
   '/images/logo-192.png',
   '/images/logo-512.png',
   '/images/cologo.png',
@@ -158,6 +159,21 @@ function shouldSkipCache(url) {
   return NO_CACHE_ORIGINS.some(origin => url.hostname.includes(origin));
 }
 
+// Vite dev server files must stay network-only. A stale service worker can
+// otherwise intercept /@vite/client or /index.tsx?t=... and break hot reloads.
+function isViteDevRequest(url) {
+  const isLocalHost = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (!isLocalHost) return false;
+  return (
+    url.port === '5220' ||
+    url.pathname.startsWith('/@') ||
+    url.pathname.startsWith('/src/') ||
+    url.pathname.startsWith('/node_modules/') ||
+    url.pathname.endsWith('.tsx') ||
+    url.searchParams.has('t')
+  );
+}
+
 // ─── Helper: is image request ───
 function isImageRequest(url, request) {
   const ext = url.pathname.split('.').pop()?.toLowerCase();
@@ -204,6 +220,7 @@ self.addEventListener('fetch', (event) => {
   if (event.request.method !== 'GET') return;
   if (url.protocol === 'chrome-extension:') return;
   if (url.protocol === 'ws:' || url.protocol === 'wss:') return;
+  if (isViteDevRequest(url)) return;
   // Skip Vite dev server HMR & internal requests
   if (url.pathname.startsWith('/@') || url.pathname.startsWith('/__') || url.pathname.includes('?token=')) return;
   if (shouldSkipCache(url)) return;
@@ -235,8 +252,8 @@ self.addEventListener('fetch', (event) => {
               trimCache(IMG_CACHE, MAX_IMG_CACHE);
             }
             return response;
-          }).catch(() => null);
-          return cached || fetchPromise || new Response('', { status: 408 });
+          }).catch(() => new Response('', { status: 408 }));
+          return cached || fetchPromise;
         })
       )
     );
@@ -251,8 +268,8 @@ self.addEventListener('fetch', (event) => {
           const fetchPromise = fetch(event.request).then(response => {
             if (response && response.ok) cache.put(event.request, response.clone());
             return response;
-          }).catch(() => null);
-          return cached || fetchPromise || new Response('', { status: 408 });
+          }).catch(() => new Response('', { status: 408 }));
+          return cached || fetchPromise;
         })
       )
     );
@@ -291,8 +308,8 @@ self.addEventListener('fetch', (event) => {
               trimCache(DYNAMIC_CACHE, MAX_DYNAMIC_CACHE);
             }
             return response;
-          }).catch(() => null);
-          return cached || fetchPromise || new Response('', { status: 408 });
+          }).catch(() => new Response('', { status: 408 }));
+          return cached || fetchPromise;
         })
       )
     );

@@ -29,10 +29,7 @@ const require = createRequire(import.meta.url);
 const { ZATCASimplifiedTaxInvoice, ZATCAInvoiceTypes, ZATCAPaymentMethods } = require('zatca-xml-js');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-/** Override for Docker/VPS: mount certs at e.g. /data/zatca-cert */
-const CERT_DIR = process.env.ZATCA_CERT_DIR
-  ? path.resolve(process.env.ZATCA_CERT_DIR)
-  : path.join(__dirname, '..', 'zatca-cert');
+const CERT_DIR  = path.join(__dirname, '..', 'zatca-cert');
 const PIH_FILE  = path.join(CERT_DIR, 'pih.txt');
 const CNTR_FILE = path.join(CERT_DIR, 'counter.txt');
 
@@ -57,50 +54,24 @@ function normalizeCertPEM(pem) {
 }
 
 // ── Load credentials ─────────────────────────────────────────────────────────
-function readFileIfExists(filePath) {
-  try {
-    return fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf8') : null;
-  } catch {
-    return null;
-  }
-}
-
-const _RAW_COMPLIANCE_CERT = process.env.ZATCA_CERT || readFileIfExists(path.join(CERT_DIR, 'cert.pem'));
-const COMPLIANCE_SECRET_RAW = process.env.ZATCA_SECRET || readFileIfExists(path.join(CERT_DIR, 'secret.txt'));
-const COMPLIANCE_SECRET = COMPLIANCE_SECRET_RAW ? COMPLIANCE_SECRET_RAW.trim() : null;
-
-const PRIVATE_KEY = process.env.ZATCA_PRIVATE_KEY || (() => {
-  const prodKey = path.join(CERT_DIR, 'private_key_production.pem');
-  const sandboxKey = path.join(CERT_DIR, 'private_key_zatca.pem');
-  return readFileIfExists(fs.existsSync(prodKey) ? prodKey : sandboxKey);
-})();
+const _RAW_COMPLIANCE_CERT  = process.env.ZATCA_CERT    || fs.readFileSync(path.join(CERT_DIR, 'cert.pem'), 'utf8');
+const COMPLIANCE_SECRET      = (process.env.ZATCA_SECRET || fs.readFileSync(path.join(CERT_DIR, 'secret.txt'), 'utf8')).trim();
+const PRIVATE_KEY = process.env.ZATCA_PRIVATE_KEY
+  || (() => {
+    const prodKey = path.join(CERT_DIR, 'private_key_production.pem');
+    const sandboxKey = path.join(CERT_DIR, 'private_key_zatca.pem');
+    return fs.readFileSync(fs.existsSync(prodKey) ? prodKey : sandboxKey, 'utf8');
+  })();
 
 // Normalise so zatca-xml-js can parse the DER inside
-const COMPLIANCE_CERT = _RAW_COMPLIANCE_CERT ? normalizeCertPEM(_RAW_COMPLIANCE_CERT) : null;
+const COMPLIANCE_CERT = normalizeCertPEM(_RAW_COMPLIANCE_CERT);
 
-let PROD_CERT = process.env.ZATCA_PRODUCTION_CERT ? normalizeCertPEM(process.env.ZATCA_PRODUCTION_CERT) : null;
-let PROD_SECRET = process.env.ZATCA_PRODUCTION_SECRET ? process.env.ZATCA_PRODUCTION_SECRET.trim() : null;
-if (!PROD_CERT) {
-  const rawProdCert = readFileIfExists(path.join(CERT_DIR, 'production-cert.pem'));
-  if (rawProdCert) PROD_CERT = normalizeCertPEM(rawProdCert);
-}
-if (!PROD_SECRET) {
-  const rawProdSecret = readFileIfExists(path.join(CERT_DIR, 'production-api-secret.txt'));
-  if (rawProdSecret) PROD_SECRET = rawProdSecret.trim();
-}
+let PROD_CERT = null;
+let PROD_SECRET = null;
+try { PROD_CERT   = normalizeCertPEM(fs.readFileSync(path.join(CERT_DIR, 'production-cert.pem'), 'utf8')); } catch {}
+try { PROD_SECRET = fs.readFileSync(path.join(CERT_DIR, 'production-api-secret.txt'), 'utf8').trim(); } catch {}
 
 const IS_PRODUCTION = !!(PROD_CERT && PROD_SECRET);
-
-function resolveCredentials() {
-  const cert = IS_PRODUCTION ? PROD_CERT : COMPLIANCE_CERT;
-  const secret = IS_PRODUCTION ? PROD_SECRET : COMPLIANCE_SECRET;
-  if (!cert || !secret || !PRIVATE_KEY) {
-    throw new Error(
-      'ZATCA credentials are missing. Set env vars (ZATCA_CERT, ZATCA_SECRET, ZATCA_PRIVATE_KEY) or mount cert files under ZATCA_CERT_DIR.'
-    );
-  }
-  return { cert, secret, privateKey: PRIVATE_KEY };
-}
 
 // ── EGS Info (must match the CSR / compliance cert) ──────────────────────────
 const EGS_INFO = {
@@ -144,7 +115,8 @@ function getAuthHeader(certPEM, secret) {
 
 // ── Report to ZATCA ───────────────────────────────────────────────────────────
 function reportToZATCA(signedXml, invoiceHash) {
-  const { cert, secret } = resolveCredentials();
+  const cert    = IS_PRODUCTION ? PROD_CERT   : COMPLIANCE_CERT;
+  const secret  = IS_PRODUCTION ? PROD_SECRET : COMPLIANCE_SECRET;
   const envPath = IS_PRODUCTION ? 'core'       : 'developer-portal';
   const url     = `https://gw-fatoora.zatca.gov.sa/e-invoicing/${envPath}/invoices/reporting/single`;
 
@@ -229,8 +201,8 @@ function buildAndSign(req) {
   const invoice = new ZATCASimplifiedTaxInvoice({ props });
 
   // 2. Sign: embeds XMLDSig (XAdES) + generates Phase 2 QR (8-tag TLV)
-  const { cert, privateKey } = resolveCredentials();
-  const { signed_invoice_string, invoice_hash, qr } = invoice.sign(cert, privateKey);
+  const cert = IS_PRODUCTION ? PROD_CERT : COMPLIANCE_CERT;
+  const { signed_invoice_string, invoice_hash, qr } = invoice.sign(cert, PRIVATE_KEY);
 
   // 3. Advance PIH and counter for the next invoice
   savePIH(invoice_hash);
@@ -244,13 +216,7 @@ function buildAndSign(req) {
 
 // ── Express App ───────────────────────────────────────────────────────────────
 const app = express();
-// Comma-separated origins, e.g. ZATCA_CORS_ORIGINS=https://app.example.com,https://www.example.com
-if (process.env.ZATCA_CORS_ORIGINS && process.env.ZATCA_CORS_ORIGINS.trim()) {
-  const list = process.env.ZATCA_CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean);
-  app.use(cors({ origin: list.length ? list : true, credentials: true }));
-} else {
-  app.use(cors());
-}
+app.use(cors());
 app.use(express.json());
 
 /**
@@ -311,10 +277,10 @@ app.get('/zatca/health', (_, res) => res.json({
   pih:    loadPIH().substring(0, 24) + '…',
 }));
 
-const PORT = Number(process.env.PORT || process.env.ZATCA_PORT) || 3002;
-const HOST = process.env.ZATCA_HOST || '0.0.0.0';
-app.listen(PORT, HOST, () => {
-  console.log(`[ZATCA] http://${HOST}:${PORT}  |  mode: ${IS_PRODUCTION ? 'PRODUCTION ✅' : 'COMPLIANCE/SANDBOX (run onboard-production.mjs to go live)'}`);
+// Default 3022 so another stack can keep using 3002 locally.
+const PORT = process.env.ZATCA_PORT || 3022;
+app.listen(PORT, () => {
+  console.log(`[ZATCA] Service on port ${PORT}  |  mode: ${IS_PRODUCTION ? 'PRODUCTION ✅' : 'COMPLIANCE/SANDBOX (run onboard-production.mjs to go live)'}`);
 });
 
 export default app;

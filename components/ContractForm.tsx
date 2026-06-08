@@ -13,6 +13,9 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import ConfirmDialog from './ConfirmDialog';
 import LoadingOverlay from './LoadingOverlay';
 import { useLanguage } from '../i18n';
+import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
+import { computeContractBalance, type RenewalPriorBalanceSnap } from '../utils/contractBalance';
+import { buildContractSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 
 interface ContractFormProps {
   currentUser: User;
@@ -137,6 +140,9 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   const [filterFromDate, setFilterFromDate] = useState('');
   const [filterToDate, setFilterToDate] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
+  const [sortBy, setSortBy] = useState<
+    'DEFAULT' | 'ROOM_ASC' | 'ROOM_DESC' | 'DATE_NEWEST' | 'DATE_OLDEST'
+  >('DEFAULT');
   const [showBuildingFilter, setShowBuildingFilter] = useState(false);
   const [showTenantFilter, setShowTenantFilter] = useState(false);
   const [showUnitFilter, setShowUnitFilter] = useState(false);
@@ -175,6 +181,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   // Base rates for duration-based auto-calculation
   const [baseAnnualRent, setBaseAnnualRent] = useState<number>(0);
   const [monthlyWaterRate, setMonthlyWaterRate] = useState<number | string>(0);
+  const [monthlyInternetRate, setMonthlyInternetRate] = useState<number | string>(0);
   const [officeFeeAmountInput, setOfficeFeeAmountInput] = useState<string>('');
   const [officeFeeTouched, setOfficeFeeTouched] = useState(false);
   const [insuranceFee, setInsuranceFee] = useState<number | string>(0);
@@ -200,6 +207,10 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   const [autoPayment, setAutoPayment] = useState(false);
   
   const [renewalSourceId, setRenewalSourceId] = useState<string | null>(null);
+  /** Prior-lease balance shown on renew confirm (cleared when modal closes). */
+  const [renewConfirmBalance, setRenewConfirmBalance] = useState<RenewalPriorBalanceSnap | null>(null);
+  /** Copy kept on the renewal form until save/reset — persisted on the new contract. */
+  const [carriedRenewalBalance, setCarriedRenewalBalance] = useState<RenewalPriorBalanceSnap | null>(null);
   const [editingContractId, setEditingContractId] = useState<string | null>(null);
   const [isWeekendStart, setIsWeekendStart] = useState(false);
 
@@ -208,43 +219,52 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   
   const calculations = useMemo(() => {
     const b = buildings.find(b => b.id === buildingId);
-    const isVAT = b?.propertyType === 'NON_RESIDENTIAL' || b?.vatApplicable;
-
+    const isNonResidential = b?.propertyType === 'NON_RESIDENTIAL';
+    const isVAT = isNonResidential || !!b?.vatApplicable;
+    // INCLUSIVE LOGIC: If it is a VAT property, the inputs are treated as the FINAL price.
+    // We do NOT multiply by 1.15 here. We will extract VAT when generating transactions.
+    
     const upfront = Math.max(0, toNum(upfrontPaid));
     const officeFeeAmount = Math.max(0, toNum(officeFeeAmountInput));
     // For renewals: insurance is recorded but NOT added to total (already paid in original contract)
     const insuranceForTotal = renewalSourceId ? 0 : toNum(insuranceFee);
-    const subtotal = (toNum(rentValue) + toNum(waterFee) + toNum(internetFee) + toNum(parkingFee) + toNum(managementFee) + insuranceForTotal + toNum(serviceFee) + officeFeeAmount + toNum(otherAmount)) - toNum(otherDeduction);
+    // Water + internet / parking / Ejar: always from inputs (no building-type gate).
+    const wFee = toNum(waterFee);
+    const iFee = toNum(internetFee);
+    const pFee = toNum(parkingFee);
+    const mFee = toNum(managementFee);
+    const subtotal = (toNum(rentValue) + wFee + iFee + pFee + mFee + insuranceForTotal + toNum(serviceFee) + officeFeeAmount + toNum(otherAmount)) - toNum(otherDeduction);
     
-    // Contract stores EXCLUSIVE amounts — VAT is tracked separately in the VAT Report tab
-    const totalValue = Math.max(0, subtotal - upfront);
+    // totalBeforeAdvance is now the subtotal because inputs are inclusive
+    const totalBeforeAdvance = subtotal; 
+    const totalValue = Math.max(0, totalBeforeAdvance - upfront);
 
     const count = toNum(installmentCount) || 1;
     const rentPerInstallment = toNum(rentValue) / count;
-    const waterPerInstallment = toNum(waterFee) / count;
-    const internetPerInstallment = toNum(internetFee) / count;
-    const parkingPerInstallment = toNum(parkingFee) / count;
-    const managementPerInstallment = toNum(managementFee) / count;
+    const waterPerInstallment = wFee / count;
+    const internetPerInstallment = iFee / count;
+    const parkingPerInstallment = pFee / count;
+    const ejarFee = mFee;
     
-    // --- VAT-applicable portion: rent only ---
-    const rentOnlyPerInstallment = rentPerInstallment;
+    // Non-VAT fees: water/internet/parking are periodic; management + office/service/insurance/other(+)/deduction(-) are 1st only.
+    const nonVatFeesPerInstallment = waterPerInstallment + internetPerInstallment + parkingPerInstallment;
+    const nonVatFeesOneTime = (insuranceForTotal + toNum(serviceFee) + officeFeeAmount + toNum(otherAmount) - toNum(otherDeduction));
+    const nonVatFeesTotal = wFee + iFee + pFee + mFee + nonVatFeesOneTime;
+    const nonVatFirstInstallment = Math.round(nonVatFeesPerInstallment + ejarFee + nonVatFeesOneTime);
+    const nonVatOtherInstallment = Math.round(nonVatFeesPerInstallment);
+
+    // Periodic total excludes first-only Ejar fee.
+    const periodicTotal = (rentPerInstallment + nonVatFeesPerInstallment);
+    
+    const otherInstallment = Math.round(periodicTotal);
+    // For NEW contracts: include insurance in 1st payment. For RENEWALS: insurance not included
+    const baseFirstInstallment = Math.round((periodicTotal + (insuranceForTotal + toNum(serviceFee) + officeFeeAmount + toNum(otherAmount) - toNum(otherDeduction)) + ejarFee));
+    const firstInstallment = Math.max(0, baseFirstInstallment - upfront);
     const rentOnlyTotal = toNum(rentValue);
     // One-time fees added to first rent installment (insurance, service, office, extra minus deduction)
     const oneTimeFees = (insuranceForTotal + toNum(serviceFee) + officeFeeAmount + toNum(otherAmount) - toNum(otherDeduction));
-    const rentFirstInstallment = Math.max(0, Math.round(rentOnlyPerInstallment + oneTimeFees) - upfront);
-    const rentOtherInstallment = Math.round(rentOnlyPerInstallment);
-
-    // --- Non-VAT fees: water + internet + parking + management ---
-    const nonVatFeesPerInstallment = waterPerInstallment + internetPerInstallment + parkingPerInstallment + managementPerInstallment;
-    const nonVatFeesTotal = toNum(waterFee) + toNum(internetFee) + toNum(parkingFee) + toNum(managementFee);
-    const nonVatFirstInstallment = Math.round(nonVatFeesPerInstallment);
-    const nonVatOtherInstallment = Math.round(nonVatFeesPerInstallment);
-
-    // --- Combined installments (for contract total tracking) ---
-    const periodicTotal = rentPerInstallment + waterPerInstallment + internetPerInstallment + parkingPerInstallment + managementPerInstallment;
-    const otherInstallment = Math.round(periodicTotal);
-    const baseFirstInstallment = Math.round(periodicTotal + oneTimeFees);
-    const firstInstallment = Math.max(0, baseFirstInstallment - upfront);
+    const rentFirstInstallment = Math.max(0, Math.round(rentPerInstallment + oneTimeFees) - upfront);
+    const rentOtherInstallment = Math.round(rentPerInstallment);
 
     // Calculate upfront coverage: which installments are covered sequentially
     let upfrontRemaining = upfront;
@@ -278,10 +298,14 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
       nonVatFeesTotal: Math.round(nonVatFeesTotal),
       nonVatFirstInstallment,
       nonVatOtherInstallment,
+      waterPerInst: Math.round(waterPerInstallment),
+      internetPerInst: Math.round(internetPerInstallment),
+      parkingPerInst: Math.round(parkingPerInstallment),
+      ejarFullAmount: Math.round(ejarFee),
     };
   }, [rentValue, waterFee, internetFee, parkingFee, managementFee, insuranceFee, serviceFee, officeFeeAmountInput, otherAmount, otherDeduction, installmentCount, upfrontPaid, renewalSourceId, buildings, buildingId]);
 
-  const { officeFeeAmount, totalValue, firstInstallment, otherInstallment, baseFirstInstallment: _baseFirst, upfrontCoverage, isVAT: calcIsVAT, rentOnlyTotal, rentFirstInstallment, rentOtherInstallment, nonVatFeesTotal, nonVatFirstInstallment, nonVatOtherInstallment } = calculations;
+  const { officeFeeAmount, totalValue, firstInstallment, otherInstallment, baseFirstInstallment: _baseFirst, upfrontCoverage, isVAT: calcIsVAT, rentOnlyTotal, rentFirstInstallment, rentOtherInstallment, nonVatFeesTotal, nonVatFirstInstallment, nonVatOtherInstallment, waterPerInst, internetPerInst, parkingPerInst, ejarFullAmount } = calculations;
 
   useEffect(() => {
     if (officeFeeTouched) return;
@@ -302,13 +326,13 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     const custs = await getCustomers() || [];
     // Restrict buildings for non-admins/managers to their assigned buildings (supports multiple)
     const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
-    if (currentUser.role !== 'ADMIN' && currentUser.role !== 'MANAGER' && userBuildingIds.length > 0) {
-      setBuildings(blds.filter((b: any) => userBuildingIds.includes(b.id)));
-    } else {
-      setBuildings(blds);
-    }
+    const nextBuildings =
+      currentUser.role !== 'ADMIN' && currentUser.role !== 'MANAGER' && userBuildingIds.length > 0
+        ? blds.filter((b: any) => userBuildingIds.includes(b.id))
+        : blds;
+    setBuildings(nextBuildings);
     setCustomers(custs);
-    await refreshContracts();
+    await refreshContracts(nextBuildings);
 
     // Auto-filter by customer when navigating from CustomerManager
     const filterCustomerName = (location.state as any)?.filterCustomerName;
@@ -319,55 +343,34 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     }
   })(); }, []);
 
-  const refreshContracts = async () => {
+  const refreshContracts = async (buildingsOverride?: Building[]) => {
+    const bList = buildingsOverride ?? buildings;
     const all = await getContracts({ includeDeleted: true }) || [];
     const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
     const txs = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }) || [];
     setExistingContracts([...all]);
     
+    const catalog = all.filter((x: any) => !x.deleted);
     const withProgress = all.map(c => {
-        const contractFrom = (c as any).fromDate || '';
-        // For Active contracts: only count payments from the current period start date
-        // (handles legacy in-place renewals where old payments share the same contractId).
-        // For historical contracts (Old N, Expired, Terminated): count all linked payments.
-        const isActiveContract = c.status === 'Active';
-        const bld = buildings.find(b => b.id === c.buildingId);
-        const isVAT = bld?.propertyType === 'NON_RESIDENTIAL' || bld?.vatApplicable === true;
-        const paidRaw = txs.filter(t => {
-          if (t.status === 'REJECTED') return false;
-          // Exclude non-VAT fees — they are tracked separately, not part of rent progress
-          if ((t as any).feesEntry) return false;
-          if (t.contractId === c.id) {
-            if (isActiveContract && contractFrom) {
-              return t.date >= contractFrom;
-            }
-            return true;
-          }
-          const txDate = t.date || '';
-          const cFrom = c.fromDate || '';
-          const cTo = c.toDate || '';
-          if (t.buildingId === c.buildingId && t.unitNumber === c.unitName && txDate >= cFrom && txDate <= cTo) return true;
-          return false;
-        }).reduce((sum, t) => sum + (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) + (Number((t as any).discountAmount) || 0), 0);
-        const upfrontPaid = Number((c as any).upfrontPaid || 0);
-        const paid = paidRaw + upfrontPaid;
-        // For VAT buildings: effective total = exclusive total + VAT on rent + VAT on one-time fees
-        const rentValue = Number((c as any).rentValue || 0);
-        const vatOnRent = isVAT ? rentValue * 0.15 : 0;
-        const totalInst = c.installmentCount || 1;
-        const otherAmtExcl = Number(c.otherInstallment || 0);
-        const firstAmtExcl = Number(c.firstInstallment || 0) + upfrontPaid;
-        const vatOnOneTime = isVAT ? Math.max(0, firstAmtExcl - otherAmtExcl) * 0.15 : 0;
-        const effectiveTotal = (c.totalValue || 0) + upfrontPaid + vatOnRent + vatOnOneTime;
-        const percent = effectiveTotal > 0 ? Math.min(100, Math.round((paid / effectiveTotal) * 100)) : 0;
-        
+        const bal = computeContractBalance(c, {
+          buildings: bList,
+          catalog,
+          transactions: txs,
+        });
+
         const endStr = c.toDate || c.endDate || '';
         const end = endStr ? new Date(endStr + 'T00:00:00') : new Date();
         const now = new Date();
         const diffTime = end.getTime() - now.getTime();
         const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
 
-        return { ...c, paidPercent: percent, daysRemaining: diffDays };
+        return {
+          ...c,
+          paidPercent: bal.percentIncludingPrior,
+          daysRemaining: diffDays,
+          balanceRemaining: bal.remainingIncludingPrior,
+          priorLeaseOutstanding: bal.priorOutstanding,
+        };
     });
     setContractsWithProgress(withProgress);
 
@@ -421,7 +424,10 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     if (totalMonths > 0 && toNum(monthlyWaterRate) > 0) {
       setWaterFee(Math.round(toNum(monthlyWaterRate) * (totalMonths / 12)));
     }
-  }, [periodMonths, periodDays, baseAnnualRent, monthlyWaterRate]);
+    if (totalMonths > 0 && toNum(monthlyInternetRate) > 0) {
+      setInternetFee(Math.round(toNum(monthlyInternetRate) * (totalMonths / 12)));
+    }
+  }, [periodMonths, periodDays, baseAnnualRent, monthlyWaterRate, monthlyInternetRate]);
 
   useEffect(() => {
     if (fromDate && (periodMonths || periodDays)) {
@@ -472,6 +478,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     setLoading(true);
     const building = buildings.find(b => b.id === buildingId);
     const customer = customers.find(c => c.id === customerId);
+    const persistWater = toNum(waterFee);
+    const persistInternet = toNum(internetFee);
+    const persistParking = toNum(parkingFee);
+    const persistManagement = toNum(managementFee);
+    const persistNonVatInst = nonVatOtherInstallment;
 
     // If renewing an existing contract: mark old contract as Renewed, create a new contract
     let savedContract: Contract;
@@ -489,10 +500,13 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         await saveContract({ ...sourceExisting, status: oldStatus } as any);
       }
 
-      // 2. Create a brand-new contract for the renewal period
+      // 2. Create a brand-new contract for the renewal period (same contract number as the lease being renewed)
+      const renewalContractNo = sourceExisting?.contractNo != null && String(sourceExisting.contractNo).trim() !== ''
+        ? String(sourceExisting.contractNo)
+        : nextContractNo;
       const newContract: Contract = {
         id: crypto.randomUUID(),
-        contractNo: nextContractNo,
+        contractNo: renewalContractNo,
         contractDate,
         status: 'Active',
         buildingId,
@@ -501,15 +515,15 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         customerId,
         customerName: customer?.nameEn || '',
         rentValue: toNum(rentValue),
-        waterFee: toNum(waterFee),
-        internetFee: toNum(internetFee),
+        waterFee: persistWater,
+        internetFee: persistInternet,
         insuranceFee: toNum(insuranceFee),
         serviceFee: toNum(serviceFee),
         officePercent: toNum(officePercent),
         officeFeeAmount,
         otherDeduction: toNum(otherDeduction),
         otherAmount: toNum(otherAmount),
-        upfrontPaid: toNum(upfrontPaid),
+        upfrontPaid: isAdmin ? toNum(upfrontPaid) : 0,
         totalValue,
         installmentCount: toNum(installmentCount),
         firstInstallment,
@@ -522,11 +536,19 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         autoPayment,
         createdBy: currentUser.id,
         renewedFromId: renewalSourceId,
-        parkingFee: toNum(parkingFee),
-        managementFee: toNum(managementFee),
+        parkingFee: persistParking,
+        managementFee: persistManagement,
         electricityMeter,
         rentOnlyInstallment: rentOtherInstallment,
-        nonVatFeesInstallment: nonVatOtherInstallment,
+        nonVatFeesInstallment: persistNonVatInst,
+        ...(carriedRenewalBalance
+          ? {
+              priorLeaseOutstandingAtRenewal: Math.round(carriedRenewalBalance.remaining * 100) / 100,
+              priorLeaseContractNoAtRenewal: carriedRenewalBalance.priorContractNo,
+              priorLeasePaidAtRenewal: Math.round(carriedRenewalBalance.paid * 100) / 100,
+              priorLeaseEffectiveTotalAtRenewal: Math.round(carriedRenewalBalance.effectiveTotal * 100) / 100,
+            }
+          : {}),
       };
       await saveContract(newContract);
       savedContract = newContract;
@@ -551,15 +573,15 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         customerId,
         customerName: customer?.nameEn || '',
         rentValue: toNum(rentValue),
-        waterFee: toNum(waterFee),
-        internetFee: toNum(internetFee),
+        waterFee: persistWater,
+        internetFee: persistInternet,
         insuranceFee: toNum(insuranceFee),
         serviceFee: toNum(serviceFee),
         officePercent: toNum(officePercent),
         officeFeeAmount,
         otherDeduction: toNum(otherDeduction),
         otherAmount: toNum(otherAmount),
-        upfrontPaid: toNum(upfrontPaid),
+        upfrontPaid: isAdmin ? toNum(upfrontPaid) : Number((existing as any)?.upfrontPaid || 0),
         totalValue,
         installmentCount: toNum(installmentCount),
         firstInstallment,
@@ -572,11 +594,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         autoPayment,
         createdBy: existing ? existing.createdBy : currentUser.id,
         staffEditCount: nextEditCount,
-        parkingFee: toNum(parkingFee),
-        managementFee: toNum(managementFee),
+        parkingFee: persistParking,
+        managementFee: persistManagement,
         electricityMeter,
         rentOnlyInstallment: rentOtherInstallment,
-        nonVatFeesInstallment: nonVatOtherInstallment,
+        nonVatFeesInstallment: persistNonVatInst,
       };
       await saveContract(updated);
       savedContract = updated;
@@ -592,15 +614,15 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         customerId,
         customerName: customer?.nameEn || '',
         rentValue: toNum(rentValue),
-        waterFee: toNum(waterFee),
-        internetFee: toNum(internetFee),
+        waterFee: persistWater,
+        internetFee: persistInternet,
         insuranceFee: toNum(insuranceFee),
         serviceFee: toNum(serviceFee),
         officePercent: toNum(officePercent),
         officeFeeAmount,
         otherDeduction: toNum(otherDeduction),
         otherAmount: toNum(otherAmount),
-        upfrontPaid: toNum(upfrontPaid),
+        upfrontPaid: isAdmin ? toNum(upfrontPaid) : 0,
         totalValue,
         installmentCount: toNum(installmentCount),
         firstInstallment,
@@ -612,11 +634,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         notes,
         autoPayment,
         createdBy: currentUser.id,
-        parkingFee: toNum(parkingFee),
-        managementFee: toNum(managementFee),
+        parkingFee: persistParking,
+        managementFee: persistManagement,
         electricityMeter,
         rentOnlyInstallment: rentOtherInstallment,
-        nonVatFeesInstallment: nonVatOtherInstallment,
+        nonVatFeesInstallment: persistNonVatInst,
       };
 
       await saveContract(newContract);
@@ -682,8 +704,10 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     setOtherDeduction(0); setOtherAmount(0); setUpfrontPaid(0); setInstallmentCount(2);
     setPeriodMonths(12); setPeriodDays(0); setFromDate(localDateStr()); setToDate(''); setNotes('');
     setAutoPayment(false);
-    setBaseAnnualRent(0); setMonthlyWaterRate(0);
+    setBaseAnnualRent(0); setMonthlyWaterRate(0); setMonthlyInternetRate(0);
     setRenewalSourceId(null); setEditingContractId(null); setIsWeekendStart(false); setErrorMsg('');
+    setCarriedRenewalBalance(null);
+    setRenewConfirmBalance(null);
     setOfficeFeeTouched(false); setOfficeFeeAmountInput(''); setOfficePercent(2.5);
     setDateOnlyMode(false);
     setParkingFee(0); setManagementFee(0); setElectricityMeter('');
@@ -709,6 +733,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     // Load contract into form for editing
     setEditingContractId(c.id);
     setRenewalSourceId(null);
+    setCarriedRenewalBalance(null);
     setBuildingId(c.buildingId); setUnitName(c.unitName); setCustomerId(c.customerId);
     
     // Auto-select units (handle comma-separated list if multiple)
@@ -728,7 +753,9 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     setUpfrontPaid((c as any).upfrontPaid || 0);
     setInstallmentCount(c.installmentCount || 2);
     setPeriodMonths(c.periodMonths || 12); setPeriodDays((c as any).periodDays || 0);
-    setFromDate(c.fromDate); setNotes(c.notes || '');
+    setFromDate(c.fromDate);
+    setToDate((c as any).toDate || (c as any).endDate || '');
+    setNotes(c.notes || '');
     setAutoPayment(!!(c as any).autoPayment);
     setOfficeFeeAmountInput((c.officeFeeAmount ?? 0).toFixed(2));
     setOfficeFeeTouched(true);
@@ -738,6 +765,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     const editTotalMonths = editMonths + editDays / 30;
     setBaseAnnualRent(editTotalMonths > 0 ? Math.round(c.rentValue / editTotalMonths * 12) : c.rentValue);
     setMonthlyWaterRate(editTotalMonths > 0 ? Math.round(c.waterFee / (editTotalMonths / 12)) : 0);
+    setMonthlyInternetRate(editTotalMonths > 0 ? Math.round((c.internetFee || 0) / (editTotalMonths / 12)) : 0);
     setParkingFee(c.parkingFee || 0);
     setManagementFee(c.managementFee || 0);
     setElectricityMeter(c.electricityMeter || '');
@@ -770,6 +798,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   };
 
   const openConfirm = async (action: 'finalize' | 'renew' | 'delete' | 'restore' | 'permanentDelete', c: Contract) => {
+    setRenewConfirmBalance(null);
     // Check if contract has payment transactions
     const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
     const allTx = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }) || [];
@@ -793,14 +822,30 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     setConfirmAction(action);
     setConfirmContract(c);
     if (action === 'finalize') setConfirmMessage(t('contract.finalizeConfirm', { 'c.contractNo': c.contractNo }));
-    if (action === 'renew') setConfirmMessage(t('contract.renewConfirm', { 'c.contractNo': c.contractNo }));
+    if (action === 'renew') {
+      const allC = (await getContracts({ includeDeleted: true })) || [];
+      const catalog = allC.filter((x: any) => !x.deleted);
+      const bal = computeContractBalance(c, { buildings, catalog, transactions: allTx });
+      setRenewConfirmBalance({
+        ...bal,
+        priorContractNo: String(c.contractNo),
+        priorContractId: c.id,
+      });
+      setConfirmMessage(t('contract.renewConfirm', { 'c.contractNo': c.contractNo }));
+    }
     if (action === 'delete') setConfirmMessage(t('contract.moveToTrash', { 'c.contractNo': c.contractNo }));
     if (action === 'restore') setConfirmMessage(t('contract.restore', { 'c.contractNo': c.contractNo }));
     if (action === 'permanentDelete') setConfirmMessage(t('contract.permanentDelete', { 'c.contractNo': c.contractNo }));
     setConfirmOpen(true);
   };
 
-  const closeConfirm = () => { setConfirmOpen(false); setConfirmAction(null); setConfirmContract(null); setConfirmMessage(''); };
+  const closeConfirm = () => {
+    setConfirmOpen(false);
+    setConfirmAction(null);
+    setConfirmContract(null);
+    setConfirmMessage('');
+    setRenewConfirmBalance(null);
+  };
 
   const handleConfirm = async () => {
     if (!confirmAction || !confirmContract) { closeConfirm(); return; }
@@ -858,6 +903,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     }
 
     if (confirmAction === 'renew') {
+      setCarriedRenewalBalance(renewConfirmBalance);
       setRenewalSourceId(c.id);
       setBuildingId(c.buildingId); setUnitName(c.unitName); setCustomerId(c.customerId);
       
@@ -878,6 +924,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
       const renewTotalMonths = renewMonths + renewDays / 30;
       setBaseAnnualRent(renewTotalMonths > 0 ? Math.round(c.rentValue / renewTotalMonths * 12) : c.rentValue);
       setMonthlyWaterRate(renewTotalMonths > 0 ? Math.round(c.waterFee / (renewTotalMonths / 12)) : 0);
+      setMonthlyInternetRate(renewTotalMonths > 0 ? Math.round((c.internetFee || 0) / (renewTotalMonths / 12)) : 0);
       // For renewal: office charges and upfront should NOT be charged again, but show previous insurance for reference
       setOfficeFeeAmountInput('0');
       setOfficeFeeTouched(true);
@@ -909,7 +956,25 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         <div className="absolute inset-0 bg-black/40" onClick={closeConfirm}></div>
         <div className="bg-white p-6 rounded-2xl shadow-xl z-10 w-full max-w-md">
           <h4 className="font-bold text-slate-800 mb-3">{t('common.confirm')}</h4>
-          <div className="text-slate-600 text-sm mb-6">{confirmMessage}</div>
+          <div className="text-slate-600 text-sm mb-4">{confirmMessage}</div>
+          {confirmAction === 'renew' && renewConfirmBalance && (
+            <div
+              className={`mb-6 p-3 rounded-xl text-sm font-semibold border ${
+                renewConfirmBalance.remaining > 0
+                  ? 'bg-amber-50 border-amber-200 text-amber-950'
+                  : 'bg-emerald-50 border-emerald-200 text-emerald-950'
+              }`}
+            >
+              {renewConfirmBalance.remaining > 0
+                ? t('contract.renewPriorOutstanding', {
+                    priorNo: renewConfirmBalance.priorContractNo,
+                    remaining: Math.round(renewConfirmBalance.remaining * 100) / 100,
+                    paid: Math.round(renewConfirmBalance.paid * 100) / 100,
+                    total: Math.round(renewConfirmBalance.effectiveTotal * 100) / 100,
+                  })
+                : t('contract.renewPriorFullyPaid', { priorNo: renewConfirmBalance.priorContractNo })}
+            </div>
+          )}
           <div className="flex justify-end gap-3">
             <button onClick={closeConfirm} className="px-4 py-2 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50">{t('common.cancel')}</button>
             <button onClick={handleConfirm} className="px-4 py-2 rounded-xl bg-emerald-500 text-white font-bold">{t('common.confirm')}</button>
@@ -955,17 +1020,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
       setSelectedContract(c);
       const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
       const allTx = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }) || [];
-      const contractFrom = (c as any).fromDate || '';
-      const isActiveContract = c.status === 'Active';
-      const txs = allTx.filter(t => {
-        if (t.contractId === c.id) return true;
-        // Fallback for non-residential or manually entered transactions: match by building, unit and date range
-        const txDate = t.date || '';
-        const cFrom = c.fromDate || '';
-        const cTo = c.toDate || '';
-        if (t.buildingId === c.buildingId && t.unitNumber === c.unitName && txDate >= cFrom && txDate <= cTo) return true;
-        return false;
-      });
+      let catalog = (existingContracts || []).filter((x: any) => !x.deleted);
+      if (catalog.length === 0) {
+        catalog = ((await getContracts({ includeDeleted: true })) || []).filter((x: any) => !x.deleted);
+      }
+      const txs = allTx.filter(t => transactionAppliesToContract(t, c, catalog));
       setLinkedTransactions(txs);
 
       // Build renewal history chain by walking renewedFromId backwards
@@ -984,7 +1043,17 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     };
 
     const computeNextInstallment = (c: Contract, txs: Transaction[]) => {
-      const validTxs = txs.filter(t => t.status !== TransactionStatus.REJECTED && !(t as any).deleted && !(t as any).feesEntry);
+      const periodicNonRentFees =
+        (Number((c as any).waterFee) || 0) +
+        (Number((c as any).internetFee) || 0) +
+        (Number((c as any).parkingFee) || 0) +
+        (Number((c as any).managementFee) || 0);
+      const nonRes = isNonResidentialBuildingForContract(buildings, c);
+      const validTxs = txs.filter(t => {
+        if (t.status === TransactionStatus.REJECTED || (t as any).deleted) return false;
+        if ((t as any).feesEntry && nonRes && periodicNonRentFees > 0) return false;
+        return true;
+      });
       const upfrontPaid = Number((c as any).upfrontPaid || 0);
       const totalInst = c.installmentCount || 1;
       const totalValueStored = Number(c.totalValue || 0);
@@ -1193,7 +1262,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                 <div class="inner-frame">
                   <div class="orn orn-tl"></div><div class="orn orn-tr"></div>
                   <div class="orn orn-bl"></div><div class="orn orn-br"></div>
-                  <img src="${window.location.origin}/images/logo.png" alt="" class="watermark-bg" />
+                  <img src="${window.location.origin}/images/cologo.png" alt="" class="watermark-bg" />
                   
                   <div class="content">
                     <div class="header">
@@ -1262,7 +1331,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                       <div class="footer-text">This is a computer-generated contract and is valid without signature &bull; هذا المستند صادر إلكترونيًا وصالح بدون توقيع</div>
                       <div class="footer-bottom">
                         <span class="footer-copy">Arar Millennium Company Ltd &copy; ${new Date().getFullYear()}</span>
-                        <span class="amlak-badge"><img src="${window.location.origin}/images/logo.png" alt="" /> Powered by Amlak</span>
+                        <span class="amlak-badge"><img src="${window.location.origin}/images/cologo.png" alt="" /> Powered by Amlak</span>
                       </div>
                     </div>
                   </div>
@@ -1511,7 +1580,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
               <div class="footer-bar">
                 <div class="footer-bottom">
                   <span class="footer-copy">Arar Millennium Company Ltd &copy; ${new Date().getFullYear()}</span>
-                  <span class="amlak-badge"><img src="${window.location.origin}/images/logo.png" alt="" /> Powered by Amlak</span>
+                  <span class="amlak-badge"><img src="${window.location.origin}/images/cologo.png" alt="" /> Powered by Amlak</span>
                 </div>
               </div>
             </div>
@@ -1573,16 +1642,16 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         const mpi = count > 0 && months > 0 ? Math.round(months / count) : 0;
         const freq = mpi === 1 ? 'Monthly' : mpi === 2 ? 'Every 2M' : mpi === 3 ? 'Quarterly' : mpi === 4 ? 'Every 4M' : mpi === 6 ? 'Semi-Annual' : mpi === 12 ? 'Annual' : mpi > 0 ? `Every ${mpi}M` : '';
         const fees = [
-          { lbl: 'Water', val: Number(c.waterFee) || 0, cls: 'cyan' },
-          { lbl: 'Internet', val: Number(c.internetFee) || 0, cls: 'sky' },
-          { lbl: 'Parking', val: Number(c.parkingFee) || 0, cls: 'slate' },
-          { lbl: 'Management', val: Number(c.managementFee) || 0, cls: 'indigo' },
+          ...(Number(c.waterFee) > 0 ? [{ lbl: 'Water', val: Number(c.waterFee) || 0, cls: 'cyan' }] : []),
+          ...(Number(c.internetFee) > 0 ? [{ lbl: 'Internet', val: Number(c.internetFee) || 0, cls: 'sky' }] : []),
+          ...(Number(c.parkingFee) > 0 ? [{ lbl: 'Parking', val: Number(c.parkingFee) || 0, cls: 'slate' }] : []),
+          ...(Number(c.managementFee) > 0 ? [{ lbl: t('contract.managementFee'), val: Number(c.managementFee) || 0, cls: 'indigo' }] : []),
           { lbl: 'Insurance', val: Number(c.insuranceFee) || 0, cls: 'orange' },
           { lbl: 'Service', val: Number(c.serviceFee) || 0, cls: 'teal' },
           { lbl: 'Office Fee', val: Number(c.officeFeeAmount) || 0, cls: 'purple' },
           { lbl: 'Extra', val: Number(c.otherAmount) || 0, cls: 'lime' },
           { lbl: 'Deduction', val: Number(c.otherDeduction) || 0, cls: 'rose' },
-        ].filter(f => f.value > 0);
+        ].filter(f => f.val > 0);
 
         return `
         <div class="card">
@@ -1752,19 +1821,21 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
 
   if (view === 'DETAILS' && selectedContract) {
       return (
-        <div className="mobile-tab-shell tab-contracts max-w-4xl mx-auto animate-fade-in pb-20">
+        <div className="mobile-tab-shell tab-contracts w-full min-w-0 max-w-4xl mx-auto animate-fade-in overflow-x-hidden pb-4 sm:pb-6">
           {renderConfirmModal()}
           <div className="mb-6 flex items-center gap-4">
             <button onClick={() => setView('LIST')} className="p-2 bg-white rounded-xl shadow-sm hover:bg-slate-50 text-slate-500">{isRTL ? <ArrowRight /> : <ArrowLeft />}</button>
             <h2 className="text-2xl font-black text-slate-800">{t('contract.details')}</h2>
             <div className="ms-auto flex items-center gap-3 flex-wrap">
               <button onClick={() => handleQuickPayment(selectedContract)} className="px-3 py-2 bg-emerald-500 text-white rounded-xl text-sm font-bold shadow-lg">{t('contract.recordPayment')}</button>
-              {/* Collect non-VAT fees (water, internet, parking, management) separately */}
+              {/* Collect non-VAT fees separately: non-residential only (residential fees are part of normal rent) */}
               {(() => {
-                const nonVatFees = (Number(selectedContract.waterFee) || 0)
-                  + (Number(selectedContract.internetFee) || 0)
-                  + (Number((selectedContract as any).parkingFee) || 0)
-                  + (Number((selectedContract as any).managementFee) || 0);
+                if (!isNonResidentialBuildingForContract(buildings, selectedContract)) return null;
+                const nonVatFees =
+                  (Number(selectedContract.waterFee) || 0) +
+                  (Number(selectedContract.internetFee) || 0) +
+                  (Number((selectedContract as any).parkingFee) || 0) +
+                  (Number((selectedContract as any).managementFee) || 0);
                 const instCount = Number(selectedContract.installmentCount) || 1;
                 const feesPerInst = Math.round(nonVatFees / instCount);
                 if (feesPerInst <= 0) return null;
@@ -1808,21 +1879,31 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
               <div><span className="text-slate-500">{t('entry.unit')}</span>: <span className="font-bold text-slate-800">{selectedContract.unitName}</span></div>
               <div><span className="text-slate-500">{t('history.customer')}</span>: <span className="font-bold text-slate-800">{displayContractCustomerName(selectedContract)}</span></div>
                 {(() => {
-                  const b = buildings.find(x => x.id === selectedContract.buildingId);
+                  const b =
+                    buildings.find(x => x.id === selectedContract.buildingId) ||
+                    buildings.find(x => (x.name || '').trim() === ((selectedContract as any).buildingName || '').trim());
                   const isVAT = b?.propertyType === 'NON_RESIDENTIAL' || b?.vatApplicable;
                   const vatSuffix = isVAT ? ' (Excl. VAT)' : '';
                   return (
                     <>
                       <div><span className="text-slate-500">{t('contract.rentValueShort')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.rentValue?.toLocaleString()} {t('common.sar')}</span></div>
-                      <div><span className="text-slate-500">{t('contract.waterFeeShort')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.waterFee?.toLocaleString()} {t('common.sar')}</span></div>
-                      <div><span className="text-slate-500">{t('contract.internetFeeShort')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.internetFee?.toLocaleString()} {t('common.sar')}</span></div>
+                      {Number(selectedContract.waterFee) > 0 && (
+                        <div><span className="text-slate-500">{t('contract.waterFeeShort')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.waterFee?.toLocaleString()} {t('common.sar')}</span></div>
+                      )}
+                      {Number(selectedContract.internetFee) > 0 && (
+                        <div><span className="text-slate-500">{t('contract.internetFeeShort')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{Number(selectedContract.internetFee || 0).toLocaleString()} {t('common.sar')}</span></div>
+                      )}
+                      <div><span className="text-slate-500">Parking{vatSuffix}</span>: <span className="font-bold text-slate-800">{Number((selectedContract as any).parkingFee || 0).toLocaleString()} {t('common.sar')}</span></div>
+                      <div><span className="text-slate-500">{t('contract.managementFee')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{Number((selectedContract as any).managementFee || 0).toLocaleString()} {t('common.sar')}</span></div>
                       <div><span className="text-slate-500">{t('contract.insuranceFee')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.insuranceFee?.toLocaleString()} SAR</span></div>
                       <div><span className="text-slate-500">{t('contract.serviceFee')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.serviceFee?.toLocaleString()} SAR</span></div>
                       <div><span className="text-slate-500">{t('contract.officePercent')}</span>: <span className="font-bold text-slate-800">{selectedContract.officePercent}</span></div>
                       <div><span className="text-slate-500">{t('contract.officeFeeAmount')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.officeFeeAmount?.toLocaleString()} SAR</span></div>
                       <div><span className="text-slate-500">{t('contract.otherDeduction')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.otherDeduction?.toLocaleString()} SAR</span></div>
                       <div><span className="text-slate-500">{t('contract.otherAmount')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.otherAmount?.toLocaleString()} SAR</span></div>
-                      <div><span className="text-slate-500">{t('contract.upfrontPaidShort')}</span>: <span className="font-bold text-slate-800">{selectedContract.upfrontPaid?.toLocaleString()} {t('common.sar')}</span></div>
+                      {isAdmin && (
+                        <div><span className="text-slate-500">{t('contract.upfrontPaidShort')}</span>: <span className="font-bold text-slate-800">{selectedContract.upfrontPaid?.toLocaleString()} {t('common.sar')}</span></div>
+                      )}
                       <div><span className="text-slate-500">{t('contract.totalValue')}{isVAT ? ' (Excl. VAT)' : ''}</span>: <span className="font-bold text-emerald-600">{selectedContract.totalValue?.toLocaleString()} SAR</span></div>
                       <div><span className="text-slate-500">{t('contract.installmentCount')}</span>: <span className="font-bold text-slate-800">{selectedContract.installmentCount}</span></div>
                       <div><span className="text-slate-500">{t('contract.firstInstallment')}{vatSuffix}</span>: <span className="font-bold text-slate-800">{selectedContract.firstInstallment?.toLocaleString()} SAR</span></div>
@@ -1839,13 +1920,27 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
               <div><span className="text-slate-500">{t('contract.createdBy')}</span>: <span className="font-bold text-slate-800">{selectedContract.createdBy || '-'}</span></div>
             </div>
           </div>
+          {(selectedContract as any).priorLeaseContractNoAtRenewal != null &&
+            String((selectedContract as any).priorLeaseContractNoAtRenewal || '').trim() !== '' && (
+              <div className="ios-card p-6 mb-8 border border-sky-200 bg-sky-50/50">
+                <h3 className="text-sm font-bold uppercase text-sky-700 mb-2 tracking-wide">{t('contract.priorLeaseOnContract')}</h3>
+                <p className="text-sm font-semibold text-sky-950 leading-relaxed">
+                  {t('contract.priorLeaseDetail', {
+                    priorNo: String((selectedContract as any).priorLeaseContractNoAtRenewal),
+                    remaining: Math.round(Number((selectedContract as any).priorLeaseOutstandingAtRenewal || 0) * 100) / 100,
+                    total: Math.round(Number((selectedContract as any).priorLeaseEffectiveTotalAtRenewal || 0) * 100) / 100,
+                    paid: Math.round(Number((selectedContract as any).priorLeasePaidAtRenewal || 0) * 100) / 100,
+                  })}
+                </p>
+              </div>
+            )}
           {/* ...existing code... */}
                <div className="ios-card p-6 mt-6">
                  <h3 className="text-sm font-bold uppercase text-slate-400 mb-4">{t('contract.fullDetails')}</h3>
                  <div className="space-y-3 text-sm text-slate-700">
                    <div className="flex justify-between"><span className="text-slate-500">{t('common.status')}</span><span className="font-bold text-slate-800">{selectedContract.status}</span></div>
                    <div className="flex justify-between"><span className="text-slate-500">{t('contract.tenantContact')}</span><span className="font-bold text-slate-800">{displayContractCustomerName(selectedContract)} {selectedContract.customerPhone || ''}</span></div>
-                   {(selectedContract as any).upfrontPaid ? (
+                  {isAdmin && (selectedContract as any).upfrontPaid ? (
                      <div className="flex justify-between"><span className="text-slate-500">{t('contract.upfrontPaidShort')}</span><span className="font-bold text-slate-800">{Number((selectedContract as any).upfrontPaid || 0).toLocaleString()} {t('common.sar')}</span></div>
                    ) : null}
                    <div className="flex justify-between"><span className="text-slate-500">{t('common.notes')}</span><span className="font-bold text-slate-800">{selectedContract.notes || '-'}</span></div>
@@ -2168,18 +2263,76 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     if (filterToDate && dateField) {
       if (new Date(dateField + 'T00:00:00') > new Date(filterToDate + 'T00:00:00')) return false;
     }
-    if (searchQuery) {
-      const q = searchQuery.toLowerCase();
-      const matches = (c.customerName || '').toLowerCase().includes(q) || (c.unitName || '').toLowerCase().includes(q) || (String(c.contractNo) || '').toLowerCase().includes(q) || (c.buildingName || '').toLowerCase().includes(q);
-      if (!matches) return false;
+    if (searchQuery.trim()) {
+      // Contracts: strict progressive prefix search on key fields (avoids dates/amounts causing noisy matches).
+      // Also uses "compact" matching so X101 matches X-101 / X 101 / X_101.
+      const norm = (v: any) => String(v ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+      const compact = (v: any) =>
+        String(v ?? '')
+          .trim()
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, '');
+      const numSegments = (v: any): string[] => {
+        const s = String(v ?? '').trim();
+        const segs = s.match(/\d+/g) || [];
+        return segs;
+      };
+      const tokens = norm(searchQuery).split(/[\s,]+/g).filter(Boolean);
+      const fields: any[] = [
+        c.unitName,
+        c.contractNo,
+        c.buildingName,
+        c.customerName,
+        c.customerId,
+        c.id,
+        c.electricityMeter,
+      ];
+      const tokenMatchesAnyField = (tok: string): boolean => {
+        const t = norm(tok);
+        const hasLetters = /[a-z]/i.test(tok);
+        const tC = hasLetters ? compact(tok) : '';
+        const tokNumSegs = numSegments(tok);
+        const tokHasMultiSegNumeric = tokNumSegs.length >= 2 && /[.\-_/\\]/.test(tok);
+        if (!t) return true;
+        return fields.some((f) => {
+          const s = norm(f);
+          if (s && s.startsWith(t)) return true;
+          // word-boundary prefix within a field (e.g. "al noor" token "no")
+          if (s) {
+            const words = s.split(/[^a-z0-9]+/g).filter(Boolean);
+            if (words.some((w) => w.startsWith(t))) return true;
+          }
+          // Segmented numeric search (e.g. 1.03) should match "1-03" / "1.03" but NOT plain "103".
+          if (tokHasMultiSegNumeric) {
+            const fSegs = numSegments(f);
+            if (fSegs.length >= tokNumSegs.length) {
+              let ok = true;
+              for (let i = 0; i < tokNumSegs.length; i++) {
+                const a = String(fSegs[i] ?? '');
+                const b = String(tokNumSegs[i] ?? '');
+                if (!a.startsWith(b)) { ok = false; break; }
+              }
+              if (ok) return true;
+            }
+          }
+          if (tC) {
+            const sc = compact(f);
+            if (sc && sc.startsWith(tC)) return true;
+          }
+          return false;
+        });
+      };
+      if (!tokens.every(tokenMatchesAnyField)) return false;
     }
     return true;
   }).sort((a: any, b: any) => {
     // Alphanumeric sort helper: extract text prefix and number for natural ordering
     // e.g. A101 < A102 < B101 < B103
     const alphaNumCmp = (s1: string, s2: string) => {
-      const m1 = s1.match(/^([A-Za-z\s-]*)[-.]?(\d+)(.*)$/);
-      const m2 = s2.match(/^([A-Za-z\s-]*)[-.]?(\d+)(.*)$/);
+      const x1 = String(s1 ?? '');
+      const x2 = String(s2 ?? '');
+      const m1 = x1.match(/^([A-Za-z\s-]*)[-.]?(\d+)(.*)$/);
+      const m2 = x2.match(/^([A-Za-z\s-]*)[-.]?(\d+)(.*)$/);
       if (m1 && m2) {
         const p1 = m1[1].replace(/[-\s]+$/, '').toLowerCase();
         const p2 = m2[1].replace(/[-\s]+$/, '').toLowerCase();
@@ -2188,8 +2341,22 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         if (n1 !== n2) return n1 - n2;
         return (m1[3] || '').localeCompare(m2[3] || '');
       }
-      return s1.localeCompare(s2, undefined, { sensitivity: 'base' });
+      return x1.localeCompare(x2, undefined, { sensitivity: 'base' });
     };
+
+    const getSortDate = (c: any): number => {
+      const useExpiryDate = filterStatuses.includes('Expiring');
+      const raw = useExpiryDate ? (c.toDate || c.endDate || '') : (c.contractDate || c.fromDate || '');
+      const t = raw ? new Date(String(raw) + 'T00:00:00').getTime() : 0;
+      return Number.isFinite(t) ? t : 0;
+    };
+
+    if (sortBy === 'ROOM_ASC') return alphaNumCmp(a.unitName || '', b.unitName || '');
+    if (sortBy === 'ROOM_DESC') return alphaNumCmp(b.unitName || '', a.unitName || '');
+    if (sortBy === 'DATE_NEWEST') return getSortDate(b) - getSortDate(a);
+    if (sortBy === 'DATE_OLDEST') return getSortDate(a) - getSortDate(b);
+
+    // DEFAULT (existing behavior)
     // Primary sort: days remaining ascending (soonest expiring first)
     const daysA = a.daysRemaining ?? 99999;
     const daysB = b.daysRemaining ?? 99999;
@@ -2205,7 +2372,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   });
 
   return (
-    <div className="mobile-tab-shell tab-contracts max-w-6xl mx-auto animate-fade-in pb-20">
+    <div className="mobile-tab-shell tab-contracts w-full min-w-0 max-w-6xl mx-auto animate-fade-in overflow-x-hidden pb-4 sm:pb-6">
       {renderConfirmModal()}
       <div className="glass-tab-bar mb-6 max-w-sm mx-auto">
          <button onClick={() => { setView('FORM'); resetForm(); }} className={`glass-tab ${view === 'FORM' ? 'is-active' : ''}`}><PlusCircle size={16} />{t('contract.new')}</button>
@@ -2215,13 +2382,44 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
       {view === 'FORM' ? (
         <form onSubmit={handleSubmit} className="ios-card p-8 space-y-8 relative">
            {errorMsg && <div className="bg-rose-50 border border-rose-200 text-rose-700 px-6 py-4 rounded-xl flex items-center gap-3 animate-shake shadow-sm font-semibold"><AlertTriangle /> {errorMsg}</div>}
+           {renewalSourceId && carriedRenewalBalance && (
+             <div className="bg-sky-50 border border-sky-200 text-sky-950 px-5 py-4 rounded-xl flex gap-3 shadow-sm">
+               <AlertCircle className="shrink-0 mt-0.5 text-sky-600" size={22} />
+               <div className="space-y-1 text-sm">
+                 <div className="font-black text-sky-900 uppercase tracking-wide text-xs">{t('contract.renewalPriorBannerTitle')}</div>
+                 {carriedRenewalBalance.remaining > 0 ? (
+                   <p className="font-semibold text-sky-950 leading-relaxed">
+                     {t('contract.renewalPriorBannerOwe', {
+                       priorNo: carriedRenewalBalance.priorContractNo,
+                       remaining: Math.round(carriedRenewalBalance.remaining * 100) / 100,
+                     })}
+                   </p>
+                 ) : (
+                   <p className="font-semibold text-sky-950 leading-relaxed">
+                     {t('contract.renewalPriorBannerPaid', { priorNo: carriedRenewalBalance.priorContractNo })}
+                   </p>
+                 )}
+               </div>
+             </div>
+           )}
 
            <div className="flex justify-between items-center pb-4 border-b border-slate-100">
                <div>
                   <h2 className="text-xl font-bold text-slate-900">{editingContractId ? t('contract.editContract') : renewalSourceId ? t('contract.renewContract') : t('contract.newLease')}</h2>
                   <p className="text-xs font-medium text-slate-500 mt-1">{editingContractId ? t('contract.editFormDesc') : renewalSourceId ? t('contract.renewFormDesc') : t('contract.fillDetails')}</p>
                </div>
-               <div className="bg-ios-bg text-slate-500 px-3 py-1.5 rounded-lg text-xs font-mono font-bold border border-slate-200">#{nextContractNo}</div>
+               <div className="bg-ios-bg text-slate-500 px-3 py-1.5 rounded-lg text-xs font-mono font-bold border border-slate-200">
+                 #
+                 {editingContractId
+                   ? String((contractsWithProgress as any[]).find((x) => x.id === editingContractId)?.contractNo ?? nextContractNo)
+                   : renewalSourceId
+                   ? String(
+                       carriedRenewalBalance?.priorContractNo ??
+                         (existingContracts as any[]).find((c) => c.id === renewalSourceId)?.contractNo ??
+                         nextContractNo,
+                     )
+                   : nextContractNo}
+               </div>
            </div>
 
            <div className="grid grid-cols-1 lg:grid-cols-4 gap-6">
@@ -2245,7 +2443,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
            </div>
 
            <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
-              <div className="space-y-6">
+              <div className="space-y-6 order-2 lg:order-1">
                   <h3 className="text-sm font-black text-slate-800 flex items-center gap-2"><Building2 size={16}/> {t('contract.propertyDetails')}</h3>
                   <div className="grid grid-cols-2 gap-4">
                       <div className="col-span-2 space-y-2">
@@ -2388,12 +2586,14 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                   </div>
               </div>
 
-              <div className="bg-slate-50/50 rounded-3xl p-3 sm:p-6 border border-slate-200">
+              <div className="bg-slate-50/50 rounded-3xl p-3 sm:p-6 border border-slate-200 order-1 lg:order-2">
                     <h3 className="text-sm font-black text-slate-800 flex items-center gap-2 mb-6"><Calculator size={16}/>{t('contract.financialBreakdown')}</h3>
                   
                   <div className="grid grid-cols-2 gap-x-3 gap-y-3 sm:gap-x-4 sm:gap-y-4">
                       <InputField label={t('contract.rentValueTotal')} value={rentValue} setter={setRentValue} prefix="SAR" readonly={isRestrictedEdit} />
-                      <InputField label={t('contract.upfrontPaid')} value={upfrontPaid} setter={setUpfrontPaid} prefix="SAR" readonly={isRestrictedEdit} />
+                      {isAdmin && (
+                        <InputField label={t('contract.upfrontPaid')} value={upfrontPaid} setter={setUpfrontPaid} prefix="SAR" readonly={isRestrictedEdit} />
+                      )}
                       <InputField label={t('contract.waterRate')} value={monthlyWaterRate} setter={(v: any) => {
                         setMonthlyWaterRate(v);
                         const rate = typeof v === 'string' ? (parseFloat(v) || 0) : (v || 0);
@@ -2406,9 +2606,20 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                           {Number(waterFee).toLocaleString()} SAR
                         </div>
                       </div>
-                      <InputField label={t('contract.internetFee')} value={internetFee} setter={setInternetFee} prefix="SAR" readonly={isRestrictedEdit} />
+                      <InputField label={t('contract.internetRate')} value={monthlyInternetRate} setter={(v: any) => {
+                        setMonthlyInternetRate(v);
+                        const rate = typeof v === 'string' ? (parseFloat(v) || 0) : (v || 0);
+                        const totalMonths = toNum(periodMonths) + toNum(periodDays) / 30;
+                        setInternetFee(Math.round(rate * (totalMonths / 12)));
+                      }} prefix="SAR" readonly={isRestrictedEdit} />
+                      <div className="space-y-2">
+                        <label className="text-[10px] sm:text-[11px] font-bold text-slate-500 uppercase tracking-wider ms-1">{t('contract.internetFee')}</label>
+                        <div className="w-full ps-3 sm:ps-4 pe-2 sm:pe-4 py-2.5 sm:py-3 bg-slate-100/50 border border-slate-300 rounded-xl text-xs sm:text-sm font-bold text-slate-500">
+                          {Number(internetFee).toLocaleString()} SAR
+                        </div>
+                      </div>
                       <InputField label="Parking Fee" value={parkingFee} setter={setParkingFee} prefix="SAR" readonly={isRestrictedEdit} />
-                      <InputField label="Management Fee" value={managementFee} setter={setManagementFee} prefix="SAR" readonly={isRestrictedEdit} />
+                      <InputField label={t('contract.managementFee')} value={managementFee} setter={setManagementFee} prefix="SAR" readonly={isRestrictedEdit} />
                       <InputField label="Electricity Meter" value={electricityMeter} setter={setElectricityMeter} type="text" readonly={isRestrictedEdit} />
                       <InputField label={t('contract.officeCharge')} value={officePercent} setter={setOfficePercent} readonly={isRestrictedEdit || !!renewalSourceId} />
                       
@@ -2459,7 +2670,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                              <span className="text-xs font-bold uppercase tracking-widest text-slate-900">{t('contract.totalValue')}</span>
                              <div className="text-3xl font-black tracking-tight text-slate-900"><div className="amount-pill amount-neutral"><span className="amt-value">{totalValue.toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div></div>
                           </div>
-                          {upfrontCoverage && (
+                          {isAdmin && upfrontCoverage && (
                             <div className="mb-3 p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-sm relative z-10">
                               <div className="font-bold text-emerald-800 mb-1">{t('contract.upfrontCoverage', { amount: upfrontCoverage.total.toLocaleString() })}</div>
                               <div className="text-emerald-700">
@@ -2471,7 +2682,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                           )}
                           <div className="pt-4 border-t border-slate-200 grid grid-cols-2 gap-6 relative z-10">
                                 <div>
-                                  <div className="text-[10px] text-slate-900 uppercase font-black mb-1">{upfrontCoverage && firstInstallment === 0 ? t('contract.firstPaymentPaid') : t('contract.firstPayment')}</div>
+                                  <div className="text-[10px] text-slate-900 uppercase font-black mb-1">{isAdmin && upfrontCoverage && firstInstallment === 0 ? t('contract.firstPaymentPaid') : t('contract.firstPayment')}</div>
                                   <div className="text-xl font-bold text-slate-900"><div className="amount-pill amount-neutral"><span className="amt-value">{firstInstallment.toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div></div>
                                 </div>
                                 <div>
@@ -2479,7 +2690,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                                   <div className="text-xl font-bold text-slate-900"><div className="amount-pill amount-neutral"><span className="amt-value">{otherInstallment.toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div></div>
                                 </div>
                           </div>
-                          {/* VAT / Non-VAT split — only shown for non-residential buildings */}
+                          {/* VAT properties: split rent (VAT) vs non-VAT fees (water always; other fees non-res only) */}
                           {calcIsVAT && (nonVatFeesTotal > 0) && (
                             <div className="mt-3 pt-3 border-t border-slate-100 space-y-2">
                               <div className="text-[9px] font-black text-slate-400 uppercase tracking-widest mb-1">Per-Installment Breakdown</div>
@@ -2491,8 +2702,43 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                                 </div>
                                 <div className="bg-sky-50 border border-sky-100 rounded-xl p-3">
                                   <div className="text-[9px] font-black text-sky-600 uppercase tracking-widest mb-1">Fees (No VAT)</div>
-                                  <div className="font-black text-sky-800 text-base">{nonVatOtherInstallment.toLocaleString()} <span className="text-[10px] font-bold">SAR</span></div>
+                                  <div className="font-black text-sky-800 text-base">
+                                    {(nonVatOtherInstallment > 0 ? nonVatOtherInstallment : nonVatFirstInstallment).toLocaleString()}{' '}
+                                    <span className="text-[10px] font-bold">SAR</span>
+                                  </div>
+                                  <div className="text-[9px] text-sky-500 -mt-0.5">
+                                    {nonVatOtherInstallment > 0 ? 'Other installments' : '1st installment'}
+                                  </div>
                                   <div className="text-[9px] text-sky-500 mt-0.5">Total: {nonVatFeesTotal.toLocaleString()} SAR</div>
+                                  <div className="mt-2 pt-2 border-t border-sky-200/80 space-y-1 text-[9px] text-sky-800 font-semibold">
+                                    {toNum(waterFee) > 0 && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.waterFee')}</span><span>{waterPerInst.toLocaleString()} / inst · {toNum(waterFee).toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(internetFee) > 0 && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.internetFee')}</span><span>{internetPerInst.toLocaleString()} / inst · {toNum(internetFee).toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(parkingFee) > 0 && (
+                                      <div className="flex justify-between gap-2"><span>Parking</span><span>{parkingPerInst.toLocaleString()} / inst · {toNum(parkingFee).toLocaleString()} total</span></div>
+                                    )}
+                                    {officeFeeAmount > 0 && !renewalSourceId && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.officeFeeAmount')}</span><span>{officeFeeAmount.toLocaleString()} on 1st only · {officeFeeAmount.toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(serviceFee) > 0 && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.serviceFee')}</span><span>{toNum(serviceFee).toLocaleString()} on 1st only · {toNum(serviceFee).toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(insuranceFee) > 0 && !renewalSourceId && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.insuranceFee')}</span><span>{toNum(insuranceFee).toLocaleString()} on 1st only · {toNum(insuranceFee).toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(otherAmount) > 0 && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.otherAmount')}</span><span>{toNum(otherAmount).toLocaleString()} on 1st only · {toNum(otherAmount).toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(otherDeduction) > 0 && (
+                                      <div className="flex justify-between gap-2 text-rose-700"><span>{t('contract.otherDeduction')}</span><span>-{toNum(otherDeduction).toLocaleString()} on 1st only · -{toNum(otherDeduction).toLocaleString()} total</span></div>
+                                    )}
+                                    {toNum(managementFee) > 0 && (
+                                      <div className="flex justify-between gap-2"><span>{t('contract.managementFee')} (Ejar)</span><span>{ejarFullAmount.toLocaleString()} on 1st only</span></div>
+                                    )}
+                                  </div>
                                 </div>
                               </div>
                             </div>
@@ -2512,15 +2758,27 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         </form>
       ) : (
         <div className="space-y-4">
-          <div className="flex flex-col md:flex-row gap-3 items-center mb-2">
-                <input value={searchQuery} onChange={(e) => setSearchQuery(e.target.value)} placeholder={t('contract.search')} className="px-3 py-2 rounded-xl border bg-white text-sm w-full md:w-64" />
-            <div className="flex items-center gap-1 flex-wrap">
+          <div className="relative z-30 mb-1 overflow-visible rounded-2xl border border-slate-200/90 bg-gradient-to-br from-slate-50/95 via-white to-emerald-50/25 shadow-sm ring-1 ring-slate-200/40">
+            {/* Search + status */}
+            <div className="flex flex-col gap-3 p-3 sm:p-4 lg:flex-row lg:items-center lg:gap-4">
+              <div className="relative min-w-0 flex-1 lg:max-w-md">
+                <Search className="pointer-events-none absolute start-3 top-1/2 h-4 w-4 -translate-y-1/2 text-slate-400" aria-hidden />
+                <input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder={t('contract.search')}
+                  className="w-full rounded-xl border border-slate-200/90 bg-white/90 py-2.5 ps-10 pe-3 text-sm font-medium text-slate-800 shadow-inner shadow-slate-200/20 outline-none transition focus:border-emerald-300 focus:ring-2 focus:ring-emerald-500/20"
+                />
+              </div>
+              <div className="flex min-w-0 flex-1 flex-col gap-2 sm:flex-row sm:items-center sm:gap-2">
+                <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-wider text-slate-400">{t('contract.status')}</span>
+                <div className="flex flex-1 flex-wrap items-center gap-1.5">
               {([
-                { status: 'Active', selectedCls: 'bg-emerald-50 text-emerald-700 border-emerald-300 ring-1 ring-emerald-200', labelKey: 'contract.statusActive' },
-                { status: 'Expiring', selectedCls: 'bg-orange-50 text-orange-700 border-orange-300 ring-1 ring-orange-200', labelKey: 'contract.statusExpiring' },
-                { status: 'Expired', selectedCls: 'bg-rose-50 text-rose-700 border-rose-300 ring-1 ring-rose-200', labelKey: 'contract.statusExpired' },
-                { status: 'Terminated', selectedCls: 'bg-amber-50 text-amber-700 border-amber-300 ring-1 ring-amber-200', labelKey: 'contract.statusTerminated' },
-                { status: 'Old', selectedCls: 'bg-blue-50 text-blue-700 border-blue-300 ring-1 ring-blue-200', labelKey: 'contract.statusOld' },
+                { status: 'Active', selectedCls: 'bg-emerald-50 text-emerald-800 border-emerald-300/80 shadow-sm ring-1 ring-emerald-200/60', labelKey: 'contract.statusActive' },
+                { status: 'Expiring', selectedCls: 'bg-orange-50 text-orange-800 border-orange-300/80 shadow-sm ring-1 ring-orange-200/60', labelKey: 'contract.statusExpiring' },
+                { status: 'Expired', selectedCls: 'bg-rose-50 text-rose-800 border-rose-300/80 shadow-sm ring-1 ring-rose-200/60', labelKey: 'contract.statusExpired' },
+                { status: 'Terminated', selectedCls: 'bg-amber-50 text-amber-800 border-amber-300/80 shadow-sm ring-1 ring-amber-200/50', labelKey: 'contract.statusTerminated' },
+                { status: 'Old', selectedCls: 'bg-blue-50 text-blue-800 border-blue-300/80 shadow-sm ring-1 ring-blue-200/60', labelKey: 'contract.statusOld' },
               ] as { status: string; selectedCls: string; labelKey: string }[]).map(({ status, selectedCls, labelKey }) => {
                 const isSelected = filterStatuses.includes(status);
                 return (
@@ -2533,8 +2791,8 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                         prev.includes(status) ? prev.filter(s => s !== status) : [...prev, status]
                       );
                     }}
-                    className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border ${
-                      isSelected ? selectedCls : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
+                    className={`whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] font-extrabold transition-all sm:px-3 sm:py-1.5 sm:text-xs ${
+                      isSelected ? selectedCls : 'border border-slate-200/90 bg-white text-slate-500 hover:border-slate-300 hover:bg-slate-50/80'
                     }`}
                   >
                     {t(labelKey)}
@@ -2544,22 +2802,31 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
               <button
                 type="button"
                 onClick={() => { SoundService.play('click'); setFilterStatuses([]); }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border ${
+                className={`whitespace-nowrap rounded-full px-2.5 py-1.5 text-[11px] font-extrabold transition-all sm:px-3 sm:text-xs ${
                   filterStatuses.length === 0
-                    ? 'bg-slate-700 text-white border-slate-700'
-                    : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'
+                    ? 'border border-slate-700 bg-slate-800 text-white shadow-sm'
+                    : 'border border-slate-200/90 bg-white text-slate-500 hover:border-slate-300'
                 }`}
               >{t('common.all')}</button>
+                </div>
+              </div>
             </div>
+
+            <div className="border-t border-slate-100/90 bg-slate-50/40 px-3 py-3 sm:px-4">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <span className="text-[10px] font-extrabold uppercase tracking-wider text-slate-500">{t('common.filters')}</span>
+              </div>
+              <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-2">
             {/* Building multi-select */}
             <div className="relative" data-filter-dropdown>
-              <button type="button" onClick={() => { setShowBuildingFilter(!showBuildingFilter); setShowTenantFilter(false); setShowUnitFilter(false); SoundService.play('click'); }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border flex items-center gap-1.5 ${filterBuildingIds.length > 0 ? 'bg-blue-50 text-blue-700 border-blue-300 ring-1 ring-blue-200' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`}>
-                <Building2 size={13} />
-                {filterBuildingIds.length === 0 ? t('contract.buildingsAll') : t('contract.buildingsCount', { count: String(filterBuildingIds.length) })}
+              <button type="button" onClick={() => { setShowBuildingFilter(!showBuildingFilter); setShowTenantFilter(false); setShowUnitFilter(false); setShowFeeFilter(false); SoundService.play('click'); }}
+                className={`flex h-9 w-full min-w-[9.5rem] items-center justify-center gap-1.5 rounded-xl border px-2.5 text-xs font-extrabold transition-all sm:min-w-[10rem] ${filterBuildingIds.length > 0 ? 'border-blue-300/80 bg-blue-50 text-blue-800 shadow-sm ring-1 ring-blue-200/50' : 'border-slate-200/90 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}>
+                <Building2 size={14} className="shrink-0 opacity-80" />
+                <span className="truncate">{filterBuildingIds.length === 0 ? t('contract.buildingsAll') : t('contract.buildingsCount', { count: String(filterBuildingIds.length) })}</span>
               </button>
               {showBuildingFilter && (
-                <div className="absolute top-full start-0 mt-1 z-50 bg-white border border-slate-200 rounded-xl shadow-xl p-2 min-w-[220px] max-h-64 overflow-y-auto">
+                <div className="absolute top-full start-0 z-[200] mt-1 max-h-64 min-w-[220px] overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-2xl ring-1 ring-slate-200/60">
                   <input value={buildingFilterSearch} onChange={e => setBuildingFilterSearch(e.target.value)} placeholder={t('contract.searchBuildings')} className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg mb-1.5 outline-none focus:ring-1 focus:ring-blue-300" />
                   <button type="button" onClick={() => { setFilterBuildingIds([]); SoundService.play('click'); }} className="w-full text-start px-2.5 py-1.5 text-xs font-bold text-slate-400 hover:bg-slate-50 rounded-lg mb-1">{t('common.clearAll')}</button>
                   {[...buildings].sort((a, b) => {
@@ -2579,13 +2846,13 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
 
             {/* Tenant multi-select */}
             <div className="relative" data-filter-dropdown>
-              <button type="button" onClick={() => { setShowTenantFilter(!showTenantFilter); setShowBuildingFilter(false); setShowUnitFilter(false); SoundService.play('click'); }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border flex items-center gap-1.5 ${filterTenants.length > 0 ? 'bg-violet-50 text-violet-700 border-violet-300 ring-1 ring-violet-200' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`}>
-                <UserIcon size={13} />
-                {filterTenants.length === 0 ? t('contract.tenantsAll') : t('contract.tenantsCount', { count: String(filterTenants.length) })}
+              <button type="button" onClick={() => { setShowTenantFilter(!showTenantFilter); setShowBuildingFilter(false); setShowUnitFilter(false); setShowFeeFilter(false); SoundService.play('click'); }}
+                className={`flex h-9 w-full min-w-[9.5rem] items-center justify-center gap-1.5 rounded-xl border px-2.5 text-xs font-extrabold transition-all sm:min-w-[10rem] ${filterTenants.length > 0 ? 'border-violet-300/80 bg-violet-50 text-violet-800 shadow-sm ring-1 ring-violet-200/50' : 'border-slate-200/90 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}>
+                <UserIcon size={14} className="shrink-0 opacity-80" />
+                <span className="truncate">{filterTenants.length === 0 ? t('contract.tenantsAll') : t('contract.tenantsCount', { count: String(filterTenants.length) })}</span>
               </button>
               {showTenantFilter && (
-                <div className="absolute top-full start-0 mt-1 z-50 bg-white border border-slate-200 rounded-xl shadow-xl p-2 min-w-[250px] max-h-64 overflow-y-auto">
+                <div className="absolute top-full start-0 z-[200] mt-1 max-h-64 min-w-[250px] overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-2xl ring-1 ring-slate-200/60">
                   <input value={tenantFilterSearch} onChange={e => setTenantFilterSearch(e.target.value)} placeholder={t('contract.searchTenants')} className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg mb-1.5 outline-none focus:ring-1 focus:ring-violet-300" />
                   <button type="button" onClick={() => { setFilterTenants([]); SoundService.play('click'); }} className="w-full text-start px-2.5 py-1.5 text-xs font-bold text-slate-400 hover:bg-slate-50 rounded-lg mb-1">{t('common.clearAll')}</button>
                   {(() => {
@@ -2604,13 +2871,13 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
 
             {/* Unit multi-select */}
             <div className="relative" data-filter-dropdown>
-              <button type="button" onClick={() => { setShowUnitFilter(!showUnitFilter); setShowBuildingFilter(false); setShowTenantFilter(false); SoundService.play('click'); }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border flex items-center gap-1.5 ${filterUnits.length > 0 ? 'bg-teal-50 text-teal-700 border-teal-300 ring-1 ring-teal-200' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`}>
-                <List size={13} />
-                {filterUnits.length === 0 ? t('contract.unitsAll') : t('contract.unitsCount', { count: String(filterUnits.length) })}
+              <button type="button" onClick={() => { setShowUnitFilter(!showUnitFilter); setShowBuildingFilter(false); setShowTenantFilter(false); setShowFeeFilter(false); SoundService.play('click'); }}
+                className={`flex h-9 w-full min-w-[8.5rem] items-center justify-center gap-1.5 rounded-xl border px-2.5 text-xs font-extrabold transition-all sm:min-w-[9.5rem] ${filterUnits.length > 0 ? 'border-teal-300/80 bg-teal-50 text-teal-800 shadow-sm ring-1 ring-teal-200/50' : 'border-slate-200/90 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}>
+                <List size={14} className="shrink-0 opacity-80" />
+                <span className="truncate">{filterUnits.length === 0 ? t('contract.unitsAll') : t('contract.unitsCount', { count: String(filterUnits.length) })}</span>
               </button>
               {showUnitFilter && (
-                <div className="absolute top-full start-0 mt-1 z-50 bg-white border border-slate-200 rounded-xl shadow-xl p-2 min-w-[180px] max-h-64 overflow-y-auto">
+                <div className="absolute top-full start-0 z-[200] mt-1 max-h-64 min-w-[180px] overflow-y-auto rounded-xl border border-slate-200 bg-white p-2 shadow-2xl ring-1 ring-slate-200/60">
                   <input value={unitFilterSearch} onChange={e => setUnitFilterSearch(e.target.value)} placeholder={t('contract.searchUnits')} className="w-full px-2.5 py-1.5 text-xs border border-slate-200 rounded-lg mb-1.5 outline-none focus:ring-1 focus:ring-teal-300" />
                   <button type="button" onClick={() => { setFilterUnits([]); SoundService.play('click'); }} className="w-full text-start px-2.5 py-1.5 text-xs font-bold text-slate-400 hover:bg-slate-50 rounded-lg mb-1">{t('common.clearAll')}</button>
                   {(() => {
@@ -2631,21 +2898,21 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
             {/* Fee-type multi-select */}
             <div className="relative" data-filter-dropdown>
               <button type="button" onClick={() => { setShowFeeFilter(!showFeeFilter); setShowBuildingFilter(false); setShowTenantFilter(false); setShowUnitFilter(false); SoundService.play('click'); }}
-                className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all border flex items-center gap-1.5 ${filterFeeTypes.length > 0 ? 'bg-amber-50 text-amber-700 border-amber-300 ring-1 ring-amber-200' : 'bg-white text-slate-500 border-slate-200 hover:bg-slate-50'}`}>
-                <Wifi size={13} />
-                {(() => {
+                className={`flex h-9 w-full min-w-[7.5rem] items-center justify-center gap-1.5 rounded-xl border px-2.5 text-xs font-extrabold transition-all sm:min-w-[8.5rem] ${filterFeeTypes.length > 0 ? 'border-amber-300/80 bg-amber-50 text-amber-900 shadow-sm ring-1 ring-amber-200/50' : 'border-slate-200/90 bg-white text-slate-600 hover:border-slate-300 hover:bg-slate-50'}`}>
+                <Wifi size={14} className="shrink-0 opacity-80" />
+                <span className="truncate">{(() => {
                   const feeLabels: Record<string, string> = {
                     water: 'Water', internet: 'Internet', parking: 'Parking',
                     office: 'Office', insurance: 'Insurance', service: 'Service',
                     upfront: 'Upfront',
                   };
-                  if (filterFeeTypes.length === 0) return 'All Fees';
+                  if (filterFeeTypes.length === 0) return t('contract.allFees');
                   if (filterFeeTypes.length === 1) return `Has ${feeLabels[filterFeeTypes[0]]}`;
                   return `${filterFeeTypes.length} Fees`;
-                })()}
+                })()}</span>
               </button>
               {showFeeFilter && (
-                <div className="absolute top-full start-0 mt-1 z-50 bg-white border border-slate-200 rounded-xl shadow-xl p-2 min-w-[220px]">
+                <div className="absolute top-full start-0 z-[200] mt-1 min-w-[220px] rounded-xl border border-slate-200 bg-white p-2 shadow-2xl ring-1 ring-slate-200/60">
                   <button type="button" onClick={() => { setFilterFeeTypes([]); SoundService.play('click'); }} className="w-full text-start px-2.5 py-1.5 text-xs font-bold text-slate-400 hover:bg-slate-50 rounded-lg mb-1">{t('common.clearAll')}</button>
                   {[
                     { id: 'water', label: 'Water Fee' },
@@ -2673,39 +2940,65 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
               )}
             </div>
 
-            <input type="date" lang={isRTL ? 'ar' : 'en'} value={filterFromDate} onChange={(e) => setFilterFromDate(e.target.value)} className="px-3 py-1.5 rounded-lg border bg-white text-xs font-medium" />
-            <input type="date" lang={isRTL ? 'ar' : 'en'} value={filterToDate} onChange={(e) => setFilterToDate(e.target.value)} className="px-3 py-1.5 rounded-lg border bg-white text-xs font-medium" />
-            <div className="ml-auto flex flex-wrap items-center gap-2">
+            <div className="flex w-full flex-col gap-1.5">
+              <span className="shrink-0 text-[10px] font-extrabold uppercase tracking-wider text-slate-400">
+                <Calendar size={12} className="me-0.5 inline-block align-middle opacity-60" /> {t('contract.period')}
+              </span>
+              <div className="grid w-full grid-cols-1 gap-2 sm:grid-cols-2">
+                <input type="date" lang={isRTL ? 'ar' : 'en'} value={filterFromDate} onChange={(e) => setFilterFromDate(e.target.value)} className="h-9 w-full rounded-xl border border-slate-200/90 bg-white px-2 text-xs font-bold text-slate-700 shadow-sm outline-none focus:border-emerald-300 focus:ring-2 focus:ring-emerald-500/20" />
+                <input type="date" lang={isRTL ? 'ar' : 'en'} value={filterToDate} onChange={(e) => setFilterToDate(e.target.value)} className="h-9 w-full rounded-xl border border-slate-200/90 bg-white px-2 text-xs font-bold text-slate-700 shadow-sm outline-none focus:border-emerald-300 focus:ring-2 focus:ring-emerald-500/20" />
+              </div>
+            </div>
+            </div>
+
+            <div className="flex w-full flex-col gap-2 border-t border-slate-200/60 pt-3">
+              <div className="flex flex-wrap items-center gap-2 sm:justify-end">
+              <select
+                value={sortBy}
+                onChange={(e) => setSortBy(e.target.value as any)}
+                className="inline-flex h-9 shrink-0 items-center justify-center rounded-xl border border-slate-200/90 bg-white px-2.5 text-xs font-extrabold text-slate-700 shadow-sm outline-none transition hover:border-slate-300 focus:border-emerald-300 focus:ring-2 focus:ring-emerald-500/20"
+                aria-label="Sort contracts"
+              >
+                <option value="DEFAULT">Sort: Default</option>
+                <option value="ROOM_ASC">Sort: Room/Unit (A→Z)</option>
+                <option value="ROOM_DESC">Sort: Room/Unit (Z→A)</option>
+                <option value="DATE_NEWEST">Sort: Date (Newest)</option>
+                <option value="DATE_OLDEST">Sort: Date (Oldest)</option>
+              </select>
               <SavedFilters
                 namespace="contracts"
-                getCurrent={() => ({ filterStatuses, filterBuildingIds, filterTenants, filterUnits, filterFeeTypes, filterFromDate, filterToDate, searchQuery })}
-                apply={(s: any) => { setFilterStatuses(s.filterStatuses || (s.filterStatus ? [s.filterStatus] : ['Active', 'Expired', 'Old'])); setFilterBuildingIds(s.filterBuildingIds || (s.filterBuildingId ? [s.filterBuildingId] : [])); setFilterTenants(s.filterTenants || []); setFilterUnits(s.filterUnits || []); setFilterFeeTypes(s.filterFeeTypes || []); setFilterFromDate(s.filterFromDate || ''); setFilterToDate(s.filterToDate || ''); setSearchQuery(s.searchQuery || ''); }}
+                getCurrent={() => ({ filterStatuses, filterBuildingIds, filterTenants, filterUnits, filterFeeTypes, filterFromDate, filterToDate, searchQuery, sortBy })}
+                apply={(s: any) => { setFilterStatuses(s.filterStatuses || (s.filterStatus ? [s.filterStatus] : ['Active', 'Expired', 'Old'])); setFilterBuildingIds(s.filterBuildingIds || (s.filterBuildingId ? [s.filterBuildingId] : [])); setFilterTenants(s.filterTenants || []); setFilterUnits(s.filterUnits || []); setFilterFeeTypes(s.filterFeeTypes || []); setFilterFromDate(s.filterFromDate || ''); setFilterToDate(s.filterToDate || ''); setSearchQuery(s.searchQuery || ''); setSortBy((s.sortBy as any) || 'DEFAULT'); }}
               />
-              <button onClick={() => { setFilterStatuses(['Active', 'Expired', 'Old']); setFilterBuildingIds([]); setFilterTenants([]); setFilterUnits([]); setFilterFeeTypes([]); setFilterFromDate(''); setFilterToDate(''); setSearchQuery(''); }} className="w-full sm:w-auto px-3 py-2 rounded-xl bg-slate-50 border text-sm">{t('common.reset')}</button>
+              <button type="button" onClick={() => { setFilterStatuses(['Active', 'Expired', 'Old']); setFilterBuildingIds([]); setFilterTenants([]); setFilterUnits([]); setFilterFeeTypes([]); setFilterFromDate(''); setFilterToDate(''); setSearchQuery(''); setSortBy('DEFAULT'); }} className="inline-flex h-9 shrink-0 items-center justify-center rounded-xl border border-slate-200/90 bg-white px-3 text-xs font-extrabold text-slate-600 transition hover:border-slate-300 hover:bg-slate-50">{t('common.reset')}</button>
               {currentUser.role === 'ADMIN' && (
-                <div className="flex items-center gap-2">
-                  <button 
+                <div className="flex flex-wrap items-center gap-1.5">
+                  <button
+                    type="button"
                     onClick={() => setShowDeleted(!showDeleted)}
-                    className={`px-3 py-2 rounded-xl text-sm font-bold flex items-center gap-2 ${showDeleted ? 'bg-red-50 text-red-700 border border-red-200' : 'bg-white border border-slate-200 text-slate-600'}`}
+                    className={`inline-flex h-9 items-center gap-1.5 rounded-xl border px-2.5 text-xs font-extrabold transition ${showDeleted ? 'border-rose-200 bg-rose-50 text-rose-800' : 'border-slate-200/90 bg-white text-slate-600 hover:border-slate-300'}`}
                   >
-                    <Trash2 size={16} /> {showDeleted ? t('contract.active') : t('contract.trash', { count: String(contractsWithProgress.filter((c: any) => (c as any).deleted).length) })}
+                    <Trash2 size={15} className="shrink-0" /> {showDeleted ? t('contract.active') : t('contract.trash', { count: String(contractsWithProgress.filter((c: any) => (c as any).deleted).length) })}
                   </button>
                   {showDeleted && (
                     <>
-                      <button onClick={handleRestoreAll} className="px-3 py-2 rounded-xl text-sm font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 hover:bg-emerald-100">{t('history.restoreAll')}</button>
-                      <button onClick={handleDeleteAll} className="px-3 py-2 rounded-xl text-sm font-bold bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100">{t('history.deleteAll')}</button>
+                      <button type="button" onClick={handleRestoreAll} className="inline-flex h-9 items-center rounded-xl border border-emerald-200 bg-emerald-50 px-2.5 text-xs font-extrabold text-emerald-800 hover:bg-emerald-100">{t('history.restoreAll')}</button>
+                      <button type="button" onClick={handleDeleteAll} className="inline-flex h-9 items-center rounded-xl border border-rose-200 bg-rose-50 px-2.5 text-xs font-extrabold text-rose-800 hover:bg-rose-100">{t('history.deleteAll')}</button>
                     </>
                   )}
                 </div>
               )}
-              <button onClick={(e) => { e.preventDefault(); handleExportContractsPdf(filteredContracts); }} className="w-full sm:w-auto px-3 py-2 rounded-xl bg-white border border-emerald-600 text-slate-900 font-bold text-sm flex items-center gap-1.5"><FileText size={14}/>{t('history.exportPdf')}</button>
-              <button onClick={(e) => { e.preventDefault(); handleExportContractsCsv(filteredContracts); }} className="w-full sm:w-auto px-3 py-2 rounded-xl bg-white border border-emerald-600 text-slate-900 font-bold text-sm">{t('contract.exportCsv')}</button>
-              <button onClick={(e) => { e.preventDefault(); handlePrintCards(filteredContracts); }} className="w-full sm:w-auto px-3 py-2 rounded-xl bg-violet-600 text-white font-bold text-sm flex items-center gap-1.5"><Printer size={14}/> Print Cards</button>
-              <button onClick={(e) => { e.preventDefault(); handleExportContractsPdf(filteredContracts); }} className="w-full sm:w-auto px-3 py-2 rounded-xl bg-emerald-600 text-white font-bold text-sm flex items-center gap-1.5"><Printer size={14}/>{t('common.print')}</button>
+              <button type="button" onClick={(e) => { e.preventDefault(); handleExportContractsPdf(filteredContracts); }} className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-emerald-500/80 bg-white px-2.5 text-xs font-extrabold text-emerald-800 shadow-sm transition hover:bg-emerald-50/80"><FileText size={14} className="shrink-0" />{t('history.exportPdf')}</button>
+              <button type="button" onClick={(e) => { e.preventDefault(); handleExportContractsCsv(filteredContracts); }} className="inline-flex h-9 shrink-0 items-center justify-center rounded-xl border border-emerald-500/80 bg-white px-2.5 text-xs font-extrabold text-emerald-800 shadow-sm transition hover:bg-emerald-50/80">{t('contract.exportCsv')}</button>
+              <button type="button" onClick={(e) => { e.preventDefault(); handlePrintCards(filteredContracts); }} className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl border border-violet-400/90 bg-violet-600 px-2.5 text-xs font-extrabold text-white shadow-sm shadow-violet-500/20 transition hover:bg-violet-500"><Printer size={14} className="shrink-0" />{t('contract.printCards')}</button>
+              <button type="button" onClick={(e) => { e.preventDefault(); handleExportContractsPdf(filteredContracts); }} className="inline-flex h-9 shrink-0 items-center justify-center gap-1.5 rounded-xl bg-gradient-to-b from-emerald-500 to-emerald-600 px-2.5 text-xs font-extrabold text-white shadow-sm shadow-emerald-500/25 transition hover:from-emerald-400 hover:to-emerald-500"><Printer size={14} className="shrink-0" />{t('common.print')}</button>
+              </div>
+            </div>
+            </div>
             </div>
           </div>
             {filteredContracts.map(c => (
-              <div key={c.id} onClick={() => openDetails(c)} className={`ios-card p-5 hover:bg-white transition-all group relative overflow-hidden cursor-pointer active:scale-[0.99] ${showDeleted ? 'bg-rose-50/40 border-rose-100 opacity-75' : ''}`}>
+              <div key={c.id} onClick={() => openDetails(c)} className={`ios-card relative z-0 cursor-pointer overflow-hidden p-5 transition-all group hover:bg-white active:scale-[0.99] ${showDeleted ? 'bg-rose-50/40 border-rose-100 opacity-75' : ''}`}>
                       <div className={`absolute start-0 top-0 bottom-0 w-1.5 ${c.status === 'Active' && c.daysRemaining >= 0 && c.daysRemaining <= EXPIRING_THRESHOLD_DAYS ? 'bg-orange-500' : c.status === 'Active' ? 'bg-emerald-500' : c.status === 'Expired' ? 'bg-rose-500' : 'bg-slate-300'}`}></div>
                       <div className="flex flex-col md:flex-row gap-6 items-center ps-4">
                           <div className="flex-1">
@@ -2749,10 +3042,10 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                               })()}
                               {(() => {
                                 const fees: { label: string; value: number; color: string }[] = [
-                                  { label: 'Water', value: Number(c.waterFee) || 0, color: 'bg-cyan-50 border-cyan-100 text-cyan-700' },
-                                  { label: 'Internet', value: Number(c.internetFee) || 0, color: 'bg-sky-50 border-sky-100 text-sky-700' },
-                                  { label: 'Parking', value: Number(c.parkingFee) || 0, color: 'bg-slate-50 border-slate-200 text-slate-600' },
-                                  { label: 'Management', value: Number(c.managementFee) || 0, color: 'bg-indigo-50 border-indigo-100 text-indigo-700' },
+                                  ...(Number(c.waterFee) > 0 ? [{ label: 'Water', value: Number(c.waterFee) || 0, color: 'bg-cyan-50 border-cyan-100 text-cyan-700' }] : []),
+                                  ...(Number(c.internetFee) > 0 ? [{ label: 'Internet', value: Number(c.internetFee) || 0, color: 'bg-sky-50 border-sky-100 text-sky-700' }] : []),
+                                  ...(Number(c.parkingFee) > 0 ? [{ label: 'Parking', value: Number(c.parkingFee) || 0, color: 'bg-slate-50 border-slate-200 text-slate-600' }] : []),
+                                  ...(Number(c.managementFee) > 0 ? [{ label: t('contract.managementFee'), value: Number(c.managementFee) || 0, color: 'bg-indigo-50 border-indigo-100 text-indigo-700' }] : []),
                                   { label: 'Insurance', value: Number(c.insuranceFee) || 0, color: 'bg-orange-50 border-orange-100 text-orange-700' },
                                   { label: 'Service', value: Number(c.serviceFee) || 0, color: 'bg-teal-50 border-teal-100 text-teal-700' },
                                   { label: 'Office Fee', value: Number(c.officeFeeAmount) || 0, color: 'bg-purple-50 border-purple-100 text-purple-700' },
@@ -2780,6 +3073,13 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                           <div className="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
                               <div className={`h-full rounded-full ${c.paidPercent === 100 ? 'bg-emerald-500' : 'bg-ios-blue'}`} style={{width: `${c.paidPercent}%`}}></div>
                           </div>
+                          {(c as any).balanceRemaining > 0 && (
+                            <div className="text-[10px] font-black text-rose-600 mt-1 text-end">
+                              {t('contract.balanceDueList', {
+                                amount: Math.round((c as any).balanceRemaining * 100) / 100,
+                              })}
+                            </div>
+                          )}
                           </div>
                           <div className="flex gap-2">
                               {showDeleted ? (

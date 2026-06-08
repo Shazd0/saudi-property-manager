@@ -7,6 +7,7 @@ import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
 import { useLanguage } from '../i18n';
+import { buildVendorSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import * as XLSX from 'xlsx';
 
 const VendorManager: React.FC = () => {
@@ -213,7 +214,9 @@ const VendorManager: React.FC = () => {
     if (importFileRef.current) importFileRef.current.value = '';
   };
 
-  const filtered = vendors.filter(v => v.name.toLowerCase().includes(searchTerm.toLowerCase()) || v.serviceType.toLowerCase().includes(searchTerm.toLowerCase()));
+  const filtered = vendors.filter((v) =>
+    !searchTerm.trim() || matchesAdvancedSearch(searchTerm, buildVendorSearchHaystack(v)),
+  );
 
   return (
     <div className="premium-card min-h-[600px] animate-fade-in">

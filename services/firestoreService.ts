@@ -1,10 +1,17 @@
-import { db } from "../firebase";
-import { collection as _colRef, getDocs, doc as _docRef, setDoc, addDoc, deleteDoc, query, orderBy, where, getDoc, onSnapshot, writeBatch } from "firebase/firestore";
-import { storage } from "../firebase";
+import { app, storage } from "../firebase";
+import { getFirestore, collection as _colRef, getDocs, doc as _docRef, setDoc, addDoc, deleteDoc, query, orderBy, where, getDoc, onSnapshot, writeBatch, type Firestore } from "firebase/firestore";
+
+/** Live Firestore instance (safe across Vite HMR). */
+function assertDb(): Firestore {
+  return getFirestore(app);
+}
 import { ref as sRef, uploadBytes, getDownloadURL } from "firebase/storage";
+import { getNextVatInvoiceNumber } from "../utils/vatInvoiceNumber";
+import { compactAmlakWorkbook } from "../utils/amlakSheetPosting";
+import { getCached, setCached, invalidateFirestoreCache } from "./firestoreCache";
 
 /** Hash a password with SHA-256 using the Web Crypto API (browser-compatible). */
-const hashPassword = async (plain: string): Promise<string> => {
+export const hashPassword = async (plain: string): Promise<string> => {
   const encoder = new TextEncoder();
   const data = encoder.encode(plain);
   const hashBuffer = await crypto.subtle.digest('SHA-256', data);
@@ -16,7 +23,7 @@ const hashPassword = async (plain: string): Promise<string> => {
  * Verify a plaintext password against a stored value.
  * Supports both legacy plaintext (migrated on first login) and SHA-256 hashed values.
  */
-const verifyPassword = async (plain: string, stored: string): Promise<boolean> => {
+export const verifyPassword = async (plain: string, stored: string): Promise<boolean> => {
   // If stored value looks like a SHA-256 hex digest (64 hex chars), compare hashes
   if (/^[0-9a-f]{64}$/.test(stored)) {
     return (await hashPassword(plain)) === stored;
@@ -25,8 +32,22 @@ const verifyPassword = async (plain: string, stored: string): Promise<boolean> =
   return plain === stored;
 };
 
+/** Same rule as Owner login: owner / investor portal accounts must not use staff mockLogin. */
+export function isOwnerPortalAccount(user: any): boolean {
+  if (!user) return false;
+  const r = String(user.role ?? '').toUpperCase();
+  return !!(user.isOwner || r === 'OWNER');
+}
 
-const toArray = (snap: any) => snap.docs.map((d: any) => ({ id: d.id, ...(d.data() as any) }));
+/** Thrown from mockLogin when the password is correct but the account is owner-portal only. */
+export const OWNER_PORTAL_ONLY_LOGIN = 'OWNER_PORTAL_ONLY_LOGIN';
+
+/** Firestore doc id must win: legacy rows sometimes stored a different `id` in the payload, which caused duplicate keys and phantom "twins" in History. */
+const toArray = (snap: any) =>
+  snap.docs.map((d: any) => {
+    const data = (d.data() as any) || {};
+    return { ...data, id: d.id };
+  });
 
 const sanitize = (obj: any): any => {
   if (obj === null || obj === undefined) return obj;
@@ -48,12 +69,13 @@ let currentBookId = 'default';
 
 const BOOK_SCOPED_COLLECTIONS = new Set([
   'transactions', 'buildings', 'contracts', 'customers', 'vendors',
-  'tasks', 'stocks', 'stock', 'stock_entries', 'banks', 'transfers',
+  'tasks', 'stocks', 'stock', 'stock_entries', 'transfers',
   'service_agreements', 'approvals', 'users',
   'notifications', 'images', 'registry', 'stockItems', 'stockTransfers',
   'sadad_bills', 'ejar_contracts', 'utility_readings', 'security_deposits',
   'whatsapp_messages', 'bank_statements', 'reconciliation_records',
   'nafath_verifications', 'municipality_licenses', 'civil_defense_records', 'absher_records',
+  'amlakSheets',
 ]);
 
 const getCol = (name: string): string => {
@@ -61,21 +83,25 @@ const getCol = (name: string): string => {
   return `book_${currentBookId}_${name}`;
 };
 
-/** Book-aware wrappers — transparently prefix collection names for non-default books */
-const collection = (...args: any[]): any => {
-  if (args.length >= 2 && typeof args[1] === 'string') {
-    return (_colRef as any)(args[0], getCol(args[1]), ...args.slice(2));
-  }
-  return (_colRef as any)(...args);
+/** Book-aware collection path — do not shadow Firebase `collection`. */
+const fsCollection = (name: string, ...segments: string[]) => {
+  const fs = assertDb();
+  const path = getCol(name);
+  return segments.length > 0
+    ? (_colRef as any)(fs, path, ...segments)
+    : (_colRef as any)(fs, path);
 };
-const doc = (...args: any[]): any => {
-  if (args.length >= 2 && typeof args[1] === 'string') {
-    return (_docRef as any)(args[0], getCol(args[1]), ...args.slice(2));
-  }
-  return (_docRef as any)(...args);
+const fsDoc = (name: string, ...segments: string[]) => {
+  const fs = assertDb();
+  const path = getCol(name);
+  return (_docRef as any)(fs, path, ...segments);
 };
 
-export const setCurrentBook = (id: string) => { currentBookId = id || 'default'; };
+export const setCurrentBook = (id: string) => {
+  const next = id || 'default';
+  if (next !== currentBookId) invalidateFirestoreCache('col:');
+  currentBookId = next;
+};
 export const getCurrentBookId = () => currentBookId;
 
 // ---- Cross-book helpers ----
@@ -87,9 +113,19 @@ const rawBookPath = (bookId: string, name: string): string => {
   if (!bookId || bookId === 'default' || !BOOK_SCOPED_COLLECTIONS.has(name)) return name;
   return `book_${bookId}_${name}`;
 };
-const bookCol = (bookId: string, name: string): any => _colRef(db, rawBookPath(bookId, name));
+const bookCol = (bookId: string, name: string): any => _colRef(assertDb(), rawBookPath(bookId, name));
 const bookDoc = (bookId: string, name: string, id?: string): any =>
-  id ? _docRef(db, rawBookPath(bookId, name), id) : _docRef(bookCol(bookId, name) as any);
+  id ? _docRef(assertDb(), rawBookPath(bookId, name), id) : _docRef(bookCol(bookId, name) as any);
+
+/** Write a transaction document to a specific book partition (Treasury / cross-book fixes). */
+export const saveTransactionInBook = async (bookId: string, t: any) => {
+  const data = sanitize(t);
+  const path = rawBookPath(bookId || 'default', 'transactions');
+  if (!t?.id) {
+    return addDoc(_colRef(assertDb(), path), data);
+  }
+  return setDoc(_docRef(assertDb(), path, t.id), data);
+};
 
 /**
  * TransferManager composes cross-book building ids as `${bookId}:${rawId}` for
@@ -108,6 +144,13 @@ export const parseCompositeBuildingId = (
     return { bookId: bk || fallbackBookId, rawId: raw || compositeId };
   }
   return { bookId: fallbackBookId, rawId: compositeId };
+};
+
+/** True if two building ids refer to the same property (raw vs `bookId:rawId` vs active book). */
+export const ownerStakeBuildingIdsMatch = (a: string, b: string, activeBookId: string): boolean => {
+  const pa = parseCompositeBuildingId(a, activeBookId);
+  const pb = parseCompositeBuildingId(b, activeBookId);
+  return pa.bookId === pb.bookId && pa.rawId === pb.rawId;
 };
 
 // ---- Scoped access: limit staff to their assigned buildings (supports multiple)
@@ -151,13 +194,18 @@ export const getCollection = async (name: string, orderFieldOrOpts?: string | Ge
     ? (opts?.includeDeleted ?? false)
     : (orderFieldOrOpts?.includeDeleted ?? false);
 
-  const colRef = collection(db, name);
+  const cacheKey = `col:${currentBookId}:${name}:${orderField || ''}:${includeDeleted}`;
+  const cached = getCached<any[]>(cacheKey);
+  if (cached) return cached;
+
+  const colRef = fsCollection(name);
   const q = orderField ? query(colRef, orderBy(orderField, "desc")) : colRef;
   const snap = await getDocs(q as any);
   const data = toArray(snap);
   const scoped = filterByScope(name, data);
-  if (includeDeleted) return scoped;
-  return scoped.filter((d: any) => !(d as any).deleted);
+  const out = includeDeleted ? scoped : scoped.filter((d: any) => !(d as any).deleted);
+  setCached(cacheKey, out);
+  return out;
 };
 
 export const getVendors = async (opts?: { includeDeleted?: boolean }) => {
@@ -165,16 +213,16 @@ export const getVendors = async (opts?: { includeDeleted?: boolean }) => {
 };
 export const saveVendor = async (v: any) => {
   const data = sanitize(v);
-  if (!v.id) return addDoc(collection(db, "vendors"), data);
-  return setDoc(doc(db, "vendors", v.id), data);
+  if (!v.id) return addDoc(fsCollection( "vendors"), data);
+  return setDoc(fsDoc( "vendors", v.id), data);
 };
 export const deleteVendor = async (id: string) => {
-  return deleteDoc(doc(db, "vendors", id));
+  return deleteDoc(fsDoc( "vendors", id));
 };
 
 export const getTasks = async (uid?: string, opts?: { includeDeleted?: boolean }) => {
   if (uid) {
-    const q = query(collection(db, "tasks"), where("userId", "==", uid));
+    const q = query(fsCollection( "tasks"), where("userId", "==", uid));
     const snap = await getDocs(q as any);
     const data = toArray(snap);
     if (opts?.includeDeleted) return data;
@@ -184,25 +232,25 @@ export const getTasks = async (uid?: string, opts?: { includeDeleted?: boolean }
 };
 export const saveTask = async (t: any) => {
   const data = sanitize(t);
-  if (!t.id) return addDoc(collection(db, "tasks"), data);
-  return setDoc(doc(db, "tasks", t.id), data);
+  if (!t.id) return addDoc(fsCollection( "tasks"), data);
+  return setDoc(fsDoc( "tasks", t.id), data);
 };
 export const deleteTask = async (id: string) => {
-  return deleteDoc(doc(db, "tasks", id));
+  return deleteDoc(fsDoc( "tasks", id));
 };
 
 export const getSettings = async () => {
-  const snap = await getDocs(collection(db, "meta"));
+  const snap = await getDocs(fsCollection( "meta"));
   const arr = toArray(snap);
   const found = arr.find((x: any) => x.id === "settings") || arr[0];
   return found || null;
 };
-export const saveSettings = async (s: any) => setDoc(doc(db, "meta", "settings"), s);
+export const saveSettings = async (s: any) => setDoc(fsDoc( "meta", "settings"), s);
 
 // Custom Expense Categories (shared across all users)
 export const getCustomExpenseCategories = async (): Promise<string[]> => {
   try {
-    const snap = await getDoc(doc(db, "meta", "expenseCategories"));
+    const snap = await getDoc(fsDoc( "meta", "expenseCategories"));
     if (snap.exists()) {
       const data = snap.data() as Record<string, any>;
       return Array.isArray(data.categories) ? data.categories : [];
@@ -211,12 +259,12 @@ export const getCustomExpenseCategories = async (): Promise<string[]> => {
   return [];
 };
 export const saveCustomExpenseCategories = async (categories: string[]) => {
-  await setDoc(doc(db, "meta", "expenseCategories"), { categories, updatedAt: Date.now() });
+  await setDoc(fsDoc( "meta", "expenseCategories"), { categories, updatedAt: Date.now() });
 };
 
 export const getCustomIncomeCategories = async (): Promise<string[]> => {
   try {
-    const snap = await getDoc(doc(db, "meta", "incomeCategories"));
+    const snap = await getDoc(fsDoc( "meta", "incomeCategories"));
     if (snap.exists()) {
       const data = snap.data() as Record<string, any>;
       return Array.isArray(data.categories) ? data.categories : [];
@@ -225,7 +273,7 @@ export const getCustomIncomeCategories = async (): Promise<string[]> => {
   return [];
 };
 export const saveCustomIncomeCategories = async (categories: string[]) => {
-  await setDoc(doc(db, "meta", "incomeCategories"), { categories, updatedAt: Date.now() });
+  await setDoc(fsDoc( "meta", "incomeCategories"), { categories, updatedAt: Date.now() });
 };
 
 export const getTransactions = async (opts?: { userId?: string; role?: string; buildingId?: string; buildingIds?: string[]; includeDeleted?: boolean }) => {
@@ -241,21 +289,44 @@ export const getTransactions = async (opts?: { userId?: string; role?: string; b
 };
 export const saveTransaction = async (t: any) => {
   const data = sanitize(t);
-  if (!t.id) return addDoc(collection(db, "transactions"), data);
-  return setDoc(doc(db, "transactions", t.id), data);
+  invalidateFirestoreCache('col:');
+  if (!t.id) return addDoc(fsCollection( "transactions"), data);
+  return setDoc(fsDoc( "transactions", t.id), data);
+};
+
+export const getAmlakWorkbooks = async () => {
+  return getCollection("amlakSheets", { orderField: "updatedAt" });
+};
+
+export const saveAmlakWorkbook = async (workbook: any) => {
+  const compacted = compactAmlakWorkbook(workbook);
+  const data = sanitize({
+    ...compacted,
+    updatedAt: Date.now(),
+  });
+  invalidateFirestoreCache('col:');
+  if (!workbook.id) return addDoc(fsCollection("amlakSheets"), data);
+  return setDoc(fsDoc("amlakSheets", workbook.id), data);
+};
+
+export const deleteAmlakWorkbook = async (id: string) => {
+  invalidateFirestoreCache('col:');
+  return setDoc(fsDoc("amlakSheets", id), { deleted: true, updatedAt: Date.now() }, { merge: true } as any);
 };
 export const updateTransactionStatus = async (id: string, status: string) => {
-  return setDoc(doc(db, "transactions", id), { status }, { merge: true } as any);
+  return setDoc(fsDoc( "transactions", id), { status }, { merge: true } as any);
 };
 
 // Create Credit Note for VAT Transaction
 export const createCreditNote = async (originalTransaction: any) => {
+  const allTransactions = await getTransactions({ includeDeleted: true }).catch(() => []);
+  const nextCreditNoteNo = getNextVatInvoiceNumber(allTransactions as any, originalTransaction?.date, 'CN-');
   const creditNote = {
     ...originalTransaction,
     id: crypto.randomUUID(),
     isCreditNote: true,
     originalInvoiceId: originalTransaction.vatInvoiceNumber,
-    vatInvoiceNumber: `CN-${originalTransaction.vatInvoiceNumber || Date.now()}`,
+    vatInvoiceNumber: nextCreditNoteNo,
     amount: -Math.abs(originalTransaction.amount || 0),
     vatAmount: -Math.abs(originalTransaction.vatAmount || 0),
     totalWithVat: -Math.abs(originalTransaction.totalWithVat || 0),
@@ -270,7 +341,7 @@ export const createCreditNote = async (originalTransaction: any) => {
   delete (creditNote as any).zatcaReportedAt;
   delete (creditNote as any).zatcaStatus;
   
-  await setDoc(doc(db, 'transactions', creditNote.id), creditNote);
+  await setDoc(fsDoc( 'transactions', creditNote.id), creditNote);
   return creditNote;
 };
 
@@ -280,14 +351,14 @@ export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: 
     let txData: any = null;
     let primaryDocId: string | null = null;
     try {
-      const direct = await getDoc(doc(db, 'transactions', id));
+      const direct = await getDoc(fsDoc( 'transactions', id));
       if (direct && direct.exists()) {
         txData = { id, ...(direct.data() as any) };
         primaryDocId = direct.id;
       }
     } catch (_) {}
     if (!txData) {
-      const q = query(collection(db, 'transactions'), where('id', '==', id));
+      const q = query(fsCollection( 'transactions'), where('id', '==', id));
       const snap = await getDocs(q as any).catch(() => null);
       if (snap && snap.docs && snap.docs.length > 0) {
         const d = snap.docs[0];
@@ -303,10 +374,10 @@ export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: 
         const qty = Math.abs(item.qty || 0);
         if (!qty) continue;
         try {
-          const stockSnap = await getDoc(doc(db, 'stocks', item.stockId)).catch(() => null as any);
+          const stockSnap = await getDoc(fsDoc( 'stocks', item.stockId)).catch(() => null as any);
           const currentQty = stockSnap && stockSnap.exists() ? ((stockSnap.data() as any).quantity || 0) : 0;
-          await setDoc(doc(db, 'stocks', item.stockId), { quantity: currentQty + qty }, { merge: true } as any).catch(() => {});
-          await addDoc(collection(db, 'stock_entries'), sanitize({ stockId: item.stockId, qty, unitPrice: item.unitPrice || 0, total: 0, by: txData.createdBy || txData.createdByName || 'system', details: `Reversal of transaction ${id}`, date: new Date().toISOString(), transactionId: id })).catch(() => {});
+          await setDoc(fsDoc( 'stocks', item.stockId), { quantity: currentQty + qty }, { merge: true } as any).catch(() => {});
+          await addDoc(fsCollection( 'stock_entries'), sanitize({ stockId: item.stockId, qty, unitPrice: item.unitPrice || 0, total: 0, by: txData.createdBy || txData.createdByName || 'system', details: `Reversal of transaction ${id}`, date: new Date().toISOString(), transactionId: id })).catch(() => {});
         } catch (e) {
           console.error('restock on delete failed', e);
         }
@@ -314,16 +385,16 @@ export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: 
     }
 
     // attempt direct delete by document id
-    await deleteDoc(doc(db, "transactions", primaryDocId || id)).catch(() => {});
+    await deleteDoc(fsDoc( "transactions", primaryDocId || id)).catch(() => {});
     // also delete any documents where the stored `id` field equals the provided id
-    const q = query(collection(db, 'transactions'), where('id', '==', id));
+    const q = query(fsCollection( 'transactions'), where('id', '==', id));
     const snap = await getDocs(q as any).catch(() => null);
     if (snap && snap.docs && snap.docs.length > 0) {
       for (const d of snap.docs) {
-        await deleteDoc(doc(db, 'transactions', d.id)).catch(() => {});
+        await deleteDoc(fsDoc( 'transactions', d.id)).catch(() => {});
       }
     }
-    await addDoc(collection(db, 'audit'), sanitize({ action: 'DELETE_TRANSACTION', details: `Deleted transaction ${id}${txData && txData.items ? ' (restocked items)' : ''}`, timestamp: Date.now() })).catch(() => {});
+    await addDoc(fsCollection( 'audit'), sanitize({ action: 'DELETE_TRANSACTION', details: `Deleted transaction ${id}${txData && txData.items ? ' (restocked items)' : ''}`, timestamp: Date.now() })).catch(() => {});
     return true;
   } catch (e) {
     console.error('deleteTransaction error', e);
@@ -334,8 +405,8 @@ export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: 
 
 export const requestTransactionDeletion = async (requestorId: string, txId: string) => {
   const req = sanitize({ type: 'transaction_delete', targetCollection: 'transactions', targetId: txId, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
-  const r = await addDoc(collection(db, 'approvals'), req);
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  const r = await addDoc(fsCollection( 'approvals'), req);
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   // Notify admins via push notification
   try {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
@@ -367,11 +438,12 @@ export const getBuildings = async (opts?: { includeDeleted?: boolean }) => {
 };
 export const saveBuilding = async (b: any) => {
   const data = sanitize(b);
-  if (!b.id) return addDoc(collection(db, "buildings"), data);
-  return setDoc(doc(db, "buildings", b.id), data);
+  invalidateFirestoreCache('col:');
+  if (!b.id) return addDoc(fsCollection( "buildings"), data);
+  return setDoc(fsDoc( "buildings", b.id), data);
 };
 export const deleteBuilding = async (id: string) => {
-  return deleteDoc(doc(db, "buildings", id));
+  return deleteDoc(fsDoc( "buildings", id));
 };
 
 /** Read buildings, transactions, and contracts from a specific book without changing global state */
@@ -388,13 +460,15 @@ export const getDataFromBook = async (bookId: string): Promise<{
   const toArr = (snap: any) => snap.docs.map((d: any) => ({ id: d.id, ...(d.data() as any) }));
 
   const [bSnap, tSnap, cSnap] = await Promise.all([
-    getDocs(_colRef(db, colPath('buildings'))),
-    getDocs(query(_colRef(db, colPath('transactions')), orderBy('date', 'desc'))).catch(() => ({ docs: [] } as any)),
-    getDocs(_colRef(db, colPath('contracts'))),
+    getDocs(_colRef(assertDb(), colPath('buildings'))),
+    getDocs(query(_colRef(assertDb(), colPath('transactions')), orderBy('date', 'desc'))).catch(() => ({ docs: [] } as any)),
+    getDocs(_colRef(assertDb(), colPath('contracts'))),
   ]);
 
   const buildings = toArr(bSnap).filter((d: any) => !d.deleted);
-  const transactions = toArr(tSnap).filter((d: any) => !d.deleted && !d.vatReportOnly);
+  // NOTE: include `vatReportOnly` rows (VAT purchase/import entries) so dashboard/history
+  // totals match the main book behavior.
+  const transactions = toArr(tSnap).filter((d: any) => !d.deleted);
   const contracts = toArr(cSnap).filter((d: any) => !d.deleted);
 
   return { buildings, transactions, contracts };
@@ -416,11 +490,11 @@ export const transferBuildingToBook = async (
 
   // 1. Transfer building document
   onProgress?.('Transferring building record...');
-  const srcBuildingRef = _docRef(db, getColPath(sourceBookId, 'buildings'), buildingId);
+  const srcBuildingRef = _docRef(assertDb(), getColPath(sourceBookId, 'buildings'), buildingId);
   const srcBuildingSnap = await getDoc(srcBuildingRef);
   if (!srcBuildingSnap.exists()) throw new Error('Building not found in source book');
   const buildingData = { id: srcBuildingSnap.id, ...srcBuildingSnap.data() };
-  await setDoc(_docRef(db, getColPath(targetBookId, 'buildings'), buildingId), sanitize(buildingData));
+  await setDoc(_docRef(assertDb(), getColPath(targetBookId, 'buildings'), buildingId), sanitize(buildingData));
   await deleteDoc(srcBuildingRef);
   transferred.buildings = 1;
 
@@ -436,11 +510,11 @@ export const transferBuildingToBook = async (
     const srcColPath = getColPath(sourceBookId, colName);
     const tgtColPath = getColPath(targetBookId, colName);
     try {
-      const snap = await getDocs(query(_colRef(db, srcColPath), where('buildingId', '==', buildingId)));
+      const snap = await getDocs(query(_colRef(assertDb(), srcColPath), where('buildingId', '==', buildingId)));
       let count = 0;
       for (const d of snap.docs) {
         const data = { id: d.id, ...(d.data() as any) };
-        await setDoc(_docRef(db, tgtColPath, d.id), sanitize(data));
+        await setDoc(_docRef(assertDb(), tgtColPath, d.id), sanitize(data));
         await deleteDoc(d.ref);
         count++;
       }
@@ -453,7 +527,7 @@ export const transferBuildingToBook = async (
   // 3. Transfer users assigned exclusively to this building; update multi-building users
   onProgress?.('Transferring staff...');
   try {
-    const srcUsersSnap = await getDocs(_colRef(db, getColPath(sourceBookId, 'users')));
+    const srcUsersSnap = await getDocs(_colRef(assertDb(), getColPath(sourceBookId, 'users')));
     let usersTransferred = 0;
     for (const d of srcUsersSnap.docs) {
       const user = { id: d.id, ...(d.data() as any) } as any;
@@ -472,7 +546,7 @@ export const transferBuildingToBook = async (
         await setDoc(d.ref, sanitize(updatedUser));
       } else {
         // Move user entirely to target book
-        await setDoc(_docRef(db, getColPath(targetBookId, 'users'), d.id), sanitize(user));
+        await setDoc(_docRef(assertDb(), getColPath(targetBookId, 'users'), d.id), sanitize(user));
         await deleteDoc(d.ref);
         usersTransferred++;
       }
@@ -483,7 +557,7 @@ export const transferBuildingToBook = async (
   }
 
   // Audit log
-  await addDoc(_colRef(db, 'audit'), sanitize({
+  await addDoc(_colRef(assertDb(), 'audit'), sanitize({
     action: 'TRANSFER_BUILDING',
     details: `Building ${buildingId} transferred from book '${sourceBookId}' to book '${targetBookId}'`,
     userId: 'system',
@@ -496,38 +570,163 @@ export const transferBuildingToBook = async (
 
 export const cascadeUnitRename = async (buildingId: string, oldUnitName: string, newUnitName: string): Promise<{ contracts: number; transactions: number; stockEntries: number }> => {
   const counts = { contracts: 0, transactions: 0, stockEntries: 0 };
-  const batch = writeBatch(db);
+  const batch = writeBatch(assertDb());
 
-  const contractsSnap = await getDocs(query(collection(db, "contracts"), where("buildingId", "==", buildingId), where("unitName", "==", oldUnitName)));
+  const contractsSnap = await getDocs(query(fsCollection( "contracts"), where("buildingId", "==", buildingId), where("unitName", "==", oldUnitName)));
   contractsSnap.forEach(d => { batch.update(d.ref, { unitName: newUnitName }); counts.contracts++; });
 
-  const txSnap = await getDocs(query(collection(db, "transactions"), where("buildingId", "==", buildingId), where("unitName", "==", oldUnitName)));
+  const txSnap = await getDocs(query(fsCollection( "transactions"), where("buildingId", "==", buildingId), where("unitName", "==", oldUnitName)));
   txSnap.forEach(d => { batch.update(d.ref, { unitName: newUnitName }); counts.transactions++; });
 
-  const stockSnap = await getDocs(query(collection(db, "stock"), where("buildingId", "==", buildingId), where("unitName", "==", oldUnitName)));
+  const stockSnap = await getDocs(query(fsCollection( "stock"), where("buildingId", "==", buildingId), where("unitName", "==", oldUnitName)));
   stockSnap.forEach(d => { batch.update(d.ref, { unitName: newUnitName }); counts.stockEntries++; });
 
   await batch.commit();
   return counts;
 };
 
-export const getCustomers = async (opts?: { includeDeleted?: boolean }) => {
+export type GetCustomersOptions = { includeDeleted?: boolean; /** Scan every book partition (slow) */ acrossBooks?: boolean };
 
-  const data = await getCollection("customers", { includeDeleted: !!opts?.includeDeleted });
-  const toName = (c: any) => (c?.nameEn || c?.nameAr || c?.name || "").toString();
-  return (data || []).slice().sort((a: any, b: any) => toName(a).localeCompare(toName(b), undefined, { sensitivity: 'base' }));
+export const getCustomers = async (opts?: GetCustomersOptions) => {
+  const includeDeleted = !!opts?.includeDeleted;
+  const cacheKey = `customers:${includeDeleted}:${opts?.acrossBooks ? 'all' : currentBookId}`;
+  const cached = getCached<any[]>(cacheKey);
+  if (cached) return cached;
+
+  const data = opts?.acrossBooks
+    ? await getCustomersAcrossBooks({ includeDeleted })
+    : await getCollection('customers', { includeDeleted });
+  const toName = (c: any) => (c?.nameEn || c?.nameAr || c?.name || '').toString();
+  const sorted = (data || []).slice().sort((a: any, b: any) => toName(a).localeCompare(toName(b), undefined, { sensitivity: 'base' }));
+  setCached(cacheKey, sorted);
+  return sorted;
 };
 export const saveCustomer = async (c: any) => {
   const data = sanitize(c);
-  if (!c.id) return addDoc(collection(db, "customers"), data);
-  return setDoc(doc(db, "customers", c.id), data);
+  invalidateFirestoreCache('customers:');
+  invalidateFirestoreCache('col:');
+  const activeBook = getCurrentBookId();
+
+  // Always write to GLOBAL customers so all books share the same directory.
+  // Also write to the active book's customers collection for backward-compatibility.
+  if (!c.id) {
+    const ref = await addDoc(_colRef(assertDb(), 'customers'), data);
+    const nextId = ref.id;
+    try {
+      if (activeBook && activeBook !== 'default') {
+        await setDoc(_docRef(assertDb(), `book_${activeBook}_customers`, nextId), data as any);
+      }
+    } catch {
+      // non-fatal
+    }
+    return ref;
+  }
+
+  await setDoc(_docRef(assertDb(), 'customers', c.id), data);
+  try {
+    if (activeBook && activeBook !== 'default') {
+      await setDoc(_docRef(assertDb(), `book_${activeBook}_customers`, c.id), data as any);
+    }
+  } catch {
+    // non-fatal
+  }
+  return true as any;
 };
 export const deleteCustomer = async (id: string) => {
-  return deleteDoc(doc(db, "customers", id));
+  invalidateFirestoreCache('customers:');
+  invalidateFirestoreCache('col:');
+  return deleteDoc(fsDoc( "customers", id));
+};
+
+/**
+ * Load customers from global + all book-scoped collections.
+ * This makes customers shared/interconnected across books.
+ */
+export const getCustomersAcrossBooks = async (opts?: { includeDeleted?: boolean }) => {
+  const includeDeleted = !!opts?.includeDeleted;
+  const toArr = (snap: any) => (snap?.docs || []).map((d: any) => ({ id: d.id, ...(d.data() as any) }));
+  const norm = (v: any) => String(v ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
+  const keyOf = (c: any): string => {
+    const vat = norm(c?.vatNumber || c?.vatNo || c?.vat || c?.customerVATNumber);
+    if (vat) return `vat:${vat}`;
+    const phone = norm(c?.phone || c?.mobile || c?.phoneNumber);
+    if (phone) return `phone:${phone}`;
+    const email = norm(c?.email);
+    if (email) return `email:${email}`;
+    const name = norm(c?.nameEn || c?.nameAr || c?.name);
+    const room = norm(c?.roomNumber || c?.room);
+    return `name:${name}|room:${room}`;
+  };
+
+  try {
+    const firestore = assertDb();
+    const globalSnap = await getDocs(_colRef(firestore, 'customers')).catch(() => ({ docs: [] } as any));
+    const globalCustomers = toArr(globalSnap).map((c: any) => ({ ...c, bookId: c.bookId || 'global' }));
+
+    const booksSnap = await getDocs(_colRef(firestore, 'books')).catch(() => ({ docs: [] } as any));
+    const bookIds = (booksSnap?.docs || [])
+      .map((d: any) => String(d.id))
+      .filter((id) => id && id !== 'default');
+    const bookCustomers =
+      bookIds.length === 0
+        ? []
+        : (
+            await Promise.all(
+              bookIds.map(async (bookId) => {
+                const snap = await getDocs(_colRef(firestore, `book_${bookId}_customers`) as any).catch(() => ({ docs: [] } as any));
+                return toArr(snap).map((c: any) => ({ ...c, bookId }));
+              }),
+            )
+          ).flat();
+
+    const merged = [...globalCustomers, ...bookCustomers];
+    const scoped = includeDeleted ? merged : merged.filter((c: any) => !(c as any).deleted);
+
+    // De-dup by stable customer identity (VAT > phone > email > name+room)
+    const uniq = Array.from(new Map(scoped.map((c: any) => [keyOf(c), c])).values());
+    return uniq;
+  } catch (e) {
+    console.error('getCustomersAcrossBooks error', e);
+    // fallback to current-book customers only
+    return await getCollection('customers', { includeDeleted }).catch(() => []);
+  }
 };
 
 export const getUsers = async (opts?: { includeDeleted?: boolean }) => {
   return getCollection("users", { includeDeleted: !!opts?.includeDeleted });
+};
+
+/**
+ * Load users from global + all book-scoped collections.
+ * Treasury needs this because owners may exist in a different book than the active one.
+ */
+export const getUsersAcrossBooks = async (opts?: { includeDeleted?: boolean }) => {
+  const includeDeleted = !!opts?.includeDeleted;
+  const toArr = (snap: any) => (snap?.docs || []).map((d: any) => ({ id: d.id, ...(d.data() as any) }));
+  const uniqById = (rows: any[]) => Array.from(new Map(rows.map((u: any) => [String(u.id), u])).values());
+
+  try {
+    const globalSnap = await getDocs(_colRef(assertDb(), 'users')).catch(() => ({ docs: [] } as any));
+    const globalUsers = toArr(globalSnap).map((u: any) => ({ ...u, bookId: u.bookId || 'default' }));
+
+    const booksSnap = await getDocs(_colRef(assertDb(), 'books')).catch(() => ({ docs: [] } as any));
+    const bookIds = (booksSnap?.docs || []).map((d: any) => String(d.id)).filter(Boolean);
+    const bookUsers = (
+      await Promise.all(
+        bookIds.map(async (bookId) => {
+          const snap = await getDocs(_colRef(assertDb(), `book_${bookId}_users`) as any).catch(() => ({ docs: [] } as any));
+          return toArr(snap).map((u: any) => ({ ...u, bookId }));
+        }),
+      )
+    ).flat();
+
+    const merged = uniqById([...globalUsers, ...bookUsers]);
+    const scoped = includeDeleted ? merged : merged.filter((u: any) => !(u as any).deleted);
+    return scoped;
+  } catch (e) {
+    console.error('getUsersAcrossBooks error', e);
+    return await getUsers(opts).catch(() => []);
+  }
 };
 export const saveUser = async (u: any) => {
   let payload = { ...u };
@@ -536,8 +735,8 @@ export const saveUser = async (u: any) => {
     payload.password = await hashPassword(payload.password);
   }
   const data = sanitize(payload);
-  if (!u.id) return addDoc(collection(db, "users"), data);
-  return setDoc(doc(db, "users", u.id), data);
+  if (!u.id) return addDoc(fsCollection( "users"), data);
+  return setDoc(fsDoc( "users", u.id), data);
 };
 
 // Upload profile photo to localStorage (saves Firebase Storage quota)
@@ -552,7 +751,7 @@ export const uploadProfilePhoto = async (userId: string, file: File): Promise<st
         localStorage.setItem(`profilePhoto_${userId}`, base64String);
         
         // Update user document with localStorage flag
-        await setDoc(doc(db, "users", userId), { 
+        await setDoc(fsDoc( "users", userId), { 
           photoURL: `localStorage:${userId}`,
           photoUpdated: Date.now()
         }, { merge: true });
@@ -573,33 +772,43 @@ export const getProfilePhoto = (userId: string): string | null => {
   return localStorage.getItem(`profilePhoto_${userId}`);
 };
 
-export const deleteUser = async (id: string) => deleteDoc(doc(db, "users", id));
+export const deleteUser = async (id: string) => deleteDoc(fsDoc( "users", id));
 
 export const mockLogin = async (id: string, pass: string) => {
   try {
     // Search global 'users' collection first
-    const q = query(_colRef(db, "users"), where("id", "==", id));
+    const q = query(_colRef(assertDb(), "users"), where("id", "==", id));
     const snap = await getDocs(q as any);
     const arr = toArray(snap);
     const user = arr[0];
-    if (user && await verifyPassword(pass, (user as any).password || '') && user.hasSystemAccess !== false) return { ...user, bookId: 'default' };
+    if (user && await verifyPassword(pass, (user as any).password || '')) {
+      if (user.hasSystemAccess !== false) {
+        if (isOwnerPortalAccount(user)) throw new Error(OWNER_PORTAL_ONLY_LOGIN);
+        return { ...user, bookId: 'default' };
+      }
+    }
 
     // If not found in global, search all book-scoped user collections
     try {
-      const booksSnap = await getDocs(_colRef(db, 'books'));
+      const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
       for (const bDoc of booksSnap.docs) {
         const bookId = bDoc.id;
-        const bq = query(_colRef(db, `book_${bookId}_users`), where("id", "==", id));
+        const bq = query(_colRef(assertDb(), `book_${bookId}_users`), where("id", "==", id));
         const bSnap = await getDocs(bq as any);
         const bArr = toArray(bSnap);
         const bUser = bArr[0];
-        if (bUser && await verifyPassword(pass, (bUser as any).password || '') && bUser.hasSystemAccess !== false) return { ...bUser, bookId };
+        if (bUser && await verifyPassword(pass, (bUser as any).password || '')) {
+          if (bUser.hasSystemAccess !== false) {
+            if (isOwnerPortalAccount(bUser)) throw new Error(OWNER_PORTAL_ONLY_LOGIN);
+            return { ...bUser, bookId };
+          }
+        }
       }
     } catch (_) { /* books collection may not exist yet */ }
 
     // First-boot: if no ADMIN user exists at all, create one so the app is usable.
     // This covers fresh databases and cases where the admin was accidentally deleted.
-    const allUsersSnap = await getDocs(_colRef(db, "users"));
+    const allUsersSnap = await getDocs(_colRef(assertDb(), "users"));
     const allUsers = toArray(allUsersSnap);
     const hasAdmin = allUsers.some((u: any) => u.role === 'ADMIN');
     if (!hasAdmin) {
@@ -613,7 +822,7 @@ export const mockLogin = async (id: string, pass: string) => {
         password: hashedPass,
         createdAt: new Date().toISOString(),
       };
-      await setDoc(_docRef(db, "users", id), newAdmin);
+      await setDoc(_docRef(assertDb(), "users", id), newAdmin);
       return { ...newAdmin, bookId: 'default' };
     }
 
@@ -626,17 +835,17 @@ export const mockLogin = async (id: string, pass: string) => {
 
 export const changeUserPassword = async (userId: string, oldPass: string, newPass: string) => {
   // Try global 'users' first, then search book-scoped collections
-  const q = query(_colRef(db, "users"), where("id", "==", userId));
+  const q = query(_colRef(assertDb(), "users"), where("id", "==", userId));
   const snap = await getDocs(q as any);
   const arr = toArray(snap);
   let user = arr[0];
   let userColPath = 'users';
   if (!user) {
     try {
-      const booksSnap = await getDocs(_colRef(db, 'books'));
+      const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
       for (const bDoc of booksSnap.docs) {
         const colPath = `book_${bDoc.id}_users`;
-        const bq = query(_colRef(db, colPath), where("id", "==", userId));
+        const bq = query(_colRef(assertDb(), colPath), where("id", "==", userId));
         const bSnap = await getDocs(bq as any);
         const bArr = toArray(bSnap);
         if (bArr[0]) { user = bArr[0]; userColPath = colPath; break; }
@@ -646,23 +855,23 @@ export const changeUserPassword = async (userId: string, oldPass: string, newPas
   if (!user) throw new Error('User not found');
   if (!await verifyPassword(oldPass, user.password || '')) throw new Error('Current password is incorrect');
   const hashedNew = await hashPassword(newPass);
-  await setDoc(_docRef(db, userColPath, user.id), { ...user, password: hashedNew }, { merge: true } as any);
+  await setDoc(_docRef(assertDb(), userColPath, user.id), { ...user, password: hashedNew }, { merge: true } as any);
   return true;
 };
 
 export const requestPasswordReset = async (userId: string, newPassword: string) => {
   // Search global 'users' first, then book-scoped collections
-  const q2 = query(_colRef(db, 'users'), where('id', '==', userId));
+  const q2 = query(_colRef(assertDb(), 'users'), where('id', '==', userId));
   const snap = await getDocs(q2 as any);
   const arr = toArray(snap);
   let user = arr[0];
   let userColPath = 'users';
   if (!user) {
     try {
-      const booksSnap = await getDocs(_colRef(db, 'books'));
+      const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
       for (const bDoc of booksSnap.docs) {
         const colPath = `book_${bDoc.id}_users`;
-        const bq = query(_colRef(db, colPath), where('id', '==', userId));
+        const bq = query(_colRef(assertDb(), colPath), where('id', '==', userId));
         const bSnap = await getDocs(bq as any);
         const bArr = toArray(bSnap);
         if (bArr[0]) { user = bArr[0]; userColPath = colPath; break; }
@@ -673,10 +882,10 @@ export const requestPasswordReset = async (userId: string, newPassword: string) 
 
   // Hash and store the new password
   const hashedNewPassword = await hashPassword(newPassword);
-  await setDoc(_docRef(db, userColPath, user.id), { password: hashedNewPassword }, { merge: true } as any);
+  await setDoc(_docRef(assertDb(), userColPath, user.id), { password: hashedNewPassword }, { merge: true } as any);
 
   // Audit log
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'PASSWORD_RESET', details: `Password reset by ${user.name || userId} (self-service)`, userId, timestamp: Date.now() })).catch(() => {});
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'PASSWORD_RESET', details: `Password reset by ${user.name || userId} (self-service)`, userId, timestamp: Date.now() })).catch(() => {});
 
   // Notify admins via push notification (no approval needed)
   try {
@@ -687,36 +896,65 @@ export const requestPasswordReset = async (userId: string, newPassword: string) 
 };
 
 export const getBanks = async () => {
-  return getCollection("banks");
+  const globalBanks = await getCollection("banks");
+  // Backward-compatibility: older versions stored banks per-book.
+  // Migrate legacy `book_<id>_banks` docs into shared `banks` collection.
+  if (currentBookId !== 'default') {
+    try {
+      const legacyPath = `book_${currentBookId}_banks`;
+      const legacySnap = await getDocs(_colRef(assertDb(), legacyPath) as any);
+      const legacyBanks = toArray(legacySnap).filter((b: any) => !(b as any).deleted);
+      if (legacyBanks.length > 0) {
+        const existingIds = new Set(globalBanks.map((b: any) => String((b as any).id || '')));
+        const existingKeys = new Set(
+          globalBanks.map((b: any) => `${String((b as any).name || '').trim().toLowerCase()}|${String((b as any).iban || '').trim().toLowerCase()}`)
+        );
+        for (const b of legacyBanks) {
+          const bankId = String((b as any).id || '');
+          const bankKey = `${String((b as any).name || '').trim().toLowerCase()}|${String((b as any).iban || '').trim().toLowerCase()}`;
+          if (existingIds.has(bankId) || existingKeys.has(bankKey)) continue;
+          const data = sanitize({ ...(b as any) });
+          delete (data as any).id;
+          if (bankId) await setDoc(_docRef(assertDb(), "banks", bankId), data, { merge: true } as any);
+          else await addDoc(_colRef(assertDb(), "banks"), data);
+        }
+        return getCollection("banks");
+      }
+    } catch (_) {
+      // Ignore legacy migration failures; shared list will still load.
+    }
+  }
+  return globalBanks;
 };
 export const saveBank = async (b: any) => {
   const data = sanitize(b);
   const id = b.name || (b.id as string);
-  if (!id) return addDoc(collection(db, "banks"), data);
-  return setDoc(doc(db, "banks", id), data);
+  if (!id) return addDoc(fsCollection( "banks"), data);
+  return setDoc(fsDoc( "banks", id), data);
 };
-export const deleteBank = async (id: string) => deleteDoc(doc(db, "banks", id));
+export const deleteBank = async (id: string) => deleteDoc(fsDoc( "banks", id));
 
 export const getContracts = async (opts?: { includeDeleted?: boolean }) => {
   return getCollection("contracts", { includeDeleted: !!opts?.includeDeleted });
 };
 export const saveContract = async (c: any) => {
   const data = sanitize(c);
-  if (!c.id) return addDoc(collection(db, "contracts"), data);
-  return setDoc(doc(db, "contracts", c.id), data);
+  invalidateFirestoreCache('col:');
+  if (!c.id) return addDoc(fsCollection( "contracts"), data);
+  return setDoc(fsDoc( "contracts", c.id), data);
 };
 export const deleteContract = async (id: string) => {
-  return deleteDoc(doc(db, "contracts", id));
+  return deleteDoc(fsDoc( "contracts", id));
 };
 
 export const isUnitOccupied = async (bid: string, uname: string) => {
-  const q = query(collection(db, "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
+  const q = query(fsCollection( "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
   const snap = await getDocs(q as any);
   return snap.size > 0;
 };
 
 export const getActiveContract = async (bid: string, uname: string) => {
-  const q = query(collection(db, "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
+  const q = query(fsCollection( "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
   const snap = await getDocs(q as any);
   const arr = toArray(snap);
   return arr[0] || null;
@@ -759,8 +997,8 @@ export const restoreBackup = async (jsonString: string) => {
       if (!items || !Array.isArray(items)) return;
       for (const it of items) {
         const id = it.id || undefined;
-        if (id) await setDoc(doc(db, name, id), it).catch(() => {});
-        else await addDoc(collection(db, name), it).catch(() => {});
+        if (id) await setDoc(fsDoc( name, id), it).catch(() => {});
+        else await addDoc(fsCollection( name), it).catch(() => {});
       }
     };
     await writeCollection('transactions', backup.transactions || []);
@@ -769,7 +1007,7 @@ export const restoreBackup = async (jsonString: string) => {
     await writeCollection('buildings', backup.buildings || []);
     await writeCollection('users', backup.users || []);
     await writeCollection('vendors', backup.vendors || []);
-    if (backup.settings) await setDoc(doc(db, 'meta', 'settings'), backup.settings).catch(() => {});
+    if (backup.settings) await setDoc(fsDoc( 'meta', 'settings'), backup.settings).catch(() => {});
     await writeCollection('tasks', backup.tasks || []);
     await writeCollection('banks', backup.banks || []);
     return true;
@@ -790,15 +1028,15 @@ export const resetSystem = async () => {
   ];
 
   for (const c of cols) {
-    const snap = await getDocs(collection(db, c) as any).catch(() => null);
+    const snap = await getDocs(fsCollection( c) as any).catch(() => null);
     if (!snap) continue;
     for (const d of snap.docs) {
-      await deleteDoc(doc(db, c, d.id)).catch(() => {});
+      await deleteDoc(fsDoc( c, d.id)).catch(() => {});
     }
   }
 
   // Remove settings doc explicitly (meta/settings)
-  await deleteDoc(doc(db, 'meta', 'settings')).catch(() => {});
+  await deleteDoc(fsDoc( 'meta', 'settings')).catch(() => {});
 
   // Final reload
   window.location.reload();
@@ -807,8 +1045,8 @@ export const resetSystem = async () => {
 // ---- Approval Workflow Helpers ----
 export const requestTransactionEdit = async (requestorId: string, txId: string, newData: any) => {
   const req = sanitize({ type: 'transaction_edit', targetCollection: 'transactions', targetId: txId, payload: newData, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
-  const r = await addDoc(collection(db, 'approvals'), req);
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  const r = await addDoc(fsCollection( 'approvals'), req);
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   // Notify admins via push notification
   try {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
@@ -826,16 +1064,20 @@ export const getApprovals = async (status = 'PENDING') => {
 
 export const listenApprovals = (callback: (arr: any[]) => void, status = 'PENDING') => {
   try {
-    // Use a simple collection snapshot and apply filter/sort client-side
-    // This avoids requiring a composite index on Firestore.
-    const colRef = collection(db, 'approvals');
-    const unsub = onSnapshot(colRef as any, (snap) => {
+    const colRef = fsCollection( 'approvals');
+    const q =
+      status && status !== 'ALL'
+        ? query(colRef, where('status', '==', status))
+        : colRef;
+    const unsub = onSnapshot(q as any, (snap) => {
       try {
         const all = toArray(snap || { docs: [] });
-        const filtered = (all || []).filter((a: any) => {
-          if (!status) return true;
-          return (a.status || 'PENDING') === status;
-        }).sort((a: any, b: any) => {
+        const filtered = (all || [])
+          .filter((a: any) => {
+            if (!status || status === 'ALL') return true;
+            return (a.status || 'PENDING') === status;
+          })
+          .sort((a: any, b: any) => {
           const ta = a.requestedAt ? new Date(a.requestedAt).getTime() : 0;
           const tb = b.requestedAt ? new Date(b.requestedAt).getTime() : 0;
           return tb - ta; // descending
@@ -857,7 +1099,7 @@ export const listenApprovals = (callback: (arr: any[]) => void, status = 'PENDIN
 };
 
 export const approveRequest = async (approvalId: string, approverId: string, approve: boolean) => {
-  const docRef = doc(db, 'approvals', approvalId);
+  const docRef = fsDoc( 'approvals', approvalId);
   const approvalDoc = await getDoc(docRef).catch(() => null);
   if (!approvalDoc || !approvalDoc.exists()) {
     throw new Error('Approval request not found');
@@ -867,7 +1109,7 @@ export const approveRequest = async (approvalId: string, approverId: string, app
   // REJECT: just update status and clean up
   if (!approve) {
     await setDoc(docRef, { handledBy: approverId, handledAt: Date.now(), status: 'REJECTED' }, { merge: true } as any);
-    await addDoc(collection(db, 'audit'), sanitize({ action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {});
+    await addDoc(fsCollection( 'audit'), sanitize({ action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {});
     try { await deleteDoc(docRef); } catch (_) {}
     return true;
   }
@@ -879,33 +1121,33 @@ export const approveRequest = async (approvalId: string, approverId: string, app
       await deleteTransaction(ap.targetId);
     } else if (ap.type === 'transaction_edit' && ap.payload && ap.targetCollection && ap.targetId) {
       const data = sanitize(ap.payload);
-      await setDoc(doc(db, ap.targetCollection, ap.targetId), data, { merge: true } as any);
+      await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
     } else if (ap.type === 'contract_finalize' && ap.payload && ap.targetCollection === 'contracts' && ap.targetId) {
       const data = sanitize(ap.payload);
-      await setDoc(doc(db, ap.targetCollection, ap.targetId), data, { merge: true } as any);
+      await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
     } else if (ap.type === 'contract_delete' && ap.payload && ap.targetCollection === 'contracts' && ap.targetId) {
       const data = sanitize(ap.payload);
-      await setDoc(doc(db, ap.targetCollection, ap.targetId), data, { merge: true } as any);
+      await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
     } else if (ap.type === 'password_reset' && ap.payload?.newPassword && ap.targetId) {
       // Password reset — find user in global or book-scoped collections
       let foundCol = 'users';
-      const pq = query(_colRef(db, 'users'), where('id', '==', ap.targetId));
+      const pq = query(_colRef(assertDb(), 'users'), where('id', '==', ap.targetId));
       const pSnap = await getDocs(pq as any);
       if (pSnap.empty) {
         try {
-          const bSnap = await getDocs(_colRef(db, 'books'));
+          const bSnap = await getDocs(_colRef(assertDb(), 'books'));
           for (const bd of bSnap.docs) {
             const cp = `book_${bd.id}_users`;
-            const bq = query(_colRef(db, cp), where('id', '==', ap.targetId));
+            const bq = query(_colRef(assertDb(), cp), where('id', '==', ap.targetId));
             const bs = await getDocs(bq as any);
             if (!bs.empty) { foundCol = cp; break; }
           }
         } catch (_) {}
       }
-      await setDoc(_docRef(db, foundCol, ap.targetId), { password: ap.payload.newPassword }, { merge: true } as any);
+      await setDoc(_docRef(assertDb(), foundCol, ap.targetId), { password: ap.payload.newPassword }, { merge: true } as any);
     } else if (ap.payload && ap.targetCollection && ap.targetId) {
       const data = sanitize(ap.payload);
-      await setDoc(doc(db, ap.targetCollection, ap.targetId), data, { merge: true } as any);
+      await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
     }
   } catch (e) {
     console.error('apply approval payload error', e);
@@ -915,7 +1157,7 @@ export const approveRequest = async (approvalId: string, approverId: string, app
 
   // Action succeeded — NOW mark as APPROVED
   await setDoc(docRef, { handledBy: approverId, handledAt: Date.now(), status: 'APPROVED' }, { merge: true } as any);
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {});
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {});
   // Remove the processed approval document so it disappears from the list
   try {
     await deleteDoc(docRef);
@@ -925,7 +1167,7 @@ export const approveRequest = async (approvalId: string, approverId: string, app
 
 export const saveUserToken = async (userId: string, token: string) => {
   try {
-    await setDoc(doc(db, 'userTokens', token), {
+    await setDoc(fsDoc( 'userTokens', token), {
       userId,
       token,
       updatedAt: Date.now(),
@@ -942,11 +1184,11 @@ export const saveUserToken = async (userId: string, token: string) => {
 export const getUserName = async (userId: string): Promise<string> => {
   try {
     // Try book-scoped users first
-    const docSnap = await getDoc(doc(db, 'users', userId));
+    const docSnap = await getDoc(fsDoc( 'users', userId));
     if (docSnap.exists()) return (docSnap.data() as any).name || userId;
     // Fallback to global users collection (for auth users not in current book)
     if (currentBookId !== 'default') {
-      const globalSnap = await getDoc(_docRef(db, 'users', userId));
+      const globalSnap = await getDoc(_docRef(assertDb(), 'users', userId));
       if (globalSnap.exists()) return (globalSnap.data() as any).name || userId;
     }
   } catch (e) { /* ignore */ }
@@ -955,14 +1197,14 @@ export const getUserName = async (userId: string): Promise<string> => {
 
 /** Get all users from ALL user collections — global + every book (for auth/login) */
 export const getAllUsersGlobal = async (): Promise<any[]> => {
-  const snap = await getDocs(_colRef(db, 'users') as any);
+  const snap = await getDocs(_colRef(assertDb(), 'users') as any);
   const all = toArray(snap).filter((d: any) => !d.deleted).map((u: any) => ({ ...u, bookId: u.bookId || 'default' }));
   const seenIds = new Set(all.map((u: any) => u.id));
   try {
-    const booksSnap = await getDocs(_colRef(db, 'books'));
+    const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
     for (const bDoc of booksSnap.docs) {
       const bookId = bDoc.id;
-      const bSnap = await getDocs(_colRef(db, `book_${bookId}_users`) as any);
+      const bSnap = await getDocs(_colRef(assertDb(), `book_${bookId}_users`) as any);
       for (const u of toArray(bSnap)) {
         if (!u.deleted && !seenIds.has(u.id)) {
           seenIds.add(u.id);
@@ -976,8 +1218,8 @@ export const getAllUsersGlobal = async (): Promise<any[]> => {
 
 export const requestContractFinalize = async (requestorId: string, contractId: string, payload: any) => {
   const req = sanitize({ type: 'contract_finalize', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
-  const r = await addDoc(collection(db, 'approvals'), req);
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  const r = await addDoc(fsCollection( 'approvals'), req);
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   // Notify admins via push notification
   try {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
@@ -989,8 +1231,8 @@ export const requestContractFinalize = async (requestorId: string, contractId: s
 
 export const requestContractDelete = async (requestorId: string, contractId: string, payload: any) => {
   const req = sanitize({ type: 'contract_delete', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
-  const r = await addDoc(collection(db, 'approvals'), req);
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  const r = await addDoc(fsCollection( 'approvals'), req);
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   try {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
     const userName = await getUserName(requestorId);
@@ -1008,14 +1250,14 @@ export const getStockEntries = async () => {
 };
 export const saveStockItem = async (s: any) => {
   const data = sanitize(s);
-  if (!s.id) return addDoc(collection(db, 'stocks'), data);
-  return setDoc(doc(db, 'stocks', s.id), data);
+  if (!s.id) return addDoc(fsCollection( 'stocks'), data);
+  return setDoc(fsDoc( 'stocks', s.id), data);
 };
 
 export const deleteStockItem = async (id: string) => {
   try {
-    await deleteDoc(doc(db, 'stocks', id));
-    await addDoc(collection(db, 'audit'), sanitize({ action: 'DELETE_STOCK', details: `Deleted stock item ${id}`, timestamp: Date.now() })).catch(() => {});
+    await deleteDoc(fsDoc( 'stocks', id));
+    await addDoc(fsCollection( 'audit'), sanitize({ action: 'DELETE_STOCK', details: `Deleted stock item ${id}`, timestamp: Date.now() })).catch(() => {});
     return true;
   } catch (e) {
     console.error('Delete stock error', e);
@@ -1031,11 +1273,11 @@ export const restoreStockFromTransaction = async (tx: any, userId: string): Prom
     const qty = Math.abs(item.qty || 0);
     if (!qty) continue;
     try {
-      const stockSnap = await getDoc(doc(db, 'stocks', item.stockId)).catch(() => null as any);
+      const stockSnap = await getDoc(fsDoc( 'stocks', item.stockId)).catch(() => null as any);
       const currentQty = stockSnap?.exists() ? ((stockSnap.data() as any).quantity || 0) : 0;
       const stockName = stockSnap?.exists() ? ((stockSnap.data() as any).name || item.name || '') : (item.name || '');
-      await setDoc(doc(db, 'stocks', item.stockId), { quantity: currentQty + qty }, { merge: true } as any).catch(() => {});
-      await addDoc(collection(db, 'stock_entries'), sanitize({
+      await setDoc(fsDoc( 'stocks', item.stockId), { quantity: currentQty + qty }, { merge: true } as any).catch(() => {});
+      await addDoc(fsCollection( 'stock_entries'), sanitize({
         stockId: item.stockId, stockName, qty, unitPrice: item.unitPrice || 0,
         by: userId, details: 'Reversal — transaction deleted', date: new Date().toISOString(),
       })).catch(() => {});
@@ -1051,11 +1293,11 @@ export const redeductStockFromTransaction = async (tx: any, userId: string): Pro
     const qty = Math.abs(item.qty || 0);
     if (!qty) continue;
     try {
-      const stockSnap = await getDoc(doc(db, 'stocks', item.stockId)).catch(() => null as any);
+      const stockSnap = await getDoc(fsDoc( 'stocks', item.stockId)).catch(() => null as any);
       const currentQty = stockSnap?.exists() ? ((stockSnap.data() as any).quantity || 0) : 0;
       const stockName = stockSnap?.exists() ? ((stockSnap.data() as any).name || item.name || '') : (item.name || '');
-      await setDoc(doc(db, 'stocks', item.stockId), { quantity: Math.max(0, currentQty - qty) }, { merge: true } as any).catch(() => {});
-      await addDoc(collection(db, 'stock_entries'), sanitize({
+      await setDoc(fsDoc( 'stocks', item.stockId), { quantity: Math.max(0, currentQty - qty) }, { merge: true } as any).catch(() => {});
+      await addDoc(fsCollection( 'stock_entries'), sanitize({
         stockId: item.stockId, stockName, qty: -qty, unitPrice: item.unitPrice || 0,
         by: userId, details: 'Re-deduction — transaction restored from trash', date: new Date().toISOString(),
       })).catch(() => {});
@@ -1065,9 +1307,9 @@ export const redeductStockFromTransaction = async (tx: any, userId: string): Pro
 
 export const consumeStockItem = async (stockId: string, qty: number, byUserId: string, details?: string, stockName?: string) => {
   // decrement stock and create stock_entries record
-  const stockDoc = doc(db, 'stocks', stockId);
+  const stockDoc = fsDoc( 'stocks', stockId);
   // best-effort read
-  const snap = await getDocs(query(collection(db, 'stocks'), where('__name__', '==', stockId)) as any).catch(() => null);
+  const snap = await getDocs(query(fsCollection( 'stocks'), where('__name__', '==', stockId)) as any).catch(() => null);
   let currentQty = 0;
   let resolvedName = stockName;
   if (snap && snap.docs && snap.docs.length > 0) {
@@ -1075,43 +1317,43 @@ export const consumeStockItem = async (stockId: string, qty: number, byUserId: s
     currentQty = (d.data() as any).quantity || 0;
     if (!resolvedName) resolvedName = (d.data() as any).name || undefined;
     const newQty = Math.max(0, currentQty - Math.abs(qty));
-    await setDoc(doc(db, 'stocks', stockId), { quantity: newQty }, { merge: true } as any).catch(() => {});
+    await setDoc(fsDoc( 'stocks', stockId), { quantity: newQty }, { merge: true } as any).catch(() => {});
   }
   // create entry record — always persist the stock name so log stays readable after deletions
   const entry = sanitize({ stockId, stockName: resolvedName || '', qty: -Math.abs(qty), by: byUserId, details, date: new Date().toISOString() });
-  await addDoc(collection(db, 'stock_entries'), entry).catch(() => {});
-  await addDoc(collection(db, 'audit'), sanitize({ action: 'CONSUME_STOCK', details: `Consumed ${qty} from ${resolvedName || stockId}`, userId: byUserId, timestamp: Date.now() })).catch(() => {});
+  await addDoc(fsCollection( 'stock_entries'), entry).catch(() => {});
+  await addDoc(fsCollection( 'audit'), sanitize({ action: 'CONSUME_STOCK', details: `Consumed ${qty} from ${resolvedName || stockId}`, userId: byUserId, timestamp: Date.now() })).catch(() => {});
   // note: Firestore atomic decrement would require FieldValue.increment; keep simple by letting background process recount or manual updates by UI.
   return true;
 };
 
 export const addStockEntry = async (stockId: string, qty: number, byUserId: string, details?: string) => {
   const entry = sanitize({ stockId, qty: Math.abs(qty), by: byUserId, details, date: new Date().toISOString() });
-  await addDoc(collection(db, 'stock_entries'), entry).catch(() => {});
+  await addDoc(fsCollection( 'stock_entries'), entry).catch(() => {});
   return true;
 };
 
 export const deleteStockEntry = async (entryId: string, reversalUserId: string): Promise<boolean> => {
   try {
     // Load the entry first so we can reverse the qty
-    const entrySnap = await getDoc(doc(db, 'stock_entries', entryId)).catch(() => null as any);
+    const entrySnap = await getDoc(fsDoc( 'stock_entries', entryId)).catch(() => null as any);
     if (!entrySnap || !entrySnap.exists()) return false;
     const entry = { id: entryId, ...entrySnap.data() as any };
     const qtyChange = entry.qty || 0; // negative = was consumed/sold, positive = was restocked
     if (qtyChange !== 0 && entry.stockId) {
       // Reverse: if qty was -5 (consumed), we add +5 back
-      const stockSnap = await getDoc(doc(db, 'stocks', entry.stockId)).catch(() => null as any);
+      const stockSnap = await getDoc(fsDoc( 'stocks', entry.stockId)).catch(() => null as any);
       if (stockSnap && stockSnap.exists()) {
         const currentQty = (stockSnap.data() as any).quantity || 0;
         const restoredQty = currentQty - qtyChange; // e.g. currentQty=3, qtyChange=-5 → 3-(-5)=8
-        await setDoc(doc(db, 'stocks', entry.stockId), { quantity: Math.max(0, restoredQty) }, { merge: true } as any).catch(() => {});
+        await setDoc(fsDoc( 'stocks', entry.stockId), { quantity: Math.max(0, restoredQty) }, { merge: true } as any).catch(() => {});
         // Create a reversal entry in the log
         const reversalEntry = sanitize({ stockId: entry.stockId, stockName: entry.stockName || '', qty: -qtyChange, by: reversalUserId, details: `Reversal of ${entry.details || 'entry'}`, date: new Date().toISOString() });
-        await addDoc(collection(db, 'stock_entries'), reversalEntry).catch(() => {});
+        await addDoc(fsCollection( 'stock_entries'), reversalEntry).catch(() => {});
       }
     }
-    await deleteDoc(doc(db, 'stock_entries', entryId)).catch(() => {});
-    await addDoc(collection(db, 'audit'), sanitize({ action: 'DELETE_STOCK_ENTRY', details: `Reversed stock entry ${entryId}`, userId: reversalUserId, timestamp: Date.now() })).catch(() => {});
+    await deleteDoc(fsDoc( 'stock_entries', entryId)).catch(() => {});
+    await addDoc(fsCollection( 'audit'), sanitize({ action: 'DELETE_STOCK_ENTRY', details: `Reversed stock entry ${entryId}`, userId: reversalUserId, timestamp: Date.now() })).catch(() => {});
     return true;
   } catch (e) {
     console.error('deleteStockEntry error', e);
@@ -1140,19 +1382,19 @@ export const sellStockItems = async (
   const isFree = !!options.isFree;
   let total = 0;
   for (const it of items) {
-    const snap = await getDocs(query(collection(db, 'stocks'), where('__name__', '==', it.stockId)) as any).catch(() => null);
+    const snap = await getDocs(query(fsCollection( 'stocks'), where('__name__', '==', it.stockId)) as any).catch(() => null);
     let currentQty = 0;
     if (snap && snap.docs && snap.docs.length > 0) {
       const d = snap.docs[0];
       currentQty = (d.data() as any).quantity || 0;
       const newQty = Math.max(0, currentQty - Math.abs(it.qty));
-      await setDoc(doc(db, 'stocks', it.stockId), { quantity: newQty }, { merge: true } as any).catch(() => {});
+      await setDoc(fsDoc( 'stocks', it.stockId), { quantity: newQty }, { merge: true } as any).catch(() => {});
     }
     const unitPrice = isFree ? 0 : (it.unitPrice || 0);
     const lineTotal = unitPrice * it.qty;
     total += lineTotal;
     const entry = sanitize({ stockId: it.stockId, stockName: it.name || '', qty: -Math.abs(it.qty), unitPrice, total: lineTotal, by: sellerId, details: isFree ? 'Free stock issue (quantity deducted)' : (options.customerName ? `Sold to ${options.customerName}` : 'Stock Sale'), date: new Date().toISOString(), buildingId: options.buildingId, unitNumber: options.unitNumber, contractId: options.contractId, customerId: options.customerId });
-    await addDoc(collection(db, 'stock_entries'), entry).catch(() => {});
+    await addDoc(fsCollection( 'stock_entries'), entry).catch(() => {});
   }
 
   // Free issues: log a neutral transaction (amount 0, not income/expense) so history shows it
@@ -1180,8 +1422,8 @@ export const sellStockItems = async (
     });
 
     try {
-      await setDoc(doc(db, 'transactions', tx.id), tx as any);
-      await addDoc(collection(db, 'audit'), sanitize({ action: 'FREE_STOCK', details: 'Free stock issued (qty deducted)', userId: sellerId, timestamp: Date.now() })).catch(() => {});
+      await setDoc(fsDoc( 'transactions', tx.id), tx as any);
+      await addDoc(fsCollection( 'audit'), sanitize({ action: 'FREE_STOCK', details: 'Free stock issued (qty deducted)', userId: sellerId, timestamp: Date.now() })).catch(() => {});
     } catch (e) {
       console.error('sellStockItems free transaction error', e);
     }
@@ -1216,17 +1458,17 @@ export const sellStockItems = async (
     // persist transaction using provided id so deletes work by id
     try {
       if (tx.id) {
-        await setDoc(doc(db, 'transactions', tx.id), tx as any);
+        await setDoc(fsDoc( 'transactions', tx.id), tx as any);
       } else {
-        await addDoc(collection(db, 'transactions'), tx as any);
+        await addDoc(fsCollection( 'transactions'), tx as any);
       }
-      await addDoc(collection(db, 'audit'), sanitize({ action: 'STOCK_SALE', details: `Sold items total ${total}`, userId: sellerId, timestamp: Date.now() })).catch(() => {});
+      await addDoc(fsCollection( 'audit'), sanitize({ action: 'STOCK_SALE', details: `Sold items total ${total}`, userId: sellerId, timestamp: Date.now() })).catch(() => {});
     } catch (e) {
       console.error('sellStockItems error', e);
     }
   } else if (!options.isPaid || total === 0) {
     // Log non-paid/free stock transactions to audit only
-    await addDoc(collection(db, 'audit'), sanitize({ action: 'STOCK_TRANSFER', details: `Stock transfer (unpaid/free) - items processed but no income recorded`, userId: sellerId, timestamp: Date.now() })).catch(() => {});
+    await addDoc(fsCollection( 'audit'), sanitize({ action: 'STOCK_TRANSFER', details: `Stock transfer (unpaid/free) - items processed but no income recorded`, userId: sellerId, timestamp: Date.now() })).catch(() => {});
   }
 
   return { total };
@@ -1241,11 +1483,11 @@ export const uploadInvoicePdf = async (vatInvoiceNumber: string, blob: Blob) => 
   const url = await getDownloadURL(ref);
   // persist URL on the transaction document (if exists)
   try {
-    const q = query(collection(db, 'transactions'), where('vatInvoiceNumber', '==', vatInvoiceNumber));
+    const q = query(fsCollection( 'transactions'), where('vatInvoiceNumber', '==', vatInvoiceNumber));
     const snap = await getDocs(q as any);
     if (snap && snap.docs && snap.docs.length > 0) {
       const docId = snap.docs[0].id;
-      await setDoc(doc(db, 'transactions', docId), { invoicePdfUrl: url }, { merge: true } as any);
+      await setDoc(fsDoc( 'transactions', docId), { invoicePdfUrl: url }, { merge: true } as any);
     }
   } catch (e) {
     console.error('Failed to attach invoicePdfUrl to transaction', e);
@@ -1333,10 +1575,31 @@ export const getAllReports = async (opts: { startDate?: string; endDate?: string
 export const getTransfers = async (opts?: { includeDeleted?: boolean }) => {
   return getCollection("transfers", { orderField: "createdAt", includeDeleted: !!opts?.includeDeleted });
 };
+
+/** Transfers collection for a specific book (Reports owner totals when Main Book is active). */
+export const getTransfersFromBook = async (bookId: string, opts?: { includeDeleted?: boolean }) => {
+  const path = rawBookPath(bookId, 'transfers');
+  const includeDeleted = !!opts?.includeDeleted;
+  try {
+    const col = _colRef(assertDb(), path);
+    let snap: any;
+    try {
+      snap = await getDocs(query(col, orderBy('createdAt', 'desc')) as any);
+    } catch {
+      snap = await getDocs(col as any);
+    }
+    const data = toArray(snap);
+    if (includeDeleted) return data;
+    return data.filter((d: any) => !d.deleted);
+  } catch {
+    return [];
+  }
+};
+
 export const saveTransfer = async (t: any) => {
   const data = sanitize(t);
   try {
-    const batch = writeBatch(db);
+    const batch = writeBatch(assertDb());
     const activeBookId = getCurrentBookId();
 
     const involvesHead = (t.toType === 'HEAD_OFFICE' || t.fromType === 'HEAD_OFFICE');
@@ -1488,8 +1751,8 @@ export const saveTransfer = async (t: any) => {
   } catch (e) {
     console.error('saveTransfer error', e);
     // fallback to original behaviour
-    if (!t.id) return addDoc(collection(db, "transfers"), data);
-    return setDoc(doc(db, "transfers", t.id), data);
+    if (!t.id) return addDoc(fsCollection( "transfers"), data);
+    return setDoc(fsDoc( "transfers", t.id), data);
   }
 };
 
@@ -1514,7 +1777,7 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
     // Collect every book we know about (admin-only can see all of them).
     let bookIds: string[] = [activeBookId];
     try {
-      const booksSnap = await getDocs(_colRef(db, 'books'));
+      const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
       booksSnap.docs.forEach((d: any) => {
         if (!bookIds.includes(d.id)) bookIds.push(d.id);
       });
@@ -1569,7 +1832,7 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
       });
     });
 
-    const batch = writeBatch(db);
+    const batch = writeBatch(assertDb());
     let created = 0;
     const norm = (v: any) => String(v || '').trim().toLowerCase();
 
@@ -1739,7 +2002,7 @@ const resolveTransferBooks = async (transferId: string): Promise<{
   let booksList: string[] = [];
   if (!t) {
     try {
-      const booksSnap = await getDocs(_colRef(db, 'books'));
+      const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
       booksList = booksSnap.docs.map((d: any) => d.id);
     } catch { /* ignore */ }
     for (const bk of booksList) {
@@ -1774,7 +2037,7 @@ const resolveTransferBooks = async (transferId: string): Promise<{
 export const deleteTransfer = async (id: string) => {
   try {
     const { transfer, transferBooks, sourceTx, destTx } = await resolveTransferBooks(id);
-    const batch = writeBatch(db);
+    const batch = writeBatch(assertDb());
     // Delete every mirrored copy of the transfer
     transferBooks.forEach(bk => batch.delete(bookDoc(bk, 'transfers', id)));
     if (transfer) {
@@ -1785,7 +2048,7 @@ export const deleteTransfer = async (id: string) => {
     return true;
   } catch (e) {
     console.error('deleteTransfer error', e);
-    return deleteDoc(doc(db, 'transfers', id));
+    return deleteDoc(fsDoc( 'transfers', id));
   }
 };
 
@@ -1795,28 +2058,28 @@ export const softDeleteTransfer = async (transferId: string, deletedBy?: string)
   try {
     const { transferBooks, sourceTx, destTx } = await resolveTransferBooks(transferId);
     const patch = { deleted: true, deletedAt: Date.now(), deletedBy: deletedBy || 'SYSTEM' };
-    const batch = writeBatch(db);
+    const batch = writeBatch(assertDb());
     transferBooks.forEach(bk => batch.set(bookDoc(bk, 'transfers', transferId), patch, { merge: true } as any));
     if (sourceTx) batch.set(bookDoc(sourceTx.bookId, 'transactions', sourceTx.id), patch, { merge: true } as any);
     if (destTx) batch.set(bookDoc(destTx.bookId, 'transactions', destTx.id), patch, { merge: true } as any);
     await batch.commit();
   } catch (e) {
     console.error('softDeleteTransfer error', e);
-    await setDoc(doc(db, 'transfers', transferId), { deleted: true, deletedAt: Date.now(), deletedBy: deletedBy || 'SYSTEM' }, { merge: true } as any);
+    await setDoc(fsDoc( 'transfers', transferId), { deleted: true, deletedAt: Date.now(), deletedBy: deletedBy || 'SYSTEM' }, { merge: true } as any);
   }
 };
 export const restoreTransfer = async (transferId: string) => {
   try {
     const { transferBooks, sourceTx, destTx } = await resolveTransferBooks(transferId);
     const patch = { deleted: false, deletedAt: null, deletedBy: null };
-    const batch = writeBatch(db);
+    const batch = writeBatch(assertDb());
     transferBooks.forEach(bk => batch.set(bookDoc(bk, 'transfers', transferId), patch, { merge: true } as any));
     if (sourceTx) batch.set(bookDoc(sourceTx.bookId, 'transactions', sourceTx.id), patch, { merge: true } as any);
     if (destTx) batch.set(bookDoc(destTx.bookId, 'transactions', destTx.id), patch, { merge: true } as any);
     await batch.commit();
   } catch (e) {
     console.error('restoreTransfer error', e);
-    await setDoc(doc(db, 'transfers', transferId), { deleted: false, deletedAt: null, deletedBy: null }, { merge: true } as any);
+    await setDoc(fsDoc( 'transfers', transferId), { deleted: false, deletedAt: null, deletedBy: null }, { merge: true } as any);
   }
 };
 
@@ -1826,10 +2089,10 @@ export const getServiceAgreements = async (opts?: { includeDeleted?: boolean }) 
 };
 export const saveServiceAgreement = async (a: any) => {
   const data = sanitize(a);
-  if (!a.id) return addDoc(collection(db, "service_agreements"), data);
-  return setDoc(doc(db, "service_agreements", a.id), data);
+  if (!a.id) return addDoc(fsCollection( "service_agreements"), data);
+  return setDoc(fsDoc( "service_agreements", a.id), data);
 };
-export const deleteServiceAgreement = async (id: string) => deleteDoc(doc(db, "service_agreements", id));
+export const deleteServiceAgreement = async (id: string) => deleteDoc(fsDoc( "service_agreements", id));
 
 // ---- Backup Management (Firestore) ----
 export interface BackupRecord { id: string; timestamp: string; date: string; size: number; data: string; createdAt: number; }
@@ -1845,7 +2108,7 @@ export const saveBackupToFirestore = async (backupData: string) => {
       createdAt: Date.now()
     };
     
-    await setDoc(doc(db, 'backups', backupRecord.id), backupRecord);
+    await setDoc(fsDoc( 'backups', backupRecord.id), backupRecord);
     return backupRecord;
   } catch (e) {
     console.error('Failed to save backup to Firestore:', e);
@@ -1855,7 +2118,7 @@ export const saveBackupToFirestore = async (backupData: string) => {
 
 export const getBackupsFromFirestore = async (): Promise<BackupRecord[]> => {
   try {
-    const snap = await getDocs(collection(db, 'backups'));
+    const snap = await getDocs(fsCollection( 'backups'));
     const backups = snap.docs.map(d => d.data() as BackupRecord).sort((a, b) => 
       new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
     );
@@ -1868,7 +2131,7 @@ export const getBackupsFromFirestore = async (): Promise<BackupRecord[]> => {
 
 export const deleteBackupFromFirestore = async (id: string) => {
   try {
-    await deleteDoc(doc(db, 'backups', id));
+    await deleteDoc(fsDoc( 'backups', id));
   } catch (e) {
     console.error('Failed to delete backup:', e);
     throw e;
@@ -1877,7 +2140,7 @@ export const deleteBackupFromFirestore = async (id: string) => {
 
 export const restoreFromFirestoreBackup = async (backupId: string) => {
   try {
-    const snap = await getDoc(doc(db, 'backups', backupId));
+    const snap = await getDoc(fsDoc( 'backups', backupId));
     if (!snap.exists()) throw new Error('Backup not found');
     
     const backup = snap.data() as BackupRecord;
@@ -1894,7 +2157,7 @@ export interface BookRecord { id: string; name: string; nameAr?: string; created
 
 export const getBooks = async (): Promise<BookRecord[]> => {
   try {
-    const snap = await getDocs(_colRef(db, 'books'));
+    const snap = await getDocs(_colRef(assertDb(), 'books'));
     return snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }) as BookRecord);
   } catch (e) {
     console.error('getBooks error', e);
@@ -1902,93 +2165,252 @@ export const getBooks = async (): Promise<BookRecord[]> => {
   }
 };
 
+/**
+ * All buildings from every book for pickers (e.g. owner stake on staff).
+ * Same id rules as Treasury: active book uses raw `id`; other books use `${bookId}:${rawId}`.
+ */
+
+export const getTransactionsAllBooks = async (opts?: { includeDeleted?: boolean }): Promise<any[]> => {
+  const activeBookId = getCurrentBookId();
+  const includeDeleted = !!opts?.includeDeleted;
+  const firestoreBooks = await getBooks();
+  let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
+  if (!bookList.some(b => b.id === 'default')) bookList.unshift({ id: 'default', name: 'Main Book' });
+  
+  const perBook = await Promise.all(
+    bookList.map(async bk => {
+      try {
+        const path = rawBookPath(bk.id, 'transactions');
+        const snap = await getDocs(_colRef(assertDb(), path) as any);
+        return toArray(snap)
+          .filter((t: any) => includeDeleted || !t.deleted)
+          .map((t: any) => {
+            const rawBuildingId = t.buildingId;
+            const compositeBuildingId = rawBuildingId && bk.id !== activeBookId ? `${bk.id}:${rawBuildingId}` : rawBuildingId;
+            return {
+              ...t,
+              _sourceBookId: bk.id,
+              _bookId: bk.id,
+              _bookName: bk.name || bk.id,
+              buildingId: compositeBuildingId,
+            };
+          });
+      } catch (e) { return []; }
+    })
+  );
+  return perBook.flat();
+};
+
+export const getContractsAllBooks = async (opts?: { includeDeleted?: boolean }): Promise<any[]> => {
+  const activeBookId = getCurrentBookId();
+  const includeDeleted = !!opts?.includeDeleted;
+  const firestoreBooks = await getBooks();
+  let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
+  if (!bookList.some(b => b.id === 'default')) bookList.unshift({ id: 'default', name: 'Main Book' });
+  
+  const perBook = await Promise.all(
+    bookList.map(async bk => {
+      try {
+        const path = rawBookPath(bk.id, 'contracts');
+        const snap = await getDocs(_colRef(assertDb(), path) as any);
+        return toArray(snap)
+          .filter((c: any) => includeDeleted || !c.deleted)
+          .map((c: any) => {
+            const rawBuildingId = c.buildingId;
+            const compositeBuildingId = rawBuildingId && bk.id !== activeBookId ? `${bk.id}:${rawBuildingId}` : rawBuildingId;
+            return { ...c, _sourceBookId: bk.id, buildingId: compositeBuildingId };
+          });
+      } catch (e) { return []; }
+    })
+  );
+  return perBook.flat();
+};
+
+export const getTransfersAllBooks = async (opts?: { includeDeleted?: boolean }): Promise<any[]> => {
+  const activeBookId = getCurrentBookId();
+  const includeDeleted = !!opts?.includeDeleted;
+  const firestoreBooks = await getBooks();
+  let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
+  if (!bookList.some(b => b.id === 'default')) bookList.unshift({ id: 'default', name: 'Main Book' });
+  
+  const perBook = await Promise.all(
+    bookList.map(async bk => {
+      try {
+        const path = rawBookPath(bk.id, 'transfers');
+        const snap = await getDocs(_colRef(assertDb(), path) as any);
+        return toArray(snap)
+          .filter((tr: any) => includeDeleted || !tr.deleted)
+          .map((tr: any) => {
+            const trData = {
+              ...tr,
+              _sourceBookId: bk.id,
+              _bookId: bk.id,
+              _bookName: bk.name || bk.id,
+            };
+            if (trData.fromType === 'BUILDING' && trData.fromId && bk.id !== activeBookId) {
+              trData.fromId = `${bk.id}:${trData.fromId}`;
+            }
+            if (trData.toType === 'BUILDING' && trData.toId && bk.id !== activeBookId) {
+              trData.toId = `${bk.id}:${trData.toId}`;
+            }
+            return trData;
+          });
+      } catch (e) { return []; }
+    })
+  );
+  return perBook.flat();
+};
+
+export const getBuildingsAllBooks = async (opts?: { includeDeleted?: boolean }): Promise<any[]> => {
+  const activeBookId = getCurrentBookId();
+  const includeDeleted = !!opts?.includeDeleted;
+  const firestoreBooks = await getBooks();
+  let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
+  if (!bookList.some(b => b.id === 'default')) {
+    bookList.unshift({ id: 'default', name: 'Main Book' });
+  }
+  const seenBook = new Set<string>();
+  bookList = bookList.filter(b => {
+    if (seenBook.has(b.id)) return false;
+    seenBook.add(b.id);
+    return true;
+  });
+
+  const extractNumber = (name: string) => {
+    const match = (name || '').match(/(\d+)/g);
+    if (!match || match.length === 0) return null;
+    return parseInt(match[match.length - 1], 10);
+  };
+
+  const perBook = await Promise.all(
+    bookList.map(async bk => {
+      try {
+        const path = rawBookPath(bk.id, 'buildings');
+        const snap = await getDocs(_colRef(assertDb(), path));
+        return snap.docs
+          .map((d: any) => {
+            const raw = { id: d.id, ...(d.data() as any) };
+            if (!includeDeleted && raw.deleted) return null;
+            const rawId = d.id;
+            const id = bk.id === activeBookId ? rawId : `${bk.id}:${rawId}`;
+            return {
+              ...raw,
+              id,
+              _sourceBookId: bk.id,
+              _rawBuildingId: rawId,
+              _bookDisplayName: bk.name,
+            };
+          })
+          .filter(Boolean);
+      } catch {
+        return [];
+      }
+    }),
+  );
+
+  const flat = perBook.flat() as any[];
+  flat.sort((a: any, b: any) => {
+    const bookCmp = String(a._sourceBookId || '').localeCompare(String(b._sourceBookId || ''));
+    if (bookCmp !== 0) return bookCmp;
+    const nameA = a?.name || '';
+    const nameB = b?.name || '';
+    const numA = extractNumber(nameA);
+    const numB = extractNumber(nameB);
+    if (numA !== null && numB !== null && numA !== numB) return numA - numB;
+    if (numA !== null && numB === null) return -1;
+    if (numA === null && numB !== null) return 1;
+    return nameA.localeCompare(nameB, undefined, { sensitivity: 'base' });
+  });
+  return flat;
+};
+
 export const saveBook = async (book: Partial<BookRecord> & { name: string }): Promise<BookRecord> => {
   const data = sanitize({ ...book, updatedAt: Date.now() });
   if (book.id) {
-    await setDoc(_docRef(db, 'books', book.id), data, { merge: true } as any);
+    await setDoc(_docRef(assertDb(), 'books', book.id), data, { merge: true } as any);
     return { id: book.id, ...data } as BookRecord;
   }
-  const ref = await addDoc(_colRef(db, 'books'), data);
+  const ref = await addDoc(_colRef(assertDb(), 'books'), data);
   return { id: ref.id, ...data } as BookRecord;
 };
 
 export const deleteBook = async (id: string): Promise<void> => {
-  await deleteDoc(_docRef(db, 'books', id));
+  await deleteDoc(_docRef(assertDb(), 'books', id));
 };
 
 // ---- SADAD Bills ----
 export const getSadadBills = async () => {  return getCollection('sadad_bills', 'dueDate'); };
 export const saveSadadBill = async (b: any) => {
   const data = sanitize(b);
-  if (!b.id) { const ref = await addDoc(collection(db, 'sadad_bills'), data); return ref.id; }
-  await setDoc(doc(db, 'sadad_bills', b.id), data);
+  if (!b.id) { const ref = await addDoc(fsCollection( 'sadad_bills'), data); return ref.id; }
+  await setDoc(fsDoc( 'sadad_bills', b.id), data);
   return b.id;
 };
-export const deleteSadadBill = async (id: string) => {  return deleteDoc(doc(db, 'sadad_bills', id)); };
+export const deleteSadadBill = async (id: string) => {  return deleteDoc(fsDoc( 'sadad_bills', id)); };
 
 // ---- Ejar Contracts ----
 export const getEjarContracts = async () => {  return getCollection('ejar_contracts', 'registrationDate'); };
 export const saveEjarContract = async (c: any) => {
   const data = sanitize(c);
-  if (!c.id) { const ref = await addDoc(collection(db, 'ejar_contracts'), data); return ref.id; }
-  await setDoc(doc(db, 'ejar_contracts', c.id), data);
+  if (!c.id) { const ref = await addDoc(fsCollection( 'ejar_contracts'), data); return ref.id; }
+  await setDoc(fsDoc( 'ejar_contracts', c.id), data);
   return c.id;
 };
-export const deleteEjarContract = async (id: string) => {  return deleteDoc(doc(db, 'ejar_contracts', id)); };
+export const deleteEjarContract = async (id: string) => {  return deleteDoc(fsDoc( 'ejar_contracts', id)); };
 
 // ---- Utility Readings ----
 export const getUtilityReadings = async () => {  return getCollection('utility_readings', 'readingDate'); };
 export const saveUtilityReading = async (r: any) => {
   const data = sanitize(r);
-  if (!r.id) { const ref = await addDoc(collection(db, 'utility_readings'), data); return ref.id; }
-  await setDoc(doc(db, 'utility_readings', r.id), data);
+  if (!r.id) { const ref = await addDoc(fsCollection( 'utility_readings'), data); return ref.id; }
+  await setDoc(fsDoc( 'utility_readings', r.id), data);
   return r.id;
 };
-export const deleteUtilityReading = async (id: string) => {  return deleteDoc(doc(db, 'utility_readings', id)); };
+export const deleteUtilityReading = async (id: string) => {  return deleteDoc(fsDoc( 'utility_readings', id)); };
 
 // ---- Security Deposits ----
 export const getSecurityDeposits = async () => {  return getCollection('security_deposits', 'depositDate'); };
 export const saveSecurityDeposit = async (d: any) => {
   const data = sanitize(d);
-  if (!d.id) { const ref = await addDoc(collection(db, 'security_deposits'), data); return ref.id; }
-  await setDoc(doc(db, 'security_deposits', d.id), data);
+  if (!d.id) { const ref = await addDoc(fsCollection( 'security_deposits'), data); return ref.id; }
+  await setDoc(fsDoc( 'security_deposits', d.id), data);
   return d.id;
 };
-export const deleteSecurityDeposit = async (id: string) => {  return deleteDoc(doc(db, 'security_deposits', id)); };
+export const deleteSecurityDeposit = async (id: string) => {  return deleteDoc(fsDoc( 'security_deposits', id)); };
 
 // ---- WhatsApp Messages ----
 export const getWhatsAppMessages = async () => {  return getCollection('whatsapp_messages', 'createdAt'); };
 export const saveWhatsAppMessage = async (m: any) => {
   const data = sanitize(m);
-  if (!m.id) { const ref = await addDoc(collection(db, 'whatsapp_messages'), data); return ref.id; }
-  await setDoc(doc(db, 'whatsapp_messages', m.id), data);
+  if (!m.id) { const ref = await addDoc(fsCollection( 'whatsapp_messages'), data); return ref.id; }
+  await setDoc(fsDoc( 'whatsapp_messages', m.id), data);
   return m.id;
 };
-export const deleteWhatsAppMessage = async (id: string) => {  return deleteDoc(doc(db, 'whatsapp_messages', id)); };
+export const deleteWhatsAppMessage = async (id: string) => {  return deleteDoc(fsDoc( 'whatsapp_messages', id)); };
 
 // WhatsApp Config (singleton)
 export const getWhatsAppConfig = async (): Promise<any> => {
   try {
-    const snap = await getDoc(doc(db, 'meta', 'whatsapp_config'));
+    const snap = await getDoc(fsDoc( 'meta', 'whatsapp_config'));
     return snap.exists() ? snap.data() : null;
   } catch { return null; }
 };
-export const saveWhatsAppConfig = async (c: any) => {  return setDoc(doc(db, 'meta', 'whatsapp_config'), sanitize(c)); };
+export const saveWhatsAppConfig = async (c: any) => {  return setDoc(fsDoc( 'meta', 'whatsapp_config'), sanitize(c)); };
 
 // ---- Bank Statements / Reconciliation ----
 export const getBankStatements = async () => {  return getCollection('bank_statements', 'transactionDate'); };
 export const saveBankStatement = async (s: any) => {
   const data = sanitize(s);
-  if (!s.id) { const ref = await addDoc(collection(db, 'bank_statements'), data); return ref.id; }
-  await setDoc(doc(db, 'bank_statements', s.id), data);
+  if (!s.id) { const ref = await addDoc(fsCollection( 'bank_statements'), data); return ref.id; }
+  await setDoc(fsDoc( 'bank_statements', s.id), data);
   return s.id;
 };
-export const deleteBankStatement = async (id: string) => {  return deleteDoc(doc(db, 'bank_statements', id)); };
+export const deleteBankStatement = async (id: string) => {  return deleteDoc(fsDoc( 'bank_statements', id)); };
 export const getReconciliationRecords = async () => {  return getCollection('reconciliation_records', 'createdAt'); };
 export const saveReconciliationRecord = async (r: any) => {
   const data = sanitize(r);
-  if (!r.id) { const ref = await addDoc(collection(db, 'reconciliation_records'), data); return ref.id; }
-  await setDoc(doc(db, 'reconciliation_records', r.id), data);
+  if (!r.id) { const ref = await addDoc(fsCollection( 'reconciliation_records'), data); return ref.id; }
+  await setDoc(fsDoc( 'reconciliation_records', r.id), data);
   return r.id;
 };
 
@@ -1996,39 +2418,38 @@ export const saveReconciliationRecord = async (r: any) => {
 export const getNafathVerifications = async () => {  return getCollection('nafath_verifications', 'createdAt'); };
 export const saveNafathVerification = async (v: any) => {
   const data = sanitize(v);
-  if (!v.id) { const ref = await addDoc(collection(db, 'nafath_verifications'), data); return ref.id; }
-  await setDoc(doc(db, 'nafath_verifications', v.id), data);
+  if (!v.id) { const ref = await addDoc(fsCollection( 'nafath_verifications'), data); return ref.id; }
+  await setDoc(fsDoc( 'nafath_verifications', v.id), data);
   return v.id;
 };
-export const deleteNafathVerification = async (id: string) => {  return deleteDoc(doc(db, 'nafath_verifications', id)); };
+export const deleteNafathVerification = async (id: string) => {  return deleteDoc(fsDoc( 'nafath_verifications', id)); };
 
 // ---- Municipality Licenses ----
 export const getMunicipalityLicenses = async () => {  return getCollection('municipality_licenses', 'expiryDate'); };
 export const saveMunicipalityLicense = async (l: any) => {
   const data = sanitize(l);
-  if (!l.id) { const ref = await addDoc(collection(db, 'municipality_licenses'), data); return ref.id; }
-  await setDoc(doc(db, 'municipality_licenses', l.id), data);
+  if (!l.id) { const ref = await addDoc(fsCollection( 'municipality_licenses'), data); return ref.id; }
+  await setDoc(fsDoc( 'municipality_licenses', l.id), data);
   return l.id;
 };
-export const deleteMunicipalityLicense = async (id: string) => {  return deleteDoc(doc(db, 'municipality_licenses', id)); };
+export const deleteMunicipalityLicense = async (id: string) => {  return deleteDoc(fsDoc( 'municipality_licenses', id)); };
 
 // ---- Civil Defense Records ----
 export const getCivilDefenseRecords = async () => {  return getCollection('civil_defense_records', 'expiryDate'); };
 export const saveCivilDefenseRecord = async (r: any) => {
   const data = sanitize(r);
-  if (!r.id) { const ref = await addDoc(collection(db, 'civil_defense_records'), data); return ref.id; }
-  await setDoc(doc(db, 'civil_defense_records', r.id), data);
+  if (!r.id) { const ref = await addDoc(fsCollection( 'civil_defense_records'), data); return ref.id; }
+  await setDoc(fsDoc( 'civil_defense_records', r.id), data);
   return r.id;
 };
-export const deleteCivilDefenseRecord = async (id: string) => {  return deleteDoc(doc(db, 'civil_defense_records', id)); };
+export const deleteCivilDefenseRecord = async (id: string) => {  return deleteDoc(fsDoc( 'civil_defense_records', id)); };
 
 // ---- Absher Records ----
 export const getAbsherRecords = async () => {  return getCollection('absher_records', 'createdAt'); };
 export const saveAbsherRecord = async (r: any) => {
   const data = sanitize(r);
-  if (!r.id) { const ref = await addDoc(collection(db, 'absher_records'), data); return ref.id; }
-  await setDoc(doc(db, 'absher_records', r.id), data);
+  if (!r.id) { const ref = await addDoc(fsCollection( 'absher_records'), data); return ref.id; }
+  await setDoc(fsDoc( 'absher_records', r.id), data);
   return r.id;
 };
-export const deleteAbsherRecord = async (id: string) => {  return deleteDoc(doc(db, 'absher_records', id)); };
-
+export const deleteAbsherRecord = async (id: string) => {  return deleteDoc(fsDoc( 'absher_records', id)); };

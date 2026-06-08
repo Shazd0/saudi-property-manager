@@ -1,12 +1,16 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
-import { Transaction, TransactionType, TransactionStatus, Contract, Building, Customer, ExpenseCategory, PaymentMethod, UserRole } from '../types';
-import { normalizePaymentMethod } from '../utils/transactionUtils';
+import { Transaction, TransactionType, TransactionStatus, Contract, Building, Customer, ExpenseCategory, PaymentMethod, UserRole, User } from '../types';
+import { normalizePaymentMethod, normalizeTransactionType } from '../utils/transactionUtils';
+import { addMoneyFingerprint, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import {
-  getTransactions, getContracts, getBuildings, getCustomers, getUsers,
+  getTransactions, getContracts, getBuildings, getCustomers,
   getOccupancyStats, getIncomeExpenseSummary, getIncomeExpenseByPeriod,
-  getSalaryReport, getMaintenanceReport, getVendors, getTransfers, getSettings
+  getSalaryReport, getMaintenanceReport, getVendors, getTransfers, getSettings,
+  getTransactionsAllBooks, getBuildingsAllBooks, getTransfersAllBooks, getUsersAcrossBooks,
+  ownerStakeBuildingIdsMatch,
 } from '../services/firestoreService';
+import { useBook } from '../contexts/BookContext';
 import { useLanguage } from '../i18n';
 import {
   BarChart, Bar, LineChart, Line, AreaChart, Area, PieChart, Pie, Cell,
@@ -21,11 +25,14 @@ import {
   Search, X
 } from 'lucide-react';
 
-import { User } from '../types';
-
 // ── Types ──
 type ReportTab = 'overview' | 'financial' | 'occupancy' | 'tenant' | 'expense' | 'salary' | 'building' | 'collection' | 'ownerExpense';
-type DatePreset = 'thisMonth' | 'lastMonth' | 'thisQuarter' | 'thisYear' | 'lastYear' | 'custom';
+type DatePreset =
+  | 'thisMonth'
+  | 'lastMonth'
+  | 'thisYear'
+  | 'lastYear'
+  | 'custom';
 
 interface KPICard {
   label: string;
@@ -49,11 +56,401 @@ const getDateRange = (preset: DatePreset): { start: string; end: string } => {
       const lm = m === 0 ? 11 : m - 1; const ly = m === 0 ? y - 1 : y;
       return { start: `${ly}-${String(lm + 1).padStart(2, '0')}-01`, end: new Date(ly, lm + 1, 0).toISOString().slice(0, 10) };
     }
-    case 'thisQuarter': { const qs = Math.floor(m / 3) * 3; return { start: `${y}-${String(qs + 1).padStart(2, '0')}-01`, end: new Date(y, qs + 3, 0).toISOString().slice(0, 10) }; }
     case 'thisYear': return { start: `${y}-01-01`, end: `${y}-12-31` };
     case 'lastYear': return { start: `${y - 1}-01-01`, end: `${y - 1}-12-31` };
     default: return { start: `${y}-01-01`, end: `${y}-12-31` };
   }
+};
+
+/** Composite Firestore id `bookId:rawId` → raw segment */
+const rawIdSegment = (id?: string): string => {
+  const s = String(id ?? '').trim();
+  if (!s) return '';
+  return s.includes(':') ? s.slice(s.lastIndexOf(':') + 1) : s;
+};
+
+const ownerReportBookId = (row: any, fallbackBookId = 'default'): string => {
+  const bid = String(row?._bookId || row?._sourceBookId || row?.bookId || fallbackBookId || 'default').trim();
+  return bid || 'default';
+};
+
+/** Treasury-linked ledger row for Building ↔ Owner (saved with paymentMethod TREASURY). */
+const isTreasuryBuildingOwnerLedgerTx = (t: any): boolean => {
+  const pm = String((t as any).paymentMethod ?? '');
+  if ((t as any).source !== 'treasury' && pm !== 'TREASURY') return false;
+  const ft = String((t as any).fromType || '').toUpperCase();
+  const tt = String((t as any).toType || '').toUpperCase();
+  return (ft === 'BUILDING' && tt === 'OWNER') || (ft === 'OWNER' && tt === 'BUILDING');
+};
+
+const ownerIdFromTreasuryBuildingOwnerTx = (t: any): string => {
+  const ft = String((t as any).fromType || '').toUpperCase();
+  const tt = String((t as any).toType || '').toUpperCase();
+  if (ft === 'OWNER') return String((t as any).fromId || '').trim();
+  if (tt === 'OWNER') return String((t as any).toId || '').trim();
+  return '';
+};
+
+/**
+ * Building↔Owner treasury row created by TransferManager "Convert owner expenses".
+ * The original form line stays in the ledger with `treasuryConverted` — count that, not this leg.
+ */
+const isTreasuryBuildingOwnerConvertedLeg = (t: any): boolean => {
+  if (!isTreasuryBuildingOwnerLedgerTx(t)) return false;
+  const p = String((t as any).purpose || '');
+  const d = String((t as any).details || (t as any).notes || '');
+  return /owner\s*expense\s*\(converted\)/i.test(p) || /converted\s+from\s+transaction/i.test(d);
+};
+
+const ownerStakeIdsForUser = (u: any): string[] =>
+  Array.isArray(u?.ownerBuildingIds)
+    ? u.ownerBuildingIds.map((x: any) => String(x || '').trim()).filter(Boolean)
+    : [];
+
+const isOwnerReportUser = (u: any): boolean => {
+  if (!u) return false;
+  const role = String(u.role || '').toUpperCase();
+  return (
+    role === 'OWNER' ||
+    u.isOwner === true ||
+    String(u.isOwner).toLowerCase() === 'true' ||
+    ownerStakeIdsForUser(u).length > 0
+  );
+};
+
+const normalizedOwnerText = (value: any): string =>
+  String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+
+const ownerTextKeysForUser = (u: any): string[] =>
+  [u?.name, u?.email, u?.ownerName]
+    .map(normalizedOwnerText)
+    .filter(Boolean);
+
+const findOwnerRecordForOwnerReport = (t: any, attributedOwnerId: string, staff: any[]): any | undefined => {
+  const candidates = (staff || []).filter(isOwnerReportUser);
+  if (!candidates.length) return undefined;
+
+  const oid = String(attributedOwnerId || '').trim();
+  const rawOid = rawIdSegment(oid);
+  const idMatches = oid
+    ? candidates.filter((e: any) => {
+        const eid = String(e.id || '').trim();
+        return eid === oid || rawIdSegment(eid) === rawOid;
+      })
+    : [];
+  const stakedIdMatch = idMatches.find((e: any) => ownerStakeIdsForUser(e).length > 0);
+  if (stakedIdMatch) return stakedIdMatch;
+
+  const ownerName = normalizedOwnerText((t as any)?.ownerName);
+  if (ownerName) {
+    const stakedNameMatch = candidates.find(
+      (e: any) => ownerStakeIdsForUser(e).length > 0 && ownerTextKeysForUser(e).includes(ownerName),
+    );
+    if (stakedNameMatch) return stakedNameMatch;
+    const nameMatch = candidates.find((e: any) => ownerTextKeysForUser(e).includes(ownerName));
+    if (nameMatch) return nameMatch;
+  }
+
+  return idMatches[0];
+};
+
+/** Resolve owner id for grouping when `ownerId` was left blank but `ownerName` matches a user. */
+const resolveOwnerIdForOwnerReport = (t: any, staff: any[]): string => {
+  const explicitOwnerId = String((t as any).ownerId || '').trim();
+  const treasuryOwnerId = ownerIdFromTreasuryBuildingOwnerTx(t);
+  const ownerRecord = findOwnerRecordForOwnerReport(t, explicitOwnerId || treasuryOwnerId, staff);
+  if (ownerRecord?.id) return String(ownerRecord.id).trim();
+  let oid = explicitOwnerId || treasuryOwnerId;
+  if (oid) return oid;
+  const tn = String((t as any).ownerName || '').trim();
+  if (!tn || !staff?.length) return '';
+  const lower = tn.toLowerCase();
+  const em = staff.find(
+    (e: any) =>
+      String(e.name || '').trim().toLowerCase() === lower ||
+      String(e.email || '').trim().toLowerCase() === lower,
+  );
+  return em?.id ? String(em.id).trim() : '';
+};
+
+const transactionBuildingIdForStake = (t: any): string => {
+  let bid = String(t?.buildingId || '').trim();
+  if (bid) return bid;
+  if (isTreasuryBuildingOwnerLedgerTx(t)) {
+    const ft = String(t.fromType || '').toUpperCase();
+    const tt = String(t.toType || '').toUpperCase();
+    if (ft === 'BUILDING') return String(t.fromId || '').trim();
+    if (tt === 'BUILDING') return String(t.toId || '').trim();
+  }
+  return '';
+};
+
+const buildingIdForOwnerStakeMatch = (t: any, activeBookId: string): string => {
+  const bid = transactionBuildingIdForStake(t);
+  if (!bid) return '';
+  if (bid.includes(':')) return bid;
+  const rowBook = ownerReportBookId(t, activeBookId);
+  const act = String(activeBookId || '').trim();
+  if (rowBook && act && rowBook !== act) return `${rowBook}:${bid}`;
+  return bid;
+};
+
+/**
+ * Owner Expense report: only include rows for an owner who has at least one building checked under
+ * "Owner's Buildings (Properties with stake)" on their staff record; when none are selected, exclude
+ * that owner entirely. When some are selected, only lines whose building is in that list (including
+ * other-book rows matched via `_bookId` + raw id). Synthetic Head Office ↔ Owner `transfer:` rows
+ * have no building: they are included only when they are not tagged to a different book than the
+ * active book (cross-book HO legs cannot be tied to a checked stake building).
+ */
+const passesOwnerStakeBuildingFilter = (
+  t: Transaction,
+  attributedOwnerId: string,
+  staff: any[],
+  activeBookId: string,
+): boolean => {
+  const oid = String(attributedOwnerId || '').trim();
+  if (!oid) return true;
+  const emp =
+    findOwnerRecordForOwnerReport(t, oid, staff) ||
+    staff.find((e: any) => String(e.id) === oid || String(e.id) === rawIdSegment(oid));
+  const stakeIds = ownerStakeIdsForUser(emp);
+  if (isOwnerOpeningEntry(t)) return true;
+  if (stakeIds.length === 0) return false;
+
+  const act = String(activeBookId || '').trim();
+  if (String((t as any).id || '').startsWith('transfer:')) {
+    const rowBook = ownerReportBookId(t, activeBookId);
+    if (rowBook && act && rowBook !== act) return false;
+    return true;
+  }
+
+  const bidNorm = buildingIdForOwnerStakeMatch(t as any, activeBookId);
+  if (!bidNorm) return false;
+
+  return stakeIds.some(sid => ownerStakeBuildingIdsMatch(String(sid), bidNorm, activeBookId));
+};
+
+const isViewerAdminOrManager = (u?: User | null): boolean => {
+  if (!u) return false;
+  const r = String(u.role || '').toUpperCase();
+  return r === 'ADMIN' || r === UserRole.ADMIN || r === 'MANAGER' || r === UserRole.MANAGER;
+};
+
+/** Staff "Assign Buildings" list from Employee / user record. */
+const viewerAssignedBuildingIds = (u?: User | null): string[] => {
+  if (!u) return [];
+  const ids = (u as any).buildingIds;
+  if (Array.isArray(ids) && ids.length)
+    return [...new Set(ids.map((x: any) => String(x || '').trim()).filter(Boolean))];
+  const one = (u as any).buildingId;
+  return one ? [String(one).trim()] : [];
+};
+
+/** Owner role: "Owner's Buildings (Properties with stake)" on the user record. */
+const viewerOwnerStakeBuildingIds = (u?: User | null): string[] => {
+  if (!u) return [];
+  const obl = (u as any).ownerBuildingIds;
+  if (Array.isArray(obl) && obl.length)
+    return [...new Set(obl.map((x: any) => String(x || '').trim()).filter(Boolean))];
+  return [];
+};
+
+/**
+ * Non–Admin/Manager: no cross-book rows; scope to Assign Buildings (or owner stake if no staff buildings).
+ * Head Office ↔ Owner synthetics without a building pass only for same-book treasury staff with some scope.
+ */
+const passesViewerStaffOwnerScope = (
+  t: Transaction,
+  currentUser: User | undefined,
+  activeBookId: string,
+): boolean => {
+  if (!currentUser || isViewerAdminOrManager(currentUser)) return true;
+
+  const act = String(activeBookId || '').trim();
+  const rowBook = ownerReportBookId(t, activeBookId);
+  if (rowBook && act && rowBook !== act) return false;
+
+  const staffBlds = viewerAssignedBuildingIds(currentUser);
+  const stakeBlds = viewerOwnerStakeBuildingIds(currentUser);
+  const allowed = staffBlds.length > 0 ? staffBlds : stakeBlds;
+  if (allowed.length === 0) return false;
+
+  if (isOwnerOpeningEntry(t)) {
+    const rowOwnerId = String((t as any).ownerId || '').trim();
+    return !!rowOwnerId && (rowOwnerId === String(currentUser.id) || rawIdSegment(rowOwnerId) === rawIdSegment(String(currentUser.id)));
+  }
+
+  const bid = transactionBuildingIdForStake(t as any);
+  if (!bid) {
+    return String((t as any).id || '').startsWith('transfer:');
+  }
+  return allowed.some(sid => ownerStakeBuildingIdsMatch(sid, bid, activeBookId));
+};
+
+const passesViewerStaffOwnerScopeTransfer = (
+  tr: any,
+  currentUser: User | undefined,
+  activeBookId: string,
+): boolean => {
+  if (!currentUser || isViewerAdminOrManager(currentUser)) return true;
+
+  const act = String(activeBookId || '').trim();
+  const rowBook = ownerReportBookId(tr, activeBookId);
+  if (rowBook && act && rowBook !== act) return false;
+
+  const staffBlds = viewerAssignedBuildingIds(currentUser);
+  const stakeBlds = viewerOwnerStakeBuildingIds(currentUser);
+  const allowed = staffBlds.length > 0 ? staffBlds : stakeBlds;
+  if (allowed.length === 0) return false;
+
+  if (isHeadOfficeOwnerTransfer(tr)) return true;
+
+  const bFrom = tr.fromType === 'BUILDING' ? String(tr.fromId || '') : '';
+  const bTo = tr.toType === 'BUILDING' ? String(tr.toId || '') : '';
+  const cand = bFrom || bTo;
+  if (!cand) return false;
+  return allowed.some(sid => ownerStakeBuildingIdsMatch(sid, cand, activeBookId));
+};
+
+/** VAT-inclusive totals — matches Dashboard `txDisplayAmount`. */
+const reportMoneyAmount = (t: Transaction): number => {
+  const tx = t as any;
+  const inclRaw = tx.amountIncludingVAT ?? tx.totalWithVat;
+  if (inclRaw != null && inclRaw !== '') {
+    const n = Number(inclRaw);
+    if (!Number.isNaN(n)) {
+      const base = Number(tx.amount) || 0;
+      const vat = Number(tx.vatAmount) || 0;
+      const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
+      if (isExpense && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
+      return n;
+    }
+  }
+  const base = Number(tx.amount) || 0;
+  const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
+  const vat = Number(tx.vatAmount) || 0;
+  if (isExpense && vat > 0) return base + vat;
+  return base;
+};
+
+/** Withdrawal (+) vs contribution (−) for Building↔Owner treasury ledger rows. */
+const signedTreasuryBuildingOwnerAmount = (t: Transaction): number => {
+  const raw = reportMoneyAmount(t);
+  if (normalizeTransactionType(t.type) === TransactionType.INCOME) return -Math.abs(raw);
+  return Math.abs(raw);
+};
+
+/** Single line amount for owner report rows (forms + treasury legs + HO↔Owner synthesised txs). */
+const ownerReportLineAmount = (t: Transaction): number => {
+  if (String((t as any).id || '').startsWith('transfer:')) return Number((t as any).amount) || 0;
+  if (isTreasuryBuildingOwnerLedgerTx(t)) return signedTreasuryBuildingOwnerAmount(t);
+  return reportMoneyAmount(t);
+};
+
+const transferCountsForOwnerReport = (tr: any): boolean => {
+  if (!tr || tr.deleted) return false;
+  const st = String(tr.status ?? 'APPROVED').toUpperCase();
+  if (st === 'CANCELLED' || st === 'PENDING') return false;
+  return st === 'APPROVED' || st === 'COMPLETED' || !tr.status;
+};
+
+const isHeadOfficeOwnerTransfer = (tr: any): boolean =>
+  (tr.fromType === 'HEAD_OFFICE' && tr.toType === 'OWNER') ||
+  (tr.fromType === 'OWNER' && tr.toType === 'HEAD_OFFICE');
+
+const ownerIdFromHeadOfficeOwnerTransfer = (tr: any): string => {
+  if (tr.fromType === 'HEAD_OFFICE' && tr.toType === 'OWNER') return String(tr.toId || '').trim();
+  if (tr.fromType === 'OWNER' && tr.toType === 'HEAD_OFFICE') return String(tr.fromId || '').trim();
+  return '';
+};
+
+/** HO→OWNER (+); OWNER→HO (−). Matches Dashboard owner transfer totals. */
+const signedHeadOfficeOwnerTransferAmount = (tr: any): number => {
+  const a = Number(tr.amount) || 0;
+  if (tr.fromType === 'HEAD_OFFICE' && tr.toType === 'OWNER') return a;
+  if (tr.fromType === 'OWNER' && tr.toType === 'HEAD_OFFICE') return -a;
+  return 0;
+};
+
+const ownerCrossBookSuffix = (tx: any): string => {
+  const bid = ownerReportBookId(tx, 'default');
+  if (!bid || bid === 'default') return '';
+  const name = String(tx?._bookName || '').trim();
+  return name ? ` [${name}]` : ` [${bid}]`;
+};
+
+const isOwnerOpeningEntry = (t: any): boolean =>
+  t?.isOwnerOpeningBalance === true ||
+  String(t?.expenseCategory || '').trim() === 'Owner Opening Balance' ||
+  (t?.borrowingType === 'OPENING_BALANCE' && !!t?.ownerId);
+
+/** Owner-expense pipeline: on that tab, Admin/Manager uses multi-select ids (incl. other books); other tabs use single `buildingFilter`. */
+type OwnerReportBuildingConstraint =
+  | { mode: 'all' }
+  | { mode: 'single'; id: string }
+  | { mode: 'multi'; ids: string[]; includeHoTreasury?: boolean };
+
+const getOwnerReportBuildingConstraint = (
+  activeTab: ReportTab,
+  currentUser: User | undefined,
+  buildingFilter: string,
+  ownerPickerBuildings: { id: string }[],
+  ownerExpenseExcludedBuildingIds: string[],
+  ownerExpenseIncludeTreasury: boolean,
+): OwnerReportBuildingConstraint => {
+  const ownerTab = activeTab === 'ownerExpense' && isViewerAdminOrManager(currentUser);
+  if (ownerTab) {
+    const allIds = ownerPickerBuildings.map(b => String(b.id || '')).filter(Boolean);
+    if (!allIds.length) return { mode: 'all' };
+    const excluded = new Set(ownerExpenseExcludedBuildingIds.map(String));
+    const included = allIds.filter(id => !excluded.has(id));
+    // Nothing excluded = same as "all buildings checked"
+    if (!ownerExpenseExcludedBuildingIds.length) return { mode: 'all' };
+    if (!included.length) return { mode: 'multi', ids: [], includeHoTreasury: false };
+    return { mode: 'multi', ids: included, includeHoTreasury: ownerExpenseIncludeTreasury };
+  }
+  if (buildingFilter === 'all') return { mode: 'all' };
+  return { mode: 'single', id: String(buildingFilter) };
+};
+
+const transactionMatchesOwnerReportBuilding = (
+  t: any,
+  c: OwnerReportBuildingConstraint,
+  activeBookId: string,
+): boolean => {
+  if (isOwnerOpeningEntry(t)) return true;
+  if (c.mode === 'all') return true;
+  if (c.mode === 'single') {
+    const bid = String(t.buildingId || '');
+    const bf = c.id;
+    return bid === bf || rawIdSegment(bid) === rawIdSegment(bf) || bid === rawIdSegment(bf);
+  }
+  // Head Office ↔ Owner synthetics use `transfer:…` ids and carry no building; keep when user opted in.
+  if (c.mode === 'multi' && c.includeHoTreasury && String(t.id || '').startsWith('transfer:')) return true;
+  if (String(t.id || '').startsWith('transfer:')) return false;
+  const bidNorm = buildingIdForOwnerStakeMatch(t, activeBookId);
+  if (!bidNorm) return false;
+  return c.ids.some(sel => ownerStakeBuildingIdsMatch(String(sel), bidNorm, activeBookId));
+};
+
+const transferBuildingSideMatchesOwnerReportBuilding = (
+  tr: any,
+  c: OwnerReportBuildingConstraint,
+  activeBookId: string,
+): boolean => {
+  if (c.mode === 'all') return true;
+  const buildingSide = tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : '');
+  if (c.mode === 'single') {
+    const bid = String(buildingSide || '');
+    const bf = c.id;
+    return bid === bf || rawIdSegment(bid) === rawIdSegment(bf) || bid === rawIdSegment(bf);
+  }
+  if (!String(buildingSide || '').trim()) return false;
+  const stub = { buildingId: String(buildingSide), _bookId: ownerReportBookId(tr, activeBookId) };
+  const bidNorm = buildingIdForOwnerStakeMatch(stub, activeBookId);
+  if (!bidNorm) return false;
+  return c.ids.some(sel => ownerStakeBuildingIdsMatch(String(sel), bidNorm, activeBookId));
 };
 
 const COLORS = ['#059669', '#0891b2', '#7c3aed', '#e11d48', '#ea580c', '#ca8a04', '#2563eb', '#db2777', '#16a34a', '#6366f1'];
@@ -69,6 +466,7 @@ interface ReportsProps {
 
 const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const { t, isRTL } = useLanguage();
+  const { activeBookId } = useBook();
 
   // ── State ──
   const [activeTab, setActiveTab] = useState<ReportTab>('overview');
@@ -77,6 +475,12 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const [customStart, setCustomStart] = useState('');
   const [customEnd, setCustomEnd] = useState('');
   const [buildingFilter, setBuildingFilter] = useState('all');
+  /** Owner tab: buildings unchecked here are excluded from the report (default none = all included). */
+  const [ownerExpenseExcludedBuildingIds, setOwnerExpenseExcludedBuildingIds] = useState<string[]>([]);
+  const [ownerExpenseBuildingPickerOpen, setOwnerExpenseBuildingPickerOpen] = useState(false);
+  const [ownerExpenseBuildingSearch, setOwnerExpenseBuildingSearch] = useState('');
+  /** When specific buildings are selected, Head Office ↔ Owner treasury synthetics are off unless this is true. */
+  const [ownerExpenseIncludeTreasury, setOwnerExpenseIncludeTreasury] = useState(false);
   const [ownerFilter, setOwnerFilter] = useState('all');
   const [showFilters, setShowFilters] = useState(false);
   const [collectionSearch, setCollectionSearch] = useState('');
@@ -91,6 +495,11 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const [occupancy, setOccupancy] = useState({ totalUnits: 0, occupiedUnits: 0, percentage: 0 });
   const [vendors, setVendors] = useState<any[]>([]);
   const [transfers, setTransfers] = useState<any[]>([]);
+  /** Main Book only: owner-related txs from other partitions for Owner Expense report */
+  const [ownerSupplementTxs, setOwnerSupplementTxs] = useState<Transaction[]>([]);
+  const [ownerSupplementTransfers, setOwnerSupplementTransfers] = useState<any[]>([]);
+  const [ownerAllBookBuildings, setOwnerAllBookBuildings] = useState<Building[]>([]);
+  const [ownerAllBookLoading, setOwnerAllBookLoading] = useState(false);
   const [reportSettings, setReportSettings] = useState<any>(null);
 
   const printRef = useRef<HTMLDivElement>(null);
@@ -102,13 +511,61 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     return getDateRange(datePreset);
   }, [datePreset, customStart, customEnd]);
 
+  const ownerPickerBuildings = useMemo(() => {
+    const sourceBuildings =
+      activeBookId === 'default' && ownerAllBookBuildings.length > 0
+        ? ownerAllBookBuildings
+        : buildings;
+    return (sourceBuildings || []).map(b => ({
+      id: b.id,
+      name: b.name,
+      _bookDisplayName: (b as any)._bookDisplayName as string | undefined,
+      _sourceBookId: ((b as any)._sourceBookId || activeBookId) as string,
+    }));
+  }, [buildings, ownerAllBookBuildings, activeBookId]);
+
+  const filteredOwnerPickerBuildings = useMemo(() => {
+    const q = ownerExpenseBuildingSearch.trim().toLowerCase();
+    if (!q) return ownerPickerBuildings;
+    return ownerPickerBuildings.filter((b: any) => {
+      const name = String(b.name || '').toLowerCase();
+      const book = String(b._bookDisplayName || '').toLowerCase();
+      return name.includes(q) || book.includes(q);
+    });
+  }, [ownerPickerBuildings, ownerExpenseBuildingSearch]);
+
+  const ownerExpenseIncludedBuildings = useMemo(() => {
+    const excluded = new Set(ownerExpenseExcludedBuildingIds.map(String));
+    return (ownerPickerBuildings || []).filter((b: any) => !excluded.has(String(b.id || '')));
+  }, [ownerPickerBuildings, ownerExpenseExcludedBuildingIds]);
+
+  const ownerReportBuildingConstraint = useMemo(
+    () =>
+      getOwnerReportBuildingConstraint(
+        activeTab,
+        currentUser,
+        buildingFilter,
+        ownerPickerBuildings,
+        ownerExpenseExcludedBuildingIds,
+        ownerExpenseIncludeTreasury,
+      ),
+    [
+      activeTab,
+      currentUser,
+      buildingFilter,
+      ownerPickerBuildings,
+      ownerExpenseExcludedBuildingIds,
+      ownerExpenseIncludeTreasury,
+    ],
+  );
+
   // ── Fetch ──
   const loadData = async () => {
     setLoading(true);
     try {
       const [txs, cons, blds, custs, usrs, occ, vnds, trsf, sett] = await Promise.all([
         getTransactions(), getContracts(), getBuildings(),
-        getCustomers(), getUsers(), getOccupancyStats(), getVendors(), getTransfers({}),
+        getCustomers({ acrossBooks: true }), getUsersAcrossBooks(), getOccupancyStats(), getVendors(), getTransfers({}),
         getSettings().catch(() => null)
       ]);
       setTransactions(txs as Transaction[]);
@@ -120,24 +577,314 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       setVendors(vnds as any[]);
       setTransfers(trsf as any[]);
       setReportSettings(sett || null);
+
+      if (!(activeBookId === 'default' && activeTab === 'ownerExpense')) {
+        setOwnerSupplementTxs([]);
+        setOwnerSupplementTransfers([]);
+        setOwnerAllBookBuildings([]);
+      }
     } catch (e) { console.error('Reports load error:', e); }
     setLoading(false);
   };
 
-  useEffect(() => { loadData(); }, []);
+  useEffect(() => { loadData(); }, [
+    activeBookId,
+    currentUser?.id,
+    (currentUser as any)?.role,
+    JSON.stringify((currentUser as any)?.buildingIds || []),
+    JSON.stringify((currentUser as any)?.ownerBuildingIds || []),
+  ]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const clearOwnerAllBookData = () => {
+      setOwnerSupplementTxs([]);
+      setOwnerSupplementTransfers([]);
+      setOwnerAllBookBuildings([]);
+      setOwnerAllBookLoading(false);
+    };
+
+    const withBookMeta = (row: any): any => {
+      const bookId = ownerReportBookId(row, activeBookId);
+      const base = row && typeof row === 'object' ? row : {};
+      return {
+        ...base,
+        _bookId: bookId,
+        _sourceBookId: bookId,
+        _bookName:
+          base._bookName ||
+          base._bookDisplayName ||
+          (bookId === 'default' ? 'Main Book' : bookId),
+      };
+    };
+
+    const isOwnerReportTransaction = (row: any): boolean => {
+      const cat = String(row?.expenseCategory || '').trim();
+      return (
+        cat === 'Owner Expense' ||
+        cat === ExpenseCategory.OWNER_EXPENSE ||
+        cat === 'Owner Profit Withdrawal' ||
+        cat === 'Owner Opening Balance' ||
+        isOwnerOpeningEntry(row) ||
+        isTreasuryBuildingOwnerLedgerTx(row)
+      );
+    };
+
+    const loadOwnerAllBooks = async () => {
+      if (activeTab !== 'ownerExpense' || activeBookId !== 'default' || !isViewerAdminOrManager(currentUser)) {
+        clearOwnerAllBookData();
+        return;
+      }
+
+      setOwnerAllBookLoading(true);
+      try {
+        const [allTxs, allTransfers, allBuildings] = await Promise.all([
+          getTransactionsAllBooks(),
+          getTransfersAllBooks(),
+          getBuildingsAllBooks(),
+        ]);
+        if (cancelled) return;
+
+        const normalizedTxs = (allTxs || []).map(withBookMeta);
+        const normalizedTransfers = (allTransfers || []).map(withBookMeta);
+        const normalizedBuildings = (allBuildings || []).map(withBookMeta) as Building[];
+
+        setOwnerAllBookBuildings(normalizedBuildings);
+        setOwnerSupplementTxs(
+          normalizedTxs.filter(
+            (row: any) =>
+              ownerReportBookId(row, activeBookId) !== activeBookId &&
+              isOwnerReportTransaction(row),
+          ) as Transaction[],
+        );
+        setOwnerSupplementTransfers(
+          normalizedTransfers.filter((tr: any) => {
+            if (ownerReportBookId(tr, activeBookId) === activeBookId) return false;
+            return (
+              isHeadOfficeOwnerTransfer(tr) ||
+              (tr.fromType === 'BUILDING' && tr.toType === 'OWNER') ||
+              (tr.fromType === 'OWNER' && tr.toType === 'BUILDING')
+            );
+          }),
+        );
+      } catch (e) {
+        if (!cancelled) {
+          console.error('Reports owner all-book load error:', e);
+          setOwnerSupplementTxs([]);
+          setOwnerSupplementTransfers([]);
+          setOwnerAllBookBuildings([]);
+        }
+      } finally {
+        if (!cancelled) setOwnerAllBookLoading(false);
+      }
+    };
+
+    loadOwnerAllBooks();
+    return () => { cancelled = true; };
+  }, [activeTab, activeBookId, currentUser?.id, (currentUser as any)?.role]);
+
+  useEffect(() => {
+    const valid = new Set(ownerPickerBuildings.map((b: any) => String(b.id || '')));
+    setOwnerExpenseExcludedBuildingIds(prev => prev.filter(id => valid.has(id)));
+  }, [ownerPickerBuildings]);
+
+  useEffect(() => {
+    if (activeTab !== 'ownerExpense') {
+      setOwnerExpenseBuildingPickerOpen(false);
+      setOwnerExpenseBuildingSearch('');
+    }
+  }, [activeTab]);
+
+  useEffect(() => {
+    if (ownerExpenseExcludedBuildingIds.length === 0) setOwnerExpenseIncludeTreasury(false);
+  }, [ownerExpenseExcludedBuildingIds.length]);
 
   // ── Filtered Transactions ──
   const filtered = useMemo(() => {
     return transactions.filter(t => {
+      // Match History default: trashed rows should not affect Reports totals
+      if ((t as any).deleted) return false;
       if (t.date < rangeStart || t.date > rangeEnd) return false;
-      if (buildingFilter !== 'all' && t.buildingId !== buildingFilter) return false;
+      if (buildingFilter !== 'all') {
+        const bid = String((t as any).buildingId || '');
+        const bf = String(buildingFilter);
+        if (bid !== bf && rawIdSegment(bid) !== rawIdSegment(bf) && bid !== rawIdSegment(bf)) return false;
+      }
       // Exclude TREASURY and TREASURY_REVERSAL transactions (internal transfers)
-      if ((t as any).source === 'treasury' || t.paymentMethod === 'TREASURY' || t.paymentMethod === 'TREASURY_REVERSAL' || (t as any).isReversal) return false;
+      const pm = String((t as any).paymentMethod ?? '');
+      if ((t as any).source === 'treasury' || pm === 'TREASURY' || pm === 'TREASURY_REVERSAL' || (t as any).isReversal) return false;
       return true;
     });
   }, [transactions, rangeStart, rangeEnd, buildingFilter]);
 
   const approved = useMemo(() => filtered.filter(t => t.status === TransactionStatus.APPROVED || !t.status), [filtered]);
+
+  const transactionsForOwnerReports = useMemo(
+    () => [...transactions, ...ownerSupplementTxs],
+    [transactions, ownerSupplementTxs],
+  );
+
+  const mergedTransfersForOwnerReports = useMemo(() => {
+    const map = new Map<string, any>();
+    for (const tr of [...(transfers || []), ...(ownerSupplementTransfers || [])]) {
+      const id = String(tr?.id || '').trim();
+      if (!id) continue;
+      const bookId = ownerReportBookId(tr, activeBookId);
+      const key = `${bookId}:${id}`;
+      if (!map.has(key)) map.set(key, tr);
+    }
+    return Array.from(map.values());
+  }, [transfers, ownerSupplementTransfers, activeBookId]);
+
+  /** Like `approved` but includes other books when Main Book is active (owner report paths only). */
+  const approvedForOwnerTab = useMemo(() => {
+    return transactionsForOwnerReports.filter(t => {
+      if ((t as any).deleted) return false;
+      const d = String(t.date || '');
+      if (d < rangeStart || d > rangeEnd) return false;
+      if (!transactionMatchesOwnerReportBuilding(t, ownerReportBuildingConstraint, activeBookId)) return false;
+      const pm = String((t as any).paymentMethod ?? '');
+      if ((t as any).source === 'treasury' || pm === 'TREASURY' || pm === 'TREASURY_REVERSAL' || (t as any).isReversal) return false;
+      if (!(t.status === TransactionStatus.APPROVED || !t.status)) return false;
+      return passesViewerStaffOwnerScope(t, currentUser, activeBookId);
+    });
+  }, [transactionsForOwnerReports, rangeStart, rangeEnd, ownerReportBuildingConstraint, currentUser, activeBookId]);
+
+  /** Building↔Owner Treasury legs are excluded from `filtered` — surface them only for owner reports. */
+  const treasuryBuildingOwnerLegsForReports = useMemo(() => {
+    return transactionsForOwnerReports.filter((t: any) => {
+      if ((t as any).deleted) return false;
+      if (!(t.status === TransactionStatus.APPROVED || !t.status)) return false;
+      if (!isTreasuryBuildingOwnerLedgerTx(t)) return false;
+      if (isTreasuryBuildingOwnerConvertedLeg(t)) return false;
+      const d = String(t.date || '');
+      if (d < rangeStart || d > rangeEnd) return false;
+      if (!transactionMatchesOwnerReportBuilding(t, ownerReportBuildingConstraint, activeBookId)) return false;
+      return passesViewerStaffOwnerScope(t, currentUser, activeBookId);
+    });
+  }, [transactionsForOwnerReports, rangeStart, rangeEnd, ownerReportBuildingConstraint, currentUser, activeBookId]);
+
+  /**
+   * Same as History/Dashboard: Building↔Owner transfers with no linked transaction document
+   * (older saves / missing writes) must still appear in owner totals.
+   */
+  const buildingOwnerPseudoForReports = useMemo((): Transaction[] => {
+    // Only treat a transfer as "already represented by a ledger doc" when that doc would
+    // actually appear in `treasuryBuildingOwnerLegsForReports`. Otherwise a row that fails
+    // the building filter (e.g. id shape mismatch) still had transferId and blocked the
+    // pseudo-row from transfers — hiding treasury entirely for that building.
+    const existingTreasuryTxIds = new Set<string>();
+    for (const t of treasuryBuildingOwnerLegsForReports) {
+      const tid = String((t as any).transferId || '').trim();
+      if (tid) existingTreasuryTxIds.add(`${ownerReportBookId(t, activeBookId)}:${tid}`);
+    }
+    for (const t of transactionsForOwnerReports) {
+      if ((t as any).deleted) continue;
+      if (!isTreasuryBuildingOwnerLedgerTx(t)) continue;
+      if (!isTreasuryBuildingOwnerConvertedLeg(t)) continue;
+      const tid = String((t as any).transferId || '').trim();
+      if (tid) existingTreasuryTxIds.add(`${ownerReportBookId(t, activeBookId)}:${tid}`);
+    }
+    return (mergedTransfersForOwnerReports || [])
+      .filter((tr: any) =>
+        ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING')) &&
+        !tr.deleted &&
+        transferCountsForOwnerReport(tr) &&
+        !existingTreasuryTxIds.has(`${ownerReportBookId(tr, activeBookId)}:${tr.id}`),
+      )
+      .filter((tr: any) => {
+        const d = String(tr.date || '');
+        if (d < rangeStart || d > rangeEnd) return false;
+        if (!transferBuildingSideMatchesOwnerReportBuilding(tr, ownerReportBuildingConstraint, activeBookId)) return false;
+        return true;
+      })
+      .filter((tr: any) => passesViewerStaffOwnerScopeTransfer(tr, currentUser, activeBookId))
+      .map((tr: any) => ({
+        id: `pseudo_${tr.id}`,
+        date: tr.date || '',
+        type: tr.fromType === 'BUILDING' ? TransactionType.EXPENSE : TransactionType.INCOME,
+        amount: Number(tr.amount) || 0,
+        paymentMethod: 'TREASURY',
+        originalPaymentMethod: tr.paymentMethod,
+        fromBankName: tr.fromBankName,
+        toBankName: tr.toBankName,
+        bankName: tr.fromBankName || tr.bankName,
+        fromType: tr.fromType,
+        toType: tr.toType,
+        fromId: tr.fromId,
+        toId: tr.toId,
+        purpose: tr.purpose || tr.notes || 'Treasury Transfer',
+        details: tr.notes || '',
+        status: tr.status || TransactionStatus.APPROVED,
+        transferId: tr.id,
+        source: 'treasury',
+        buildingId: tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : undefined),
+        expenseCategory: '',
+        _bookId: ownerReportBookId(tr, activeBookId),
+        _bookName: (tr as any)._bookName,
+      } as unknown as Transaction));
+  }, [
+    transactionsForOwnerReports,
+    treasuryBuildingOwnerLegsForReports,
+    mergedTransfersForOwnerReports,
+    rangeStart,
+    rangeEnd,
+    ownerReportBuildingConstraint,
+    currentUser,
+    activeBookId,
+  ]);
+
+  const allBuildingOwnerTreasuryRowsForReports = useMemo(
+    () => [...treasuryBuildingOwnerLegsForReports, ...buildingOwnerPseudoForReports],
+    [treasuryBuildingOwnerLegsForReports, buildingOwnerPseudoForReports],
+  );
+
+  /**
+   * Head Office ↔ Owner: treasury ledger rows are stripped from general Reports filters (Dashboard does the same).
+   * Amounts are carried on `transfers`, like Dashboard `ownerExpensesTotal`. Only when all buildings selected.
+   */
+  const headOfficeOwnerSyntheticTransactions = useMemo((): Transaction[] => {
+    const allowHoTreasury =
+      ownerReportBuildingConstraint.mode === 'all' ||
+      (ownerReportBuildingConstraint.mode === 'multi' && ownerExpenseIncludeTreasury);
+    if (!allowHoTreasury) return [];
+    const seen = new Set<string>();
+    const out: Transaction[] = [];
+    for (const tr of mergedTransfersForOwnerReports || []) {
+      if (!tr || !transferCountsForOwnerReport(tr) || !isHeadOfficeOwnerTransfer(tr)) continue;
+      if (!passesViewerStaffOwnerScopeTransfer(tr, currentUser, activeBookId)) continue;
+      const tid = String(tr.id || '');
+      if (!tid || seen.has(tid)) continue;
+      const d = String(tr.date || '');
+      if (d < rangeStart || d > rangeEnd) continue;
+      seen.add(tid);
+      const oid = ownerIdFromHeadOfficeOwnerTransfer(tr);
+      out.push({
+        id: `transfer:${tr.id}`,
+        date: tr.date || '',
+        amount: signedHeadOfficeOwnerTransferAmount(tr),
+        type: TransactionType.EXPENSE,
+        purpose: tr.purpose || tr.notes || 'Treasury (Head Office ↔ Owner)',
+        status: TransactionStatus.APPROVED,
+        expenseCategory: '',
+        ownerId: oid,
+        details: '',
+        _bookId: ownerReportBookId(tr, activeBookId),
+        _bookName: (tr as any)._bookName,
+      } as unknown as Transaction);
+    }
+    return out;
+  }, [
+    mergedTransfersForOwnerReports,
+    ownerReportBuildingConstraint,
+    ownerExpenseIncludeTreasury,
+    rangeStart,
+    rangeEnd,
+    currentUser,
+    activeBookId,
+  ]);
+
   const income = useMemo(() => approved.filter(t => t.type === TransactionType.INCOME), [approved]);
   // Exclude Borrowing from expense totals (tracked separately in Borrowing Tracker)
   const expenses = useMemo(() => approved.filter(t => t.type === TransactionType.EXPENSE && t.expenseCategory !== 'Borrowing' && t.expenseCategory !== 'BORROWING'), [approved]);
@@ -241,13 +988,23 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   // Filtered tenant collection based on search
   const filteredTenantCollection = useMemo(() => {
     if (!collectionSearch.trim()) return tenantCollection;
-    const search = collectionSearch.toLowerCase();
-    return tenantCollection.filter(t => t.name.toLowerCase().includes(search));
+    return tenantCollection.filter((t) => {
+      const collFp = new Set<string>();
+      addMoneyFingerprint(collFp, t.contracted);
+      addMoneyFingerprint(collFp, t.paid);
+      addMoneyFingerprint(collFp, t.balance);
+      const h =
+        [t.id, t.name, String(t.percentage)].join(' ') + moneyFingerprintSuffix(collFp);
+      return matchesAdvancedSearch(collectionSearch, h);
+    });
   }, [tenantCollection, collectionSearch]);
 
   // Get tenant transaction history
   const getTenantHistory = (customerId: string, customerName: string) => {
     const tenantTxs = transactions.filter(t => {
+      if ((t as any).deleted) return false;
+      const pm = String((t as any).paymentMethod ?? '');
+      if ((t as any).source === 'treasury' || pm === 'TREASURY' || pm === 'TREASURY_REVERSAL' || (t as any).isReversal) return false;
       // Find transactions for this customer via contracts
       const con = contracts.find(c => c.customerId === customerId && c.id === t.contractId);
       return con !== undefined;
@@ -288,22 +1045,52 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
 
   // ── Owner Expenses & Opening Balances ──
   const ownerExpensesData = useMemo(() => {
-    let filteredTxs = approved.filter(t => 
-      (t.expenseCategory === 'Owner Expense' || t.expenseCategory === 'OWNER_EXPENSE' || t.expenseCategory === 'Owner Profit Withdrawal') 
-      && !t.isOwnerOpeningBalance  // Exclude opening balance transactions
-    );
+    let filteredTxs: Transaction[] = [
+      ...approvedForOwnerTab.filter(t =>
+        (t.expenseCategory === 'Owner Expense' || t.expenseCategory === ExpenseCategory.OWNER_EXPENSE || t.expenseCategory === 'Owner Profit Withdrawal')
+        && !t.isOwnerOpeningBalance, // Exclude opening balance transactions
+      ),
+      ...(allBuildingOwnerTreasuryRowsForReports as Transaction[]),
+      ...headOfficeOwnerSyntheticTransactions,
+    ];
+    filteredTxs = filteredTxs.filter(t => {
+      const oid =
+        resolveOwnerIdForOwnerReport(t, employees) ||
+        String((t as any).ownerId || '').trim() ||
+        ownerIdFromTreasuryBuildingOwnerTx(t) ||
+        '';
+      return (
+        passesViewerStaffOwnerScope(t, currentUser, activeBookId) &&
+        passesOwnerStakeBuildingFilter(t, oid, employees, activeBookId)
+      );
+    });
     if (ownerFilter !== 'all') {
-      filteredTxs = filteredTxs.filter(t => (t as any).ownerId === ownerFilter);
+      const of = String(ownerFilter);
+      filteredTxs = filteredTxs.filter(t => {
+        const oid =
+          resolveOwnerIdForOwnerReport(t, employees) ||
+          String((t as any).ownerId || '').trim() ||
+          ownerIdFromTreasuryBuildingOwnerTx(t);
+        return oid === of || rawIdSegment(oid) === rawIdSegment(of);
+      });
     }
     const byOwner: Record<string, { name: string; transactions: Transaction[]; total: number }> = {};
     filteredTxs.forEach(t => {
-      const ownerId = (t as any).ownerId || 'unknown';
-      const ownerName = (t as any).ownerName || customers.find(c => c.id === ownerId)?.name || 'Unknown Owner';
+      const ownerId =
+        resolveOwnerIdForOwnerReport(t, employees) ||
+        String((t as any).ownerId || '').trim() ||
+        ownerIdFromTreasuryBuildingOwnerTx(t) ||
+        'unknown';
+      const cust = customers.find(c => c.id === ownerId || c.id === rawIdSegment(ownerId));
+      const ownerName = (t as any).ownerName
+        || employees.find((e: any) => String(e.id) === ownerId || String(e.id) === rawIdSegment(ownerId))?.name
+        || (cust && (cust.nameEn || cust.nameAr))?.trim()
+        || 'Unknown Owner';
       if (!byOwner[ownerId]) {
         byOwner[ownerId] = { name: ownerName, transactions: [], total: 0 };
       }
       byOwner[ownerId].transactions.push(t);
-      byOwner[ownerId].total += Number(t.amount) || 0;
+      byOwner[ownerId].total += ownerReportLineAmount(t);
     });
     return Object.entries(byOwner).map(([id, v]) => ({
       id,
@@ -311,7 +1098,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       transactions: v.transactions.sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()),
       total: v.total
     })).sort((a, b) => b.total - a.total);
-  }, [approved, customers, ownerFilter]);
+  }, [approvedForOwnerTab, allBuildingOwnerTreasuryRowsForReports, headOfficeOwnerSyntheticTransactions, customers, employees, ownerFilter, activeBookId, currentUser]);
 
   // Combined Owner Report Data - Opening Balance (includes previous months) + This Month
   const ownerCombinedData = useMemo(() => {
@@ -320,27 +1107,96 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     const currentMonthStart = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-01`;
     const _lastDay = new Date(_now.getFullYear(), _now.getMonth() + 1, 0).getDate();
     const currentMonthEnd = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-${String(_lastDay).padStart(2, '0')}`;
-    
-    // Get all owner expense transactions (excluding opening balance entries)
-    let allOwnerExpenses = transactions.filter(t => 
-      (t.expenseCategory === 'Owner Expense' || t.expenseCategory === 'OWNER_EXPENSE' || t.expenseCategory === 'Owner Profit Withdrawal') &&
-      !t.isOwnerOpeningBalance &&
-      (t.status === TransactionStatus.APPROVED || !t.status)
-    );
-    
-    // Get all opening balance entries
-    let openingBalanceTxs = transactions.filter(t => 
-      (t.isOwnerOpeningBalance === true || t.expenseCategory === 'Owner Opening Balance') &&
-      (t.status === TransactionStatus.APPROVED || !t.status)
-    );
-    
+
+    const isApprovedLedgerRow = (t: any) =>
+      (t.status === TransactionStatus.APPROVED || !t.status);
+
+    const isTreasuryInternalRow = (t: any) => {
+      const pm = String((t as any).paymentMethod ?? '');
+      return (
+        (t as any).source === 'treasury' ||
+        pm === 'TREASURY' ||
+        pm === 'TREASURY_REVERSAL' ||
+        !!(t as any).isReversal
+      );
+    };
+
+    /** Same non-date rules as Report `filtered`, without applying rangeStart/rangeEnd. */
+    const passesReportScopeNoDate = (t: any) => {
+      if ((t as any).deleted) return false;
+      if (!isApprovedLedgerRow(t)) return false;
+      if (isTreasuryInternalRow(t)) return false;
+      if (!transactionMatchesOwnerReportBuilding(t, ownerReportBuildingConstraint, activeBookId)) return false;
+      return true;
+    };
+
+    const isOwnerOpeningEntry = (t: any) =>
+      t.isOwnerOpeningBalance === true ||
+      String(t.expenseCategory || '').trim() === 'Owner Opening Balance' ||
+      (t.borrowingType === 'OPENING_BALANCE' && !!(t as any).ownerId);
+
+    // Owner opening balance rows must show for ALL TIME — do not tie them to the
+    // selected Reports period (this month / this year / custom range).
+    let openingBalanceTxs = transactionsForOwnerReports.filter((t: any) => {
+      if (!passesReportScopeNoDate(t) || !isOwnerOpeningEntry(t)) return false;
+      if (!passesViewerStaffOwnerScope(t as Transaction, currentUser, activeBookId)) return false;
+      const oidOb =
+        resolveOwnerIdForOwnerReport(t as Transaction, employees) ||
+        String((t as any).ownerId || '').trim() ||
+        ownerIdFromTreasuryBuildingOwnerTx(t) ||
+        '';
+      return passesOwnerStakeBuildingFilter(t as Transaction, oidOb, employees, activeBookId);
+    });
+
+    // Period-scoped owner expenses: entry form categories + Treasury Building↔Owner legs.
+    let allOwnerExpenses: Transaction[] = [
+      ...approvedForOwnerTab.filter((t: any) => {
+        const cat = String(t.expenseCategory || '').trim();
+        const isOwnerCat =
+          cat === 'Owner Expense' ||
+          cat === ExpenseCategory.OWNER_EXPENSE ||
+          cat === 'Owner Profit Withdrawal';
+        return isOwnerCat && !t.isOwnerOpeningBalance;
+      }),
+      ...(allBuildingOwnerTreasuryRowsForReports as Transaction[]),
+      ...headOfficeOwnerSyntheticTransactions,
+    ];
+    allOwnerExpenses = allOwnerExpenses.filter(t => {
+      const oid =
+        resolveOwnerIdForOwnerReport(t, employees) ||
+        String((t as any).ownerId || '').trim() ||
+        ownerIdFromTreasuryBuildingOwnerTx(t) ||
+        '';
+      return (
+        passesViewerStaffOwnerScope(t, currentUser, activeBookId) &&
+        passesOwnerStakeBuildingFilter(t, oid, employees, activeBookId)
+      );
+    });
+
     if (ownerFilter !== 'all') {
-      allOwnerExpenses = allOwnerExpenses.filter(t => (t as any).ownerId === ownerFilter);
-      openingBalanceTxs = openingBalanceTxs.filter(t => (t as any).ownerId === ownerFilter);
+      const of = String(ownerFilter);
+      allOwnerExpenses = allOwnerExpenses.filter(t => {
+        const oid =
+          resolveOwnerIdForOwnerReport(t, employees) ||
+          String((t as any).ownerId || '').trim() ||
+          ownerIdFromTreasuryBuildingOwnerTx(t);
+        return oid === of || rawIdSegment(oid) === rawIdSegment(of);
+      });
+      openingBalanceTxs = openingBalanceTxs.filter(t => {
+        const oid =
+          resolveOwnerIdForOwnerReport(t, employees) ||
+          String((t as any).ownerId || '').trim() ||
+          ownerIdFromTreasuryBuildingOwnerTx(t);
+        return oid === of || rawIdSegment(oid) === rawIdSegment(of);
+      });
     }
-    if (buildingFilter !== 'all') {
-      allOwnerExpenses = allOwnerExpenses.filter(t => t.buildingId === buildingFilter);
-      openingBalanceTxs = openingBalanceTxs.filter(t => t.buildingId === buildingFilter);
+    if (ownerReportBuildingConstraint.mode !== 'all') {
+      allOwnerExpenses = allOwnerExpenses.filter(t =>
+        transactionMatchesOwnerReportBuilding(t, ownerReportBuildingConstraint, activeBookId),
+      );
+      openingBalanceTxs = openingBalanceTxs.filter(t =>
+        transactionMatchesOwnerReportBuilding(t, ownerReportBuildingConstraint, activeBookId),
+      );
     }
     
     // Build combined data by owner
@@ -355,8 +1211,16 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     
     // Process opening balances
     openingBalanceTxs.forEach(t => {
-      const ownerId = (t as any).ownerId || 'unknown';
-      const ownerName = (t as any).ownerName || customers.find(c => c.id === ownerId)?.name || 'Unknown Owner';
+      const ownerId =
+        resolveOwnerIdForOwnerReport(t, employees) ||
+        String((t as any).ownerId || '').trim() ||
+        ownerIdFromTreasuryBuildingOwnerTx(t) ||
+        'unknown';
+      const custOb = customers.find(c => c.id === ownerId || c.id === rawIdSegment(ownerId));
+      const ownerName = (t as any).ownerName
+        || employees.find((e: any) => String(e.id) === ownerId || String(e.id) === rawIdSegment(ownerId))?.name
+        || (custOb && (custOb.nameEn || custOb.nameAr))?.trim()
+        || 'Unknown Owner';
       if (!byOwner[ownerId]) {
         byOwner[ownerId] = {
           name: ownerName,
@@ -367,14 +1231,22 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
           subtotal: 0
         };
       }
-      byOwner[ownerId].openingBalance += Number(t.amount) || 0;
+      byOwner[ownerId].openingBalance += reportMoneyAmount(t);
       byOwner[ownerId].openingBalanceTxs.push(t);
     });
     
     // Process owner expenses - previous months go to opening balance, this month separate
     allOwnerExpenses.forEach(t => {
-      const ownerId = (t as any).ownerId || 'unknown';
-      const ownerName = (t as any).ownerName || customers.find(c => c.id === ownerId)?.name || 'Unknown Owner';
+      const ownerId =
+        resolveOwnerIdForOwnerReport(t, employees) ||
+        String((t as any).ownerId || '').trim() ||
+        ownerIdFromTreasuryBuildingOwnerTx(t) ||
+        'unknown';
+      const custEx = customers.find(c => c.id === ownerId || c.id === rawIdSegment(ownerId));
+      const ownerName = (t as any).ownerName
+        || employees.find((e: any) => String(e.id) === ownerId || String(e.id) === rawIdSegment(ownerId))?.name
+        || (custEx && (custEx.nameEn || custEx.nameAr))?.trim()
+        || 'Unknown Owner';
       if (!byOwner[ownerId]) {
         byOwner[ownerId] = {
           name: ownerName,
@@ -387,114 +1259,21 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       }
       
       const txDate = t.date || '';
+      const lineAmt = ownerReportLineAmount(t);
       if (txDate >= currentMonthStart && txDate <= currentMonthEnd) {
-        byOwner[ownerId].thisMonthExpenses += Number(t.amount) || 0;
+        byOwner[ownerId].thisMonthExpenses += lineAmt;
         byOwner[ownerId].thisMonthTxs.push(t);
       } else if (txDate < currentMonthStart) {
         // Previous months expenses are added to opening balance
-        byOwner[ownerId].openingBalance += Number(t.amount) || 0;
+        byOwner[ownerId].openingBalance += lineAmt;
+        byOwner[ownerId].openingBalanceTxs.push(t);
+      } else if (txDate >= rangeStart && txDate <= rangeEnd) {
+        // Later in the selected period than current calendar month (totals must not drop these)
+        byOwner[ownerId].openingBalance += lineAmt;
         byOwner[ownerId].openingBalanceTxs.push(t);
       }
     });
-    
-    // Process HEAD_OFFICE -> OWNER transfers as owner expenses
-    // Skip transfers when building filter is active (transfers are not building-specific)
-    const ownerTransfers = buildingFilter !== 'all' ? [] : transfers.filter(tr => 
-      tr.fromType === 'HEAD_OFFICE' && 
-      tr.toType === 'OWNER' && 
-      tr.status === 'COMPLETED' &&
-      !tr.deleted
-    );
-    
-    ownerTransfers.forEach(tr => {
-      const ownerId = tr.toId;
-      // Apply owner filter if set
-      if (ownerFilter !== 'all' && ownerId !== ownerFilter) return;
-      
-      // Look up owner from employees (users), not customers
-      const owner = employees.find((u: any) => u.id === ownerId);
-      const ownerName = owner?.name || owner?.email || ownerId || 'Unknown Owner';
-      
-      if (!byOwner[ownerId]) {
-        byOwner[ownerId] = {
-          name: ownerName,
-          openingBalance: 0,
-          openingBalanceTxs: [],
-          thisMonthExpenses: 0,
-          thisMonthTxs: [],
-          subtotal: 0
-        };
-      }
-      
-      // Create a pseudo-transaction for display
-      const pseudoTx = {
-        id: tr.id,
-        date: tr.date,
-        amount: tr.amount,
-        details: `تحويل من المكتب - ${tr.purpose || 'Head Office Transfer'}`,
-        type: TransactionType.EXPENSE,
-        buildingId: '',
-      } as Transaction;
-      
-      const txDate = tr.date || '';
-      if (txDate >= currentMonthStart && txDate <= currentMonthEnd) {
-        byOwner[ownerId].thisMonthExpenses += Number(tr.amount) || 0;
-        byOwner[ownerId].thisMonthTxs.push(pseudoTx);
-      } else {
-        byOwner[ownerId].openingBalance += Number(tr.amount) || 0;
-        byOwner[ownerId].openingBalanceTxs.push(pseudoTx);
-      }
-    });
-    
-    // Process OWNER -> HEAD_OFFICE transfers as returns (deduct from owner expenses)
-    // Skip transfers when building filter is active (transfers are not building-specific)
-    const ownerReturns = buildingFilter !== 'all' ? [] : transfers.filter(tr => 
-      tr.fromType === 'OWNER' && 
-      tr.toType === 'HEAD_OFFICE' && 
-      tr.status === 'COMPLETED' &&
-      !tr.deleted
-    );
-    
-    ownerReturns.forEach(tr => {
-      const ownerId = tr.fromId;
-      // Apply owner filter if set
-      if (ownerFilter !== 'all' && ownerId !== ownerFilter) return;
-      
-      // Look up owner from employees (users)
-      const owner = employees.find((u: any) => u.id === ownerId);
-      const ownerName = owner?.name || owner?.email || ownerId || 'Unknown Owner';
-      
-      if (!byOwner[ownerId]) {
-        byOwner[ownerId] = {
-          name: ownerName,
-          openingBalance: 0,
-          openingBalanceTxs: [],
-          thisMonthExpenses: 0,
-          thisMonthTxs: [],
-          subtotal: 0
-        };
-      }
-      
-      // Create a pseudo-transaction for display (negative amount = return)
-      const pseudoTx = {
-        id: tr.id,
-        date: tr.date,
-        amount: -Number(tr.amount), // Negative to show as deduction
-        details: `إرجاع إلى المكتب - ${tr.purpose || 'Return to Head Office'}`,
-        type: TransactionType.EXPENSE,
-        buildingId: '',
-      } as Transaction;
-      
-      const txDate = tr.date || '';
-      if (txDate >= currentMonthStart && txDate <= currentMonthEnd) {
-        byOwner[ownerId].thisMonthExpenses -= Number(tr.amount) || 0;
-        byOwner[ownerId].thisMonthTxs.push(pseudoTx);
-      } else {
-        byOwner[ownerId].openingBalance -= Number(tr.amount) || 0;
-        byOwner[ownerId].openingBalanceTxs.push(pseudoTx);
-      }
-    });
-    
+
     // Calculate subtotals
     Object.values(byOwner).forEach(owner => {
       owner.subtotal = owner.openingBalance + owner.thisMonthExpenses;
@@ -504,7 +1283,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       id,
       ...data
     })).sort((a, b) => b.subtotal - a.subtotal);
-  }, [transactions, customers, ownerFilter, buildingFilter, transfers, buildings, employees, rangeStart, rangeEnd]);
+  }, [transactionsForOwnerReports, approvedForOwnerTab, allBuildingOwnerTreasuryRowsForReports, headOfficeOwnerSyntheticTransactions, customers, employees, ownerFilter, ownerReportBuildingConstraint, rangeStart, rangeEnd, activeBookId, currentUser]);
 
   // ── Top Customers by Revenue ──
   const topCustomers = useMemo(() => {
@@ -547,12 +1326,21 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     const reportDate = new Date().toLocaleDateString('en-SA', { year: 'numeric', month: 'long', day: 'numeric' });
     const periodLabel = `${rangeStart} to ${rangeEnd}`;
 
-    const txRow = (tx: any, isNeg = false) => `
+    const txRow = (tx: any, isNeg = false) => {
+      const line = ownerReportLineAmount(tx as Transaction);
+      const neg = isNeg || line < 0;
+      const detail =
+        (tx.details ||
+          tx.purpose ||
+          (String(tx.id || '').startsWith('transfer:') ? 'Treasury (Head Office ↔ Owner)' : '') ||
+          (isNeg ? 'Return to Head Office' : t('history.ownerExpenses'))) + ownerCrossBookSuffix(tx);
+      return `
       <tr>
         <td>${new Date(tx.date).toLocaleDateString('en-SA')}</td>
-        <td>${tx.details || (isNeg ? 'Return to Head Office' : t('history.ownerExpenses'))}</td>
-        <td class="amt ${isNeg || Number(tx.amount) < 0 ? 'neg' : ''}">SAR ${fmt(Math.abs(Number(tx.amount) || 0))}</td>
+        <td>${detail}</td>
+        <td class="amt ${neg ? 'neg' : ''}">SAR ${fmt(Math.abs(line))}</td>
       </tr>`;
+    };
 
     const generateOwnerSection = (owner: typeof ownerCombinedData[0], isFirst: boolean) => `
       <div class="owner-block ${isFirst ? '' : 'page-break'}">
@@ -597,7 +1385,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         <div class="section-label emerald-label">${t('common.thisMonth')}</div>
         <table class="tx-table">
           <thead><tr><th>${t('common.date')}</th><th>${t('common.details')}</th><th>${t('common.amount')}</th></tr></thead>
-          <tbody>${owner.thisMonthTxs.map(tx => txRow(tx, Number(tx.amount) < 0)).join('')}</tbody>
+          <tbody>${owner.thisMonthTxs.map(tx => txRow(tx, ownerReportLineAmount(tx as Transaction) < 0)).join('')}</tbody>
           <tfoot><tr class="foot-row emerald-foot"><td colspan="2">${t('invoice.subtotal')} (${t('common.thisMonth')})</td><td class="amt">SAR ${fmt(owner.thisMonthExpenses)}</td></tr></tfoot>
         </table>` : ''}
 
@@ -842,7 +1630,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       </div>
       <div class="lh-right">
         <div class="lh-badge">${t('reports.tab.ownerExpense').toUpperCase()}</div>
-        <img src="${origin}/images/logo.png" class="lh-logo" alt="Amlak Logo" onerror="this.style.display='none'" />
+        <img src="${origin}/images/cologo.png" class="lh-logo" alt="Amlak Logo" onerror="this.style.display='none'" />
         <div class="lh-date">${reportDate}</div>
       </div>
     </div>
@@ -900,7 +1688,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       <!-- REPORT FOOTER -->
       <div class="report-footer">
         <div class="rf-left">
-          <img src="${origin}/images/logo.png" class="rf-logo" alt="Amlak" onerror="this.style.display='none'" />
+          <img src="${origin}/images/cologo.png" class="rf-logo" alt="Amlak" onerror="this.style.display='none'" />
           <div class="rf-text">Powered by Amlak &bull; ${reportSettings?.companyName || ''} &copy; ${new Date().getFullYear()}</div>
         </div>
         <div class="rf-right">
@@ -940,8 +1728,9 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   };
 
   // ── Tabs ──
-  const isAdmin = currentUser?.role === UserRole.ADMIN || currentUser?.role === 'ADMIN';
-  const isManager = currentUser?.role === UserRole.MANAGER || currentUser?.role === 'MANAGER';
+  const viewerRole = String(currentUser?.role || '').toUpperCase();
+  const isAdmin = viewerRole === 'ADMIN';
+  const isManager = viewerRole === 'MANAGER';
   const canViewOwnerExpenses = isAdmin || isManager; // Treasury staff (Admin/Manager) can view owner expenses
   const tabs: { key: ReportTab; label: string; icon: React.ReactNode }[] = useMemo(() => [
     { key: 'overview', label: t('reports.tab.overview'), icon: <PieChartIcon size={16} /> },
@@ -959,7 +1748,6 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const datePresets: { key: DatePreset; label: string }[] = [
     { key: 'thisMonth', label: t('reports.preset.thisMonth') },
     { key: 'lastMonth', label: t('reports.preset.lastMonth') },
-    { key: 'thisQuarter', label: t('reports.preset.thisQuarter') },
     { key: 'thisYear', label: t('reports.preset.thisYear') },
     { key: 'lastYear', label: t('reports.preset.lastYear') },
     { key: 'custom', label: t('reports.preset.custom') },
@@ -1008,13 +1796,13 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
 
   // ── Section Wrapper ──
   const Section: React.FC<{ title: string; icon?: React.ReactNode; actions?: React.ReactNode; children: React.ReactNode }> = ({ title, icon, actions, children }) => (
-    <div className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden">
-      <div className="flex items-center justify-between px-5 py-4 border-b border-gray-50 bg-gradient-to-r from-gray-50 to-white">
-        <div className="flex items-center gap-2">
-          {icon && <span className="text-emerald-600">{icon}</span>}
-          <h3 className="font-bold text-gray-800 text-sm sm:text-base">{title}</h3>
+    <div className="bg-white rounded-2xl shadow-lg border border-gray-100 overflow-hidden min-w-0">
+      <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 min-w-0 px-4 sm:px-5 py-4 border-b border-gray-50 bg-gradient-to-r from-gray-50 to-white">
+        <div className="flex items-center gap-2 min-w-0 flex-1">
+          {icon && <span className="text-emerald-600 shrink-0">{icon}</span>}
+          <h3 className="font-bold text-gray-800 text-sm sm:text-base truncate">{title}</h3>
         </div>
-        {actions && <div className="flex items-center gap-2">{actions}</div>}
+        {actions && <div className="flex flex-shrink-0 items-center gap-2 flex-wrap justify-end">{actions}</div>}
       </div>
       <div className="p-4 sm:p-5">{children}</div>
     </div>
@@ -1031,23 +1819,23 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   );
 
   return (
-    <div ref={printRef} className="space-y-5" dir={isRTL ? 'rtl' : 'ltr'}>
+    <div ref={printRef} className="mobile-tab-shell tab-reports w-full max-w-full min-w-0 space-y-5 overflow-x-hidden pb-4 sm:pb-6" dir={isRTL ? 'rtl' : 'ltr'}>
       {/* ══ Header ══ */}
       <div className="bg-gradient-to-br from-emerald-600 via-emerald-700 to-teal-800 rounded-2xl p-5 sm:p-6 text-white shadow-xl relative overflow-hidden">
         <div className="absolute inset-0 opacity-10">
           <div className="absolute top-0 right-0 w-64 h-64 bg-white rounded-full -translate-y-32 translate-x-32" />
           <div className="absolute bottom-0 left-0 w-48 h-48 bg-white rounded-full translate-y-24 -translate-x-24" />
         </div>
-        <div className="relative z-10">
-          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-            <div>
-              <h1 className="text-2xl sm:text-3xl font-black tracking-tight flex items-center gap-2">
+        <div className="relative z-10 min-w-0">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 min-w-0">
+            <div className="min-w-0">
+              <h1 className="text-2xl sm:text-3xl font-black tracking-tight flex flex-wrap items-center gap-2">
                 <BarChart3 size={28} className="text-emerald-300" />
                 {t('reports.title') || 'Reports & Analytics'}
               </h1>
               <p className="text-emerald-200 text-sm mt-1">{t('reports.subtitle')}</p>
             </div>
-            <div className="flex items-center gap-2">
+            <div className="flex flex-shrink-0 flex-wrap items-center gap-2">
               <button onClick={loadData} className="p-2.5 bg-white/15 hover:bg-white/25 rounded-xl transition-all backdrop-blur-sm" title={t('reports.refresh')}>
                 <RefreshCw size={18} />
               </button>
@@ -1082,14 +1870,131 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs" />
             </div>
           )}
-          {/* Building Filter */}
-          <div className={`${isRTL ? 'sm:mr-auto' : 'sm:ml-auto'} flex items-center gap-2`}>
-            <Building2 size={16} className="text-emerald-600" />
-            <select value={buildingFilter} onChange={e => setBuildingFilter(e.target.value)}
-              className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white min-w-[140px]">
-              <option value="all">{t('history.allBuildings')}</option>
-              {buildings.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
-            </select>
+          {/* Building filter: Owner Expenses = all books + multi-select; other tabs = active book + single */}
+          <div className={`${isRTL ? 'sm:mr-auto' : 'sm:ml-auto'} flex items-center gap-2 relative`}>
+            <Building2 size={16} className="text-emerald-600 shrink-0" />
+            {activeTab === 'ownerExpense' && canViewOwnerExpenses ? (
+              <div className="relative min-w-[160px] max-w-[min(100vw-2rem,320px)]">
+                <button
+                  type="button"
+                  onClick={() => setOwnerExpenseBuildingPickerOpen(v => !v)}
+                  className="w-full flex items-center gap-2 border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white text-start"
+                >
+                  <span className="flex-1 truncate">
+                    {ownerExpenseExcludedBuildingIds.length === 0
+                      ? t('history.allBuildings')
+                      : ownerExpenseIncludedBuildings.length <= 2
+                        ? ownerExpenseIncludedBuildings.map((b: any) => b.name).join(', ')
+                        : t('reports.ownerExpenseBuildingsCount').replace(
+                            '{n}',
+                            String(ownerExpenseIncludedBuildings.length),
+                          )}
+                    {ownerExpenseExcludedBuildingIds.length > 0 && ownerExpenseIncludeTreasury ? (
+                      <span className="text-indigo-600 font-semibold">{` · ${t('reports.ownerExpenseTreasuryOnBadge')}`}</span>
+                    ) : null}
+                  </span>
+                  <ChevronDown size={14} className={`shrink-0 text-gray-500 transition-transform ${ownerExpenseBuildingPickerOpen ? 'rotate-180' : ''}`} />
+                </button>
+                {ownerExpenseBuildingPickerOpen && (
+                  <div
+                    className={`absolute top-full mt-1 z-50 w-full min-w-[260px] max-h-[min(50vh,320px)] flex flex-col rounded-xl border border-emerald-100 bg-white shadow-xl p-2 ${
+                      isRTL ? 'right-0' : 'left-0'
+                    }`}
+                  >
+                    <input
+                      type="text"
+                      value={ownerExpenseBuildingSearch}
+                      onChange={e => setOwnerExpenseBuildingSearch(e.target.value)}
+                      placeholder={t('reports.searchBuildings')}
+                      className="w-full mb-2 px-2 py-1.5 border border-gray-200 rounded-lg text-xs"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOwnerExpenseExcludedBuildingIds([]);
+                        setOwnerExpenseIncludeTreasury(false);
+                      }}
+                      className="w-full mb-1 px-2 py-1.5 text-start text-xs font-bold rounded-lg bg-emerald-50 text-emerald-700 hover:bg-emerald-100"
+                    >
+                      {t('reports.ownerExpenseCheckAllBuildings')}
+                    </button>
+                    <label
+                      className={`flex items-start gap-2 px-2 py-2 rounded-lg border border-slate-200 bg-slate-50/80 mb-2 ${
+                        ownerExpenseExcludedBuildingIds.length === 0 ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={
+                          ownerExpenseExcludedBuildingIds.length === 0 ? true : ownerExpenseIncludeTreasury
+                        }
+                        disabled={ownerExpenseExcludedBuildingIds.length === 0}
+                        onChange={e => setOwnerExpenseIncludeTreasury(e.target.checked)}
+                        className="accent-emerald-600 mt-0.5 shrink-0"
+                      />
+                      <span className="text-[11px] font-semibold text-slate-700 leading-snug">
+                        {t('reports.ownerExpenseIncludeTreasury')}
+                        <span className="block font-normal text-slate-500 mt-0.5">{t('reports.ownerExpenseIncludeTreasuryHint')}</span>
+                      </span>
+                    </label>
+                    <div className="overflow-y-auto flex-1 space-y-0.5 pr-1 max-h-[220px]">
+                      {filteredOwnerPickerBuildings.map((b: any) => {
+                        const checked = !ownerExpenseExcludedBuildingIds.includes(String(b.id));
+                        const bookLabel =
+                          (b._bookDisplayName && String(b._bookDisplayName).trim()) ||
+                          (b._sourceBookId && String(b._sourceBookId) !== String(activeBookId) ? String(b._sourceBookId) : '');
+                        return (
+                          <label
+                            key={b.id}
+                            className={`flex items-center gap-2 px-2 py-1.5 rounded-lg cursor-pointer text-xs ${checked ? 'bg-emerald-50' : 'hover:bg-gray-50'}`}
+                          >
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => {
+                                const id = String(b.id);
+                                setOwnerExpenseExcludedBuildingIds(prev =>
+                                  prev.includes(id) ? prev.filter(x => x !== id) : [...prev, id],
+                                );
+                              }}
+                              className="accent-emerald-600 shrink-0"
+                            />
+                            <span className={`flex-1 font-medium truncate ${checked ? 'text-emerald-800' : 'text-gray-700'}`}>{b.name}</span>
+                            {bookLabel ? (
+                              <span
+                                className="text-[9px] px-1 py-0.5 bg-indigo-100 text-indigo-700 rounded font-bold shrink-0 max-w-[96px] truncate"
+                                title={bookLabel}
+                              >
+                                {bookLabel}
+                              </span>
+                            ) : null}
+                          </label>
+                        );
+                      })}
+                      {filteredOwnerPickerBuildings.length === 0 && (
+                        <p className="px-2 py-3 text-xs text-gray-500">{t('reports.noBuildings')}</p>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setOwnerExpenseBuildingPickerOpen(false);
+                        setOwnerExpenseBuildingSearch('');
+                      }}
+                      className="w-full mt-2 px-2 py-1.5 rounded-lg bg-emerald-600 text-white text-xs font-bold hover:bg-emerald-700"
+                    >
+                      {t('task.done')}
+                    </button>
+                  </div>
+                )}
+              </div>
+            ) : (
+              <select value={buildingFilter} onChange={e => setBuildingFilter(e.target.value)}
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white min-w-[140px]">
+                <option value="all">{t('history.allBuildings')}</option>
+                {buildings.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
+              </select>
+            )}
           </div>
 
           {/* Owner Filter - only show for owner-specific reports */}
@@ -1099,7 +2004,21 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <select value={ownerFilter} onChange={e => setOwnerFilter(e.target.value)}
                 className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white min-w-[140px]">
                 <option value="all">{t('reports.allOwners')}</option>
-                {employees.filter((u: any) => u.role === 'OWNER').map((u: any) => <option key={u.id} value={u.id}>{u.name || u.email}</option>)}
+                {employees
+                  .filter(
+                    (u: any) =>
+                      isOwnerReportUser(u) &&
+                      ownerStakeIdsForUser(u).some((stakeId: string) =>
+                        ownerPickerBuildings.some((b: any) =>
+                          ownerStakeBuildingIdsMatch(stakeId, String(b.id || ''), activeBookId),
+                        ),
+                      ),
+                  )
+                  .map((u: any) => (
+                    <option key={u.id} value={u.id}>
+                      {u.name || u.email}
+                    </option>
+                  ))}
               </select>
             </div>
           )}
@@ -2068,10 +2987,18 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
           {ownerCombinedData.length === 0 && (
             <div className="text-center py-16">
               <div className="w-20 h-20 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
-                <Wallet size={32} className="text-slate-400" />
+                {ownerAllBookLoading ? (
+                  <RefreshCw size={32} className="text-emerald-500 animate-spin" />
+                ) : (
+                  <Wallet size={32} className="text-slate-400" />
+                )}
               </div>
-              <p className="text-slate-500 font-medium">{t('reports.noOwnerData')}</p>
-              <p className="text-slate-400 text-sm mt-1">{t('reports.noOwnerDataHint')}</p>
+              <p className="text-slate-500 font-medium">
+                {ownerAllBookLoading ? t('reports.loading') : t('reports.noOwnerData')}
+              </p>
+              {!ownerAllBookLoading && (
+                <p className="text-slate-400 text-sm mt-1">{t('reports.noOwnerDataHint')}</p>
+              )}
             </div>
           )}
 
@@ -2088,8 +3015,20 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <button 
                 onClick={() => exportCSV(
                   ownerCombinedData.flatMap(o => [
-                    ...o.openingBalanceTxs.map(tx => ({ Owner: o.name, Type: 'Opening Balance', Date: tx.date, Amount: tx.amount, Details: tx.details || '-' })),
-                    ...o.thisMonthTxs.map(tx => ({ Owner: o.name, Type: 'This Month', Date: tx.date, Amount: tx.amount, Details: tx.details || '-' })),
+                    ...o.openingBalanceTxs.map(tx => ({
+                      Owner: o.name,
+                      Type: 'Opening Balance',
+                      Date: tx.date,
+                      Amount: ownerReportLineAmount(tx),
+                      Details: ((tx as any).details || (tx as any).purpose || '-') + ownerCrossBookSuffix(tx),
+                    })),
+                    ...o.thisMonthTxs.map(tx => ({
+                      Owner: o.name,
+                      Type: 'This Month',
+                      Date: tx.date,
+                      Amount: ownerReportLineAmount(tx),
+                      Details: ((tx as any).details || (tx as any).purpose || '-') + ownerCrossBookSuffix(tx),
+                    })),
                   ]), 'owner-expenses-all'
                 )} 
                 className="flex items-center gap-2 px-4 py-2 bg-emerald-500 text-white rounded-xl text-sm font-semibold hover:bg-emerald-600 transition-colors shadow-md"
@@ -2133,8 +3072,18 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                       </button>
                       <button 
                         onClick={() => exportCSV([
-                          ...owner.openingBalanceTxs.map(tx => ({ Type: 'Opening Balance', Date: tx.date, Amount: tx.amount, Details: tx.details || '-' })),
-                          ...owner.thisMonthTxs.map(tx => ({ Type: 'This Month', Date: tx.date, Amount: tx.amount, Details: tx.details || '-' })),
+                          ...owner.openingBalanceTxs.map(tx => ({
+                            Type: 'Opening Balance',
+                            Date: tx.date,
+                            Amount: ownerReportLineAmount(tx),
+                            Details: ((tx as any).details || (tx as any).purpose || '-') + ownerCrossBookSuffix(tx),
+                          })),
+                          ...owner.thisMonthTxs.map(tx => ({
+                            Type: 'This Month',
+                            Date: tx.date,
+                            Amount: ownerReportLineAmount(tx),
+                            Details: ((tx as any).details || (tx as any).purpose || '-') + ownerCrossBookSuffix(tx),
+                          })),
                         ], `${owner.name.replace(/\s+/g, '-')}-expenses`)}
                         className="p-2.5 bg-white/20 hover:bg-white/30 rounded-xl transition-colors"
                         title={t('contract.exportCsv')}
@@ -2187,13 +3136,18 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-violet-100">
-                            {owner.openingBalanceTxs.map((tx, idx) => (
-                              <tr key={idx} className="hover:bg-violet-100/50 transition-colors">
+                            {owner.openingBalanceTxs.map((tx, idx) => {
+                              const line = ownerReportLineAmount(tx);
+                              const detail =
+                                ((tx as any).details || (tx as any).purpose || t('reports.openingBalance')) + ownerCrossBookSuffix(tx);
+                              return (
+                              <tr key={`${(tx as any)._bookId || 'default'}-${(tx as any).id}-${idx}`} className="hover:bg-violet-100/50 transition-colors">
                                 <td className="px-4 py-3 text-sm text-slate-600">{new Date(tx.date).toLocaleDateString('en-SA')}</td>
-                                <td className="px-4 py-3 text-sm text-slate-700 font-medium">{tx.details || t('reports.openingBalance')}</td>
-                                <td className="px-4 py-3 text-sm font-bold text-violet-700 text-end">SAR {fmt(Number(tx.amount) || 0)}</td>
+                                <td className="px-4 py-3 text-sm text-slate-700 font-medium">{detail}</td>
+                                <td className={`px-4 py-3 text-sm font-bold text-end ${line < 0 ? 'text-rose-600' : 'text-violet-700'}`}>{line < 0 ? '− ' : ''}SAR {fmt(Math.abs(line))}</td>
                               </tr>
-                            ))}
+                              );
+                            })}
                           </tbody>
                           <tfoot>
                             <tr className="bg-violet-200">
@@ -2228,13 +3182,18 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-emerald-100">
-                            {owner.thisMonthTxs.map((tx, idx) => (
-                              <tr key={idx} className="hover:bg-emerald-100/50 transition-colors">
+                            {owner.thisMonthTxs.map((tx, idx) => {
+                              const line = ownerReportLineAmount(tx);
+                              const detail =
+                                ((tx as any).details || (tx as any).purpose || t('history.ownerExpenses')) + ownerCrossBookSuffix(tx);
+                              return (
+                              <tr key={`${(tx as any)._bookId || 'default'}-${(tx as any).id}-${idx}`} className="hover:bg-emerald-100/50 transition-colors">
                                 <td className="px-4 py-3 text-sm text-slate-600">{new Date(tx.date).toLocaleDateString('en-SA')}</td>
-                                <td className="px-4 py-3 text-sm text-slate-700 font-medium">{tx.details || t('history.ownerExpenses')}</td>
-                                <td className="px-4 py-3 text-sm font-bold text-emerald-700 text-end">SAR {fmt(Number(tx.amount) || 0)}</td>
+                                <td className="px-4 py-3 text-sm text-slate-700 font-medium">{detail}</td>
+                                <td className={`px-4 py-3 text-sm font-bold text-end ${line < 0 ? 'text-rose-600' : 'text-emerald-700'}`}>{line < 0 ? '− ' : ''}SAR {fmt(Math.abs(line))}</td>
                               </tr>
-                            ))}
+                              );
+                            })}
                           </tbody>
                           <tfoot>
                             <tr className="bg-emerald-200">
@@ -2309,7 +3268,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                           {tx.type === TransactionType.INCOME ? <TrendingUp size={18} /> : <TrendingDown size={18} />}
                         </div>
                         <div>
-                          <p className="font-semibold text-gray-800 text-sm">{tx.details || tx.incomeCategory || 'Payment'}</p>
+                          <p className="font-semibold text-gray-800 text-sm">{tx.details || (tx as any).incomeCategory || 'Payment'}</p>
                           <p className="text-xs text-gray-500">{new Date(tx.date).toLocaleDateString('en-SA', { year: 'numeric', month: 'short', day: 'numeric' })}</p>
                         </div>
                       </div>
