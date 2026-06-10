@@ -7,7 +7,7 @@ redirects = []
 [functions."*"]
 
 [build]
-publish = "C:\\Users\\shhah\\Desktop\\My Projects\\saudi-property-manager\\dist"
+publish = "/Users/shahzad/Downloads/My Projects 3/saudi-property-manager/dist"
 publishOrigin = "ui"
 commandOrigin = "ui"
 command = "npm run build"

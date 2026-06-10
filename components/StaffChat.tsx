@@ -17,7 +17,7 @@ import {
   getOrCreateDirectChat, createGroupChat, syncBuildingGroups,
   uploadChatFile, uploadVoiceMessage,
   deleteMessage, editMessage, toggleReaction, toggleStarMessage, markMessagesRead,
-  setTyping, setPresence, listenAllPresence, showChatNotification,
+  setTyping, listenAllPresence, showChatNotification,
   clearChat, togglePinChat, toggleMuteChat, toggleArchiveChat, toggleLockChat,
   addGroupMember, removeGroupMember, leaveGroup, updateGroupDescription, updateGroupName,
   setGroupAdmins, setDisappearingMessages, setChatWallpaper,
@@ -40,6 +40,13 @@ const EMOJI_CATEGORIES: Record<string, string[]> = {
 };
 
 const QUICK_REACTIONS = ['👍','❤️','😂','😮','😢','🙏'];
+
+const getPresenceMillis = (lastSeen: any) => {
+  if (!lastSeen) return 0;
+  if (typeof lastSeen?.toMillis === 'function') return lastSeen.toMillis();
+  if (typeof lastSeen?.seconds === 'number') return lastSeen.seconds * 1000;
+  return 0;
+};
 
 interface StaffChatProps {
   currentUser: User;
@@ -146,31 +153,6 @@ const StaffChat: React.FC<StaffChatProps> = ({ currentUser, fullScreen, embedded
     return () => window.removeEventListener('resize', handleResize);
   }, []);
 
-  // ── Presence: set online + heartbeat ──
-  useEffect(() => {
-    // Set online on mount
-    setPresence(userId, userName, true);
-    // Heartbeat every 60s
-    const heartbeat = setInterval(() => {
-      setPresence(userId, userName, true);
-    }, 60000);
-    // Go offline on unmount / tab close
-    const handleOffline = () => setPresence(userId, userName, false);
-    window.addEventListener('beforeunload', handleOffline);
-    document.addEventListener('visibilitychange', () => {
-      if (document.visibilityState === 'hidden') {
-        setPresence(userId, userName, false);
-      } else {
-        setPresence(userId, userName, true);
-      }
-    });
-    return () => {
-      clearInterval(heartbeat);
-      window.removeEventListener('beforeunload', handleOffline);
-      setPresence(userId, userName, false);
-    };
-  }, [userId, userName]);
-
   // ── Listen to all users' presence ──
   useEffect(() => {
     const unsub = listenAllPresence((map) => {
@@ -178,7 +160,7 @@ const StaffChat: React.FC<StaffChatProps> = ({ currentUser, fullScreen, embedded
       const now = Date.now();
       const resolved: Record<string, { online: boolean; lastSeen: any }> = {};
       Object.entries(map).forEach(([uid, p]) => {
-        const lastSeenMs = p.lastSeen?.toMillis?.() || p.lastSeen?.seconds ? p.lastSeen.seconds * 1000 : 0;
+        const lastSeenMs = getPresenceMillis(p.lastSeen);
         const isStale = lastSeenMs && (now - lastSeenMs > 2 * 60 * 1000);
         resolved[uid] = { online: p.online && !isStale, lastSeen: p.lastSeen };
       });

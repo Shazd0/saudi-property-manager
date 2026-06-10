@@ -8,7 +8,7 @@ import {
   LogOut, Package, Landmark, ClipboardCheck, BarChart3, FileText,
   Crown, ShieldAlert, MapPin, Zap, Shield, MessageSquare,
   Banknote, CreditCard, FileCheck, BookMarked, Layers, Scale,
-  TrendingUp, TrendingDown, DollarSign,
+  TrendingUp, TrendingDown, DollarSign, FileSpreadsheet, ScreenShare,
 } from 'lucide-react';
 import SoundService from '../services/soundService';
 import HapticService from '../services/hapticService';
@@ -81,6 +81,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
       { to: '/calendar', icon: CalendarDays, label: t('nav.calendar'), section: 'main' },
       { to: '/entry', icon: PlusCircle, label: t('nav.addEntry'), section: 'main' },
       { to: '/bulk-rent', icon: Upload, label: t('nav.bulkRent'), section: 'main' },
+      { to: '/amlak-sheets', icon: FileSpreadsheet, label: t('nav.amlakSheets'), section: 'main' },
       { to: '/history', icon: History, label: t('nav.transactions'), section: 'main' },
       { to: '/contracts', icon: FileSignature, label: t('nav.contracts'), section: 'main' },
       { to: '/customers', icon: Users, label: t('nav.customers'), section: 'data' },
@@ -136,6 +137,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
         { to: '/admin/backup', icon: FolderOpen, label: t('nav.localBackup'), section: 'settings' },
         { to: '/admin/cloud-backup', icon: BookOpen, label: t('nav.cloudBackup'), section: 'settings' },
         { to: '/admin/books', icon: BookOpen, label: t('nav.booksPartitions'), section: 'settings' },
+        { to: '/admin/remote-support', icon: ScreenShare, label: t('nav.remoteSupport'), section: 'settings' },
       );
     }
     return base;

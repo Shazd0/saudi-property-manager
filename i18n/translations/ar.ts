@@ -120,6 +120,7 @@ const ar: Record<string, string> = {
   'bank.tab.unmatched': 'معاملات غير مطابقة',
   'nav.stocks': 'الأسهم',
   'nav.staffChat': 'دردشة أملاك',
+  'nav.remoteSupport': 'الدعم عن بُعد',
   'nav.chat': 'المحادثة',
 
   // Common

@@ -11,6 +11,7 @@ import {
   validateWorksheetPostingRows,
 } from '../utils/amlakSheetPosting';
 import { ExpenseCategory } from '../types';
+import { buildMonitoringDueRoomRows } from '../utils/monitoringDueRooms';
 
 function blankSheet(): AmlakWorksheet {
   return {
@@ -167,5 +168,57 @@ describe('Amlak Sheets posting validation', () => {
     expect(result[0].transaction?.type).toBe(TransactionType.EXPENSE);
     expect(result[0].transaction?.expenseCategory).toBe(ExpenseCategory.OWNER_EXPENSE);
     expect(result[0].transaction?.ownerId).toBe('owner1');
+  });
+});
+
+describe('Amlak Sheets monitoring due rows', () => {
+  it('keeps earlier unpaid installments due when a later installment is paid explicitly', () => {
+    const building = {
+      id: 'b1',
+      name: 'Amlak Tower',
+      propertyType: 'RESIDENTIAL',
+      units: [{ name: '7-03 3Bhk' }],
+    } as any;
+    const contract = {
+      id: 'c1',
+      contractNo: 'C-1',
+      status: 'Active',
+      buildingId: 'b1',
+      buildingName: 'Amlak Tower',
+      unitName: '7-03 3Bhk',
+      customerId: 'cust1',
+      customerName: 'Tenant One',
+      rentValue: 180000,
+      totalValue: 180000,
+      installmentCount: 12,
+      firstInstallment: 15000,
+      otherInstallment: 15000,
+      periodMonths: 12,
+      fromDate: '2026-01-01',
+      toDate: '2026-12-31',
+    } as any;
+    const rows = buildMonitoringDueRoomRows({
+      building,
+      contracts: [contract],
+      transactions: [{
+        id: 'tx-july',
+        type: TransactionType.INCOME,
+        status: 'APPROVED',
+        buildingId: 'b1',
+        unitNumber: '7-03 3Bhk',
+        contractId: 'c1',
+        customerId: 'cust1',
+        date: '2026-06-10',
+        dueDate: '2026-07-01',
+        installmentStartDate: '2026-07-01',
+        amount: 15000,
+        amountIncludingVAT: 15000,
+      } as any],
+      reportUpTo: '2026-08-31',
+      payThrough: '2026-06-10',
+    });
+
+    expect(rows.some(row => row.nextDueDate === '2026-01-01' && row.totalDue === 15000)).toBe(true);
+    expect(rows.some(row => row.nextDueDate === '2026-07-01')).toBe(false);
   });
 });

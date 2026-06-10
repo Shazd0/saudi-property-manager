@@ -223,6 +223,7 @@ const en = {
   'bank.tab.unmatched': 'Unmatched System Tx',
   'nav.stocks': 'Stocks',
   'nav.staffChat': 'Amlak Chat',
+  'nav.remoteSupport': 'Remote Support',
   'nav.chat': 'Chat',
 
   // Chat

@@ -19,6 +19,10 @@ export interface User {
   buildingId?: string; // legacy single-building assignment for compatibility
   buildingIds?: string[]; // allow assigning multiple buildings
   hasSystemAccess?: boolean; // NEW: Does this employee log in?
+  onVacation?: boolean; // Admin-controlled read-only mode for staff on leave
+  vacationNote?: string;
+  vacationUpdatedAt?: number;
+  vacationUpdatedBy?: string;
   iqamaNo?: string; // Iqama / Residence Permit number
   iqamaExpiry?: string; // Iqama expiry date (YYYY-MM-DD)
   // Owner-specific fields
@@ -220,6 +224,16 @@ export interface AmlakSheetRowMeta {
   postedBy?: string;
   postedByName?: string;
   error?: string;
+  generatedDueSource?: 'monitoring';
+  generatedDueKey?: string;
+  generatedAt?: number;
+  generatedDueSuppressedKey?: string;
+  manualAddedRow?: boolean;
+  splitPaymentChild?: boolean;
+  splitParentRow?: number;
+  splitParentDueDate?: string;
+  splitParentUnit?: string;
+  splitParentOriginalDue?: number;
 }
 
 export type AmlakSheetPostType = 'RENT' | 'EXPENSE' | 'SALARY' | 'BORROWING' | 'OWNER_EXPENSE' | 'OTHER_INCOME';
@@ -268,6 +282,7 @@ export interface AmlakWorksheet {
   rowsMeta?: Record<string, AmlakSheetRowMeta>;
   columnWidths?: Record<string, number>;
   rowHeights?: Record<string, number>;
+  visibleEmptyRowLimit?: number;
   postingConfig?: AmlakSheetPostingConfig;
   createdAt: number;
   updatedAt: number;

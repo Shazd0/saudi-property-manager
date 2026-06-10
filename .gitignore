@@ -32,3 +32,6 @@ zatca-cert/*secret*.txt
 # Build artifacts
 release/
 .vite/
+
+# Local Netlify folder
+.netlify

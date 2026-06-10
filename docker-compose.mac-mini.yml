@@ -1,0 +1,93 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: amlak-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-amlak}
+      POSTGRES_USER: ${POSTGRES_USER:-amlak}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-amlak_local_password}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - amlak_postgres_data:/var/lib/postgresql/data
+      - ./mac-cloud/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-amlak} -d ${POSTGRES_DB:-amlak}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  amlak-api:
+    build:
+      context: ./mac-cloud
+    container_name: amlak-api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PORT: ${AMLAK_API_PORT:-8787}
+      DATABASE_URL: postgres://${POSTGRES_USER:-amlak}:${POSTGRES_PASSWORD:-amlak_local_password}@postgres:5432/${POSTGRES_DB:-amlak}
+      AMLAK_API_TOKEN: ${AMLAK_API_TOKEN:-change-me-local-token}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    ports:
+      - "${AMLAK_API_PORT:-8787}:${AMLAK_API_PORT:-8787}"
+
+  migration:
+    build:
+      context: ./mac-cloud
+    container_name: amlak-migration
+    profiles: ["migration"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER:-amlak}:${POSTGRES_PASSWORD:-amlak_local_password}@postgres:5432/${POSTGRES_DB:-amlak}
+      FIREBASE_PROJECT_ID: ${FIREBASE_PROJECT_ID:-saudi-property-manager}
+    command: ["node", "migrate/firebase-to-postgres.mjs", "--dry-run", "--all"]
+
+  backup:
+    image: postgres:16-alpine
+    container_name: amlak-postgres-backup
+    profiles: ["backup"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-amlak}
+      POSTGRES_USER: ${POSTGRES_USER:-amlak}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-amlak_local_password}
+    volumes:
+      - ./mac-cloud/backups:/backups
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        while true; do
+          PGPASSWORD="$${POSTGRES_PASSWORD}" pg_dump -h postgres -U "$${POSTGRES_USER}" "$${POSTGRES_DB}" > "/backups/amlak-$$(date +%Y%m%d-%H%M%S).sql"
+          find /backups -type f -name 'amlak-*.sql' -mtime +14 -delete
+          sleep 86400
+        done
+
+  zatca:
+    image: node:22-alpine
+    container_name: amlak-zatca-slot
+    profiles: ["future-services"]
+    working_dir: /app
+    volumes:
+      - ./fcm-server:/app:ro
+    command: ["node", "zatca-service.js"]
+
+  ai:
+    image: ollama/ollama:latest
+    container_name: amlak-ai
+    profiles: ["ai"]
+    restart: unless-stopped
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - amlak_ollama_data:/root/.ollama
+
+volumes:
+  amlak_postgres_data:
+  amlak_ollama_data:

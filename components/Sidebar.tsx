@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, PlusCircle, History, Users, Settings, LogOut, Building, UserCheck, FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart, Search, Car, Bell, ArrowRightLeft, Receipt, ChevronLeft, ChevronRight, FolderOpen, Info, ChevronDown, ChevronUp, Upload, MessageCircle, FileText, DollarSign, BarChart3, Crown, BookOpen, Fingerprint, Landmark, ShieldAlert, MapPin, Zap, Shield, MessageSquare, Banknote, CreditCard, FileCheck, Star, GripVertical, Pencil, Check, Plus, X, Calculator, Layers, Scale, TrendingDown, TrendingUp, BookMarked, FileSpreadsheet } from 'lucide-react';
+import { LayoutDashboard, PlusCircle, History, Users, Settings, LogOut, Building, UserCheck, FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart, Search, Car, Bell, ArrowRightLeft, Receipt, ChevronLeft, ChevronRight, FolderOpen, Info, ChevronDown, ChevronUp, Upload, MessageCircle, FileText, DollarSign, BarChart3, Crown, BookOpen, Fingerprint, Landmark, ShieldAlert, MapPin, Zap, Shield, MessageSquare, Banknote, CreditCard, FileCheck, Star, GripVertical, Pencil, Check, Plus, X, Calculator, Layers, Scale, TrendingDown, TrendingUp, BookMarked, FileSpreadsheet, ScreenShare } from 'lucide-react';
 import SoundService from '../services/soundService';
 import logo from '../images/logo.png';
 import { User, UserRole } from '../types';
@@ -70,6 +70,12 @@ const MAIN_MENU_DEFS: MainMenuDef[] = [
     icon: Bell,
     approvalsBadge: true,
     requiresAdminOrManager: true,
+  },
+  {
+    to: '/admin/remote-support',
+    labelKey: 'nav.remoteSupport',
+    icon: ScreenShare,
+    requiresAdmin: true,
   },
 ];
 
@@ -958,6 +964,7 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse, pen
                   <NavItem to="/admin/backup" icon={FolderOpen} label={t('nav.localBackup')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/cloud-backup" icon={FolderOpen} label={t('nav.cloudBackup')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/books" icon={BookOpen} label={t('nav.booksPartitions')} isCollapsed={isCollapsed} />
+                  <NavItem to="/admin/remote-support" icon={ScreenShare} label={t('nav.remoteSupport')} isCollapsed={isCollapsed} />
                 </>
               )}
             </MenuGroup>

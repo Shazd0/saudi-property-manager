@@ -2,8 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { MessageCircle, X, Maximize2, Minus, GripHorizontal } from 'lucide-react';
 import { listenChatRooms } from '../services/chatService';
-import StaffChat from './StaffChat';
 import { useLanguage } from '../i18n';
+
+const StaffChat = React.lazy(() => import('./StaffChat'));
 
 interface ChatBubbleProps {
   currentUser: any;
@@ -142,7 +143,9 @@ const ChatBubble: React.FC<ChatBubbleProps> = ({ currentUser, defaultOpen, hideT
           </div>
           {/* Embedded StaffChat */}
           <div className="flex-1 overflow-hidden bg-white">
-            <StaffChat currentUser={currentUser} embedded />
+            <React.Suspense fallback={<div className="h-full grid place-items-center text-sm font-bold text-slate-500">Loading chat...</div>}>
+              <StaffChat currentUser={currentUser} embedded />
+            </React.Suspense>
           </div>
         </div>
       )}

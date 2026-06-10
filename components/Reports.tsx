@@ -1727,6 +1727,234 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     URL.revokeObjectURL(url);
   };
 
+  const handleExportActiveReportPDF = () => {
+    const esc = (value: any) => String(value ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+    const sar = (value: number) => `SAR ${fmt(Number(value) || 0)}`;
+    const tabLabel = tabs.find(tab => tab.key === activeTab)?.label || 'Report';
+    const buildingLabel = activeTab === 'ownerExpense' && canViewOwnerExpenses
+      ? (ownerExpenseExcludedBuildingIds.length === 0
+        ? t('history.allBuildings')
+        : ownerExpenseIncludedBuildings.map((b: any) => b.name).join(', '))
+      : (buildingFilter === 'all' ? t('history.allBuildings') : buildings.find(b => b.id === buildingFilter)?.name || buildingFilter);
+    const ownerLabel = ownerFilter === 'all'
+      ? t('reports.allOwners')
+      : employees.find((employee: any) => String(employee.id) === String(ownerFilter))?.name || ownerFilter;
+
+    const buildingOccupancyRows = buildings.map((b) => {
+      const totalUnits = b.units?.length || 0;
+      const activeContracts = contracts.filter(c => c.buildingId === b.id && c.status === 'Active');
+      const occupiedUnits = new Set(activeContracts.map(c => c.unitName)).size;
+      const pct = totalUnits > 0 ? Math.round((occupiedUnits / totalUnits) * 100) : 0;
+      return [b.name, String(totalUnits), String(occupiedUnits), `${pct}%`];
+    });
+
+    const report = (() => {
+      if (activeTab === 'financial') {
+        return {
+          columns: ['Period', 'Income', 'Expense', 'Net', 'Margin'],
+          rows: monthlyData.map(m => [m.month, sar(m.income), sar(m.expense), sar(m.net), m.income > 0 ? `${((m.net / m.income) * 100).toFixed(1)}%` : '-']),
+          summary: [
+            ['Total income', sar(totalIncome)],
+            ['Total expense', sar(totalExpense)],
+            ['Net position', sar(netProfit)],
+          ],
+        };
+      }
+      if (activeTab === 'occupancy') {
+        return {
+          columns: ['Building', 'Total Units', 'Occupied', 'Occupancy'],
+          rows: buildingOccupancyRows,
+          summary: [
+            ['Total units', String(occupancy.totalUnits)],
+            ['Occupied units', String(occupancy.occupiedUnits)],
+            ['Occupancy', `${occupancy.percentage}%`],
+          ],
+        };
+      }
+      if (activeTab === 'tenant') {
+        return {
+          columns: ['Tenant', 'Revenue'],
+          rows: topCustomers.map(c => [c.name, sar(c.total)]),
+          summary: [
+            ['Total tenants', String(customers.length)],
+            ['Active contracts', String(contractStats.active)],
+            ['Top tenants shown', String(topCustomers.length)],
+          ],
+        };
+      }
+      if (activeTab === 'expense') {
+        return {
+          columns: ['Category', 'Amount', 'Share'],
+          rows: expenseByCat.map(c => [c.name, sar(c.value), totalExpense > 0 ? `${((c.value / totalExpense) * 100).toFixed(1)}%` : '0%']),
+          summary: [
+            ['Total expense', sar(totalExpense)],
+            ['Categories', String(expenseByCat.length)],
+            ['Transactions', String(expenses.length)],
+          ],
+        };
+      }
+      if (activeTab === 'salary') {
+        return {
+          columns: ['Employee', 'Gross Pay', 'Bonus', 'Deductions', 'Payments'],
+          rows: salaryData.map(e => [e.name, sar(e.total), sar(e.bonus), sar(e.deductions), String(e.count)]),
+          summary: [
+            ['Total salaries', sar(salaryData.reduce((sum, e) => sum + e.total, 0))],
+            ['Employees paid', String(salaryData.length)],
+            ['Total deductions', sar(salaryData.reduce((sum, e) => sum + e.deductions, 0))],
+          ],
+        };
+      }
+      if (activeTab === 'building') {
+        return {
+          columns: ['Building', 'Income', 'Expense', 'Net', 'ROI'],
+          rows: buildingRevenue.map(b => [b.name, sar(b.income), sar(b.expense), sar(b.net), b.income > 0 ? `${((b.net / b.income) * 100).toFixed(1)}%` : '-']),
+          summary: [
+            ['Buildings', String(buildingRevenue.length)],
+            ['Income', sar(buildingRevenue.reduce((sum, b) => sum + b.income, 0))],
+            ['Expense', sar(buildingRevenue.reduce((sum, b) => sum + b.expense, 0))],
+          ],
+        };
+      }
+      if (activeTab === 'collection') {
+        return {
+          columns: ['Tenant', 'Contracted', 'Paid', 'Balance', 'Collection'],
+          rows: filteredTenantCollection.map(row => [row.name, sar(row.contracted), sar(row.paid), sar(row.balance), `${row.percentage}%`]),
+          summary: [
+            ['Total contracted', sar(filteredTenantCollection.reduce((sum, row) => sum + row.contracted, 0))],
+            ['Total collected', sar(filteredTenantCollection.reduce((sum, row) => sum + row.paid, 0))],
+            ['Outstanding', sar(filteredTenantCollection.reduce((sum, row) => sum + row.balance, 0))],
+          ],
+        };
+      }
+      if (activeTab === 'ownerExpense') {
+        const rows = ownerCombinedData.flatMap(owner => [
+          ...owner.openingBalanceTxs.map(tx => [
+            owner.name,
+            t('reports.openingBalance'),
+            tx.date,
+            ((tx as any).details || (tx as any).purpose || '-') + ownerCrossBookSuffix(tx),
+            sar(ownerReportLineAmount(tx)),
+          ]),
+          ...owner.thisMonthTxs.map(tx => [
+            owner.name,
+            t('common.thisMonth'),
+            tx.date,
+            ((tx as any).details || (tx as any).purpose || '-') + ownerCrossBookSuffix(tx),
+            sar(ownerReportLineAmount(tx)),
+          ]),
+        ]);
+        return {
+          columns: ['Owner', 'Section', 'Date', 'Details', 'Amount'],
+          rows,
+          summary: [
+            ['Owners', String(ownerCombinedData.length)],
+            ['Opening balance', sar(ownerCombinedData.reduce((sum, owner) => sum + owner.openingBalance, 0))],
+            ['Total owed', sar(ownerCombinedData.reduce((sum, owner) => sum + owner.subtotal, 0))],
+          ],
+        };
+      }
+      return {
+        columns: ['Period', 'Income', 'Expense', 'Net'],
+        rows: monthlyData.map(m => [m.month, sar(m.income), sar(m.expense), sar(m.net)]),
+        summary: overviewKPIs.map(kpi => [String(kpi.label), String(kpi.value)]),
+      };
+    })();
+
+    const filterItems = [
+      ['From', rangeStart],
+      ['Till', rangeEnd],
+      ['Building', buildingLabel],
+      ...(activeTab === 'ownerExpense' ? [['Owner', ownerLabel]] : []),
+      ...(activeTab === 'collection' && collectionSearch ? [['Search', collectionSearch]] : []),
+    ];
+
+    const rowsHtml = report.rows.length
+      ? report.rows.map(row => `<tr>${row.map((cell, index) => `<td class="${index === row.length - 1 ? 'num' : ''}">${esc(cell)}</td>`).join('')}</tr>`).join('')
+      : `<tr><td colspan="${report.columns.length}" class="empty">No data for this filter.</td></tr>`;
+
+    const origin = window.location.origin;
+    const win = window.open('', '_blank', 'width=1100,height=820');
+    if (!win) return;
+    win.document.write(`<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8" />
+  <title>${esc(tabLabel)} PDF Report</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; background: #f8fafc; color: #0f172a; font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .page { max-width: 1040px; margin: 24px auto; background: #fff; border-radius: 18px; overflow: hidden; box-shadow: 0 18px 55px rgba(15,23,42,.12); }
+    .toolbar { text-align: right; max-width: 1040px; margin: 18px auto 0; }
+    .toolbar button { border: 0; border-radius: 999px; padding: 10px 18px; color: #fff; background: #047857; font-weight: 800; cursor: pointer; }
+    .head { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 24px 28px; background: linear-gradient(135deg,#064e3b,#047857); color: #fff; }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .brand img { width: 52px; height: 52px; object-fit: contain; border-radius: 14px; background: #fff; padding: 5px; }
+    h1 { margin: 0; font-size: 22px; }
+    .sub { color: #bbf7d0; font-size: 12px; margin-top: 4px; }
+    .generated { text-align: right; font-size: 12px; color: #d1fae5; line-height: 1.6; }
+    .filters, .summary { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; padding: 18px 28px; border-bottom: 1px solid #e2e8f0; }
+    .chip, .card { border: 1px solid #d1fae5; background: #ecfdf5; border-radius: 12px; padding: 10px 12px; }
+    .label { color: #64748b; font-size: 10px; font-weight: 800; text-transform: uppercase; letter-spacing: .08em; }
+    .value { margin-top: 3px; color: #064e3b; font-weight: 900; font-size: 14px; }
+    .body { padding: 24px 28px 30px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { background: #065f46; color: #fff; text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: .06em; padding: 10px; }
+    td { border-bottom: 1px solid #e2e8f0; padding: 9px 10px; font-size: 12px; vertical-align: top; }
+    tr:nth-child(even) td { background: #f8fafc; }
+    .num { text-align: right; font-weight: 800; white-space: nowrap; }
+    .empty { text-align: center; color: #94a3b8; padding: 26px; }
+    .footer { display: flex; justify-content: space-between; gap: 14px; padding: 14px 28px; border-top: 1px solid #e2e8f0; color: #64748b; font-size: 11px; }
+    @media print {
+      body { background: #fff; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+      .toolbar { display: none; }
+      .page { margin: 0; max-width: none; border-radius: 0; box-shadow: none; }
+      @page { size: A4 portrait; margin: 10mm; }
+    }
+  </style>
+</head>
+<body>
+  <div class="toolbar"><button onclick="window.print()">Print / Save PDF</button></div>
+  <main class="page">
+    <section class="head">
+      <div class="brand">
+        <img src="${origin}/images/cologo.png" alt="Logo" onerror="this.style.display='none'" />
+        <div>
+          <h1>${esc(tabLabel)} Report</h1>
+          <div class="sub">${esc(reportSettings?.companyName || 'Amlak')}</div>
+        </div>
+      </div>
+      <div class="generated">
+        <div>Generated: ${esc(new Date().toLocaleString('en-SA'))}</div>
+        <div>By: ${esc(currentUser?.name || currentUser?.email || '')}</div>
+      </div>
+    </section>
+    <section class="filters">
+      ${filterItems.map(([label, value]) => `<div class="chip"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('')}
+    </section>
+    <section class="summary">
+      ${report.summary.map(([label, value]) => `<div class="card"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join('')}
+    </section>
+    <section class="body">
+      <table>
+        <thead><tr>${report.columns.map(col => `<th>${esc(col)}</th>`).join('')}</tr></thead>
+        <tbody>${rowsHtml}</tbody>
+      </table>
+    </section>
+    <section class="footer">
+      <span>This is a computer-generated report.</span>
+      <span>Period: ${esc(rangeStart)} to ${esc(rangeEnd)}</span>
+    </section>
+  </main>
+</body>
+</html>`);
+    win.document.close();
+    win.focus();
+  };
+
   // ── Tabs ──
   const viewerRole = String(currentUser?.role || '').toUpperCase();
   const isAdmin = viewerRole === 'ADMIN';
@@ -1839,8 +2067,8 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               <button onClick={loadData} className="p-2.5 bg-white/15 hover:bg-white/25 rounded-xl transition-all backdrop-blur-sm" title={t('reports.refresh')}>
                 <RefreshCw size={18} />
               </button>
-              <button onClick={handlePrint} className="p-2.5 bg-white/15 hover:bg-white/25 rounded-xl transition-all backdrop-blur-sm" title={t('common.print')}>
-                <Printer size={18} />
+              <button onClick={handleExportActiveReportPDF} className="flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-xl transition-all backdrop-blur-sm text-sm font-semibold" title="Export current report as PDF">
+                <Printer size={16} /> PDF
               </button>
               <button onClick={() => exportCSV(approved.map(tx => ({ Date: tx.date, Type: tx.type, Amount: tx.amount, Building: tx.buildingName, Details: tx.details, Payment: tx.paymentMethod, Status: tx.status })), 'transactions-report')} className="flex items-center gap-1.5 px-3 py-2 bg-white/15 hover:bg-white/25 rounded-xl transition-all backdrop-blur-sm text-sm font-semibold">
                 <Download size={16} />{t('common.export')}</button>
@@ -1862,14 +2090,30 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
               </button>
             ))}
           </div>
-          {/* Custom dates */}
-          {datePreset === 'custom' && (
-            <div className="flex items-center gap-2">
-              <input type="date" value={customStart} onChange={e => setCustomStart(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs" />
-              <span className="text-gray-400 text-xs">{t('vat.to')}</span>
-              <input type="date" value={customEnd} onChange={e => setCustomEnd(e.target.value)} className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs" />
-            </div>
-          )}
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[11px] font-bold text-gray-500">From</span>
+            <input
+              type="date"
+              value={datePreset === 'custom' ? customStart : rangeStart}
+              onChange={e => {
+                setDatePreset('custom');
+                setCustomStart(e.target.value);
+                if (!customEnd) setCustomEnd(rangeEnd);
+              }}
+              className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs"
+            />
+            <span className="text-gray-400 text-xs">{t('vat.to')}</span>
+            <input
+              type="date"
+              value={datePreset === 'custom' ? customEnd : rangeEnd}
+              onChange={e => {
+                setDatePreset('custom');
+                if (!customStart) setCustomStart(rangeStart);
+                setCustomEnd(e.target.value);
+              }}
+              className="border border-gray-200 rounded-lg px-2 py-1.5 text-xs"
+            />
+          </div>
           {/* Building filter: Owner Expenses = all books + multi-select; other tabs = active book + single */}
           <div className={`${isRTL ? 'sm:mr-auto' : 'sm:ml-auto'} flex items-center gap-2 relative`}>
             <Building2 size={16} className="text-emerald-600 shrink-0" />

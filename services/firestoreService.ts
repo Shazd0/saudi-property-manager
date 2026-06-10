@@ -9,6 +9,7 @@ import { ref as sRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { getNextVatInvoiceNumber } from "../utils/vatInvoiceNumber";
 import { compactAmlakWorkbook } from "../utils/amlakSheetPosting";
 import { getCached, setCached, invalidateFirestoreCache } from "./firestoreCache";
+import { macDeleteDocument, macGetDocument, macListCollection, macSaveDocument } from "./macApiClient";
 
 /** Hash a password with SHA-256 using the Web Crypto API (browser-compatible). */
 export const hashPassword = async (plain: string): Promise<string> => {
@@ -78,6 +79,66 @@ const BOOK_SCOPED_COLLECTIONS = new Set([
   'amlakSheets',
 ]);
 
+const ALL_AMLAK_MAC_COLLECTIONS = new Set([
+  'transactions',
+  'buildings',
+  'contracts',
+  'customers',
+  'vendors',
+  'users',
+  'banks',
+  'meta',
+  'books',
+  'tasks',
+  'approvals',
+  'transfers',
+  'audit',
+  'amlakSheets',
+  'stocks',
+  'stock',
+  'stock_entries',
+  'stockItems',
+  'stockTransfers',
+  'registry',
+  'service_agreements',
+  'borrowings',
+  'sadad_bills',
+  'ejar_contracts',
+  'utility_readings',
+  'security_deposits',
+  'municipality_licenses',
+  'civil_defense_records',
+  'absher_records',
+  'whatsapp_messages',
+  'bank_statements',
+  'reconciliation_records',
+  'nafath_verifications',
+  'notifications',
+  'chatRooms',
+  'chatMessages',
+  'chatPresence',
+  'chatStatuses',
+  'userTokens',
+  'images',
+  'backups',
+]);
+
+const useMacBackend = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
+const useMacCollection = (name: string) => useMacBackend() && ALL_AMLAK_MAC_COLLECTIONS.has(name);
+
+const macSave = async (name: string, data: any, bookId = currentBookId, merge = false) => {
+  return macSaveDocument(name, sanitize(data), { bookId: bookId || 'default', merge });
+};
+
+const macDelete = async (name: string, id: string, bookId = currentBookId) => {
+  return macDeleteDocument(name, id, { bookId: bookId || 'default' });
+};
+
+const macSaveId = async (name: string, data: any, bookId = currentBookId) => {
+  const saved = await macSave(name, data, bookId, !!data?.id);
+  return (saved as any)?.id || data?.id;
+};
+
 const getCol = (name: string): string => {
   if (currentBookId === 'default' || !BOOK_SCOPED_COLLECTIONS.has(name)) return name;
   return `book_${currentBookId}_${name}`;
@@ -120,6 +181,9 @@ const bookDoc = (bookId: string, name: string, id?: string): any =>
 /** Write a transaction document to a specific book partition (Treasury / cross-book fixes). */
 export const saveTransactionInBook = async (bookId: string, t: any) => {
   const data = sanitize(t);
+  if (useMacCollection('transactions')) {
+    return macSave('transactions', data, bookId || 'default');
+  }
   const path = rawBookPath(bookId || 'default', 'transactions');
   if (!t?.id) {
     return addDoc(_colRef(assertDb(), path), data);
@@ -198,6 +262,18 @@ export const getCollection = async (name: string, orderFieldOrOpts?: string | Ge
   const cached = getCached<any[]>(cacheKey);
   if (cached) return cached;
 
+  if (useMacCollection(name)) {
+    const data = await macListCollection(name, {
+      bookId: currentBookId,
+      orderField,
+      includeDeleted,
+    });
+    const scoped = filterByScope(name, data);
+    const out = includeDeleted ? scoped : scoped.filter((d: any) => !(d as any).deleted);
+    setCached(cacheKey, out);
+    return out;
+  }
+
   const colRef = fsCollection(name);
   const q = orderField ? query(colRef, orderBy(orderField, "desc")) : colRef;
   const snap = await getDocs(q as any);
@@ -213,14 +289,25 @@ export const getVendors = async (opts?: { includeDeleted?: boolean }) => {
 };
 export const saveVendor = async (v: any) => {
   const data = sanitize(v);
+  if (useMacCollection('vendors')) return macSave('vendors', data);
   if (!v.id) return addDoc(fsCollection( "vendors"), data);
   return setDoc(fsDoc( "vendors", v.id), data);
 };
 export const deleteVendor = async (id: string) => {
+  if (useMacCollection('vendors')) return macDelete('vendors', id);
   return deleteDoc(fsDoc( "vendors", id));
 };
 
 export const getTasks = async (uid?: string, opts?: { includeDeleted?: boolean }) => {
+  if (useMacCollection('tasks')) {
+    const data = await macListCollection('tasks', {
+      bookId: currentBookId,
+      includeDeleted: !!opts?.includeDeleted,
+      filters: uid ? { userId: uid } : undefined,
+    });
+    if (opts?.includeDeleted) return data;
+    return data.filter((t: any) => !(t as any).deleted);
+  }
   if (uid) {
     const q = query(fsCollection( "tasks"), where("userId", "==", uid));
     const snap = await getDocs(q as any);
@@ -232,23 +319,37 @@ export const getTasks = async (uid?: string, opts?: { includeDeleted?: boolean }
 };
 export const saveTask = async (t: any) => {
   const data = sanitize(t);
+  if (useMacCollection('tasks')) return macSave('tasks', data);
   if (!t.id) return addDoc(fsCollection( "tasks"), data);
   return setDoc(fsDoc( "tasks", t.id), data);
 };
 export const deleteTask = async (id: string) => {
+  if (useMacCollection('tasks')) return macDelete('tasks', id);
   return deleteDoc(fsDoc( "tasks", id));
 };
 
 export const getSettings = async () => {
+  if (useMacCollection('meta')) {
+    const arr = await macListCollection('meta', { bookId: currentBookId, includeDeleted: false });
+    return arr.find((x: any) => x.id === "settings") || arr[0] || null;
+  }
   const snap = await getDocs(fsCollection( "meta"));
   const arr = toArray(snap);
   const found = arr.find((x: any) => x.id === "settings") || arr[0];
   return found || null;
 };
-export const saveSettings = async (s: any) => setDoc(fsDoc( "meta", "settings"), s);
+export const saveSettings = async (s: any) => {
+  if (useMacCollection('meta')) return macSave('meta', { ...s, id: 'settings' });
+  return setDoc(fsDoc( "meta", "settings"), s);
+};
 
 // Custom Expense Categories (shared across all users)
 export const getCustomExpenseCategories = async (): Promise<string[]> => {
+  if (useMacCollection('meta')) {
+    const arr = await macListCollection('meta', { bookId: currentBookId, includeDeleted: true });
+    const data = arr.find((x: any) => x.id === "expenseCategories") as any;
+    return Array.isArray(data?.categories) ? data.categories : [];
+  }
   try {
     const snap = await getDoc(fsDoc( "meta", "expenseCategories"));
     if (snap.exists()) {
@@ -259,10 +360,19 @@ export const getCustomExpenseCategories = async (): Promise<string[]> => {
   return [];
 };
 export const saveCustomExpenseCategories = async (categories: string[]) => {
+  if (useMacCollection('meta')) {
+    await macSave('meta', { id: 'expenseCategories', categories, updatedAt: Date.now() });
+    return;
+  }
   await setDoc(fsDoc( "meta", "expenseCategories"), { categories, updatedAt: Date.now() });
 };
 
 export const getCustomIncomeCategories = async (): Promise<string[]> => {
+  if (useMacCollection('meta')) {
+    const arr = await macListCollection('meta', { bookId: currentBookId, includeDeleted: true });
+    const data = arr.find((x: any) => x.id === "incomeCategories") as any;
+    return Array.isArray(data?.categories) ? data.categories : [];
+  }
   try {
     const snap = await getDoc(fsDoc( "meta", "incomeCategories"));
     if (snap.exists()) {
@@ -273,6 +383,10 @@ export const getCustomIncomeCategories = async (): Promise<string[]> => {
   return [];
 };
 export const saveCustomIncomeCategories = async (categories: string[]) => {
+  if (useMacCollection('meta')) {
+    await macSave('meta', { id: 'incomeCategories', categories, updatedAt: Date.now() });
+    return;
+  }
   await setDoc(fsDoc( "meta", "incomeCategories"), { categories, updatedAt: Date.now() });
 };
 
@@ -290,12 +404,41 @@ export const getTransactions = async (opts?: { userId?: string; role?: string; b
 export const saveTransaction = async (t: any) => {
   const data = sanitize(t);
   invalidateFirestoreCache('col:');
+  if (useMacCollection('transactions')) return macSave('transactions', data);
   if (!t.id) return addDoc(fsCollection( "transactions"), data);
   return setDoc(fsDoc( "transactions", t.id), data);
 };
 
 export const getAmlakWorkbooks = async () => {
   return getCollection("amlakSheets", { orderField: "updatedAt" });
+};
+
+export const listenAmlakWorkbooks = (callback: (workbooks: any[]) => void) => {
+  if (useMacCollection('amlakSheets')) {
+    let cancelled = false;
+    const load = async () => {
+      const rows = await getAmlakWorkbooks().catch(() => []);
+      if (!cancelled) callback(rows || []);
+    };
+    void load();
+    const timer = window.setInterval(load, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }
+  try {
+    const q = query(fsCollection("amlakSheets"), orderBy("updatedAt"));
+    return onSnapshot(q as any, (snap) => {
+      callback(toArray(snap || { docs: [] }));
+    }, (err) => {
+      console.error('listenAmlakWorkbooks error', err);
+      callback([]);
+    });
+  } catch (e) {
+    console.error('listenAmlakWorkbooks setup error', e);
+    return () => {};
+  }
 };
 
 export const saveAmlakWorkbook = async (workbook: any) => {
@@ -305,15 +448,18 @@ export const saveAmlakWorkbook = async (workbook: any) => {
     updatedAt: Date.now(),
   });
   invalidateFirestoreCache('col:');
+  if (useMacCollection('amlakSheets')) return macSave('amlakSheets', data);
   if (!workbook.id) return addDoc(fsCollection("amlakSheets"), data);
   return setDoc(fsDoc("amlakSheets", workbook.id), data);
 };
 
 export const deleteAmlakWorkbook = async (id: string) => {
   invalidateFirestoreCache('col:');
+  if (useMacCollection('amlakSheets')) return macSave('amlakSheets', { id, deleted: true, updatedAt: Date.now() });
   return setDoc(fsDoc("amlakSheets", id), { deleted: true, updatedAt: Date.now() }, { merge: true } as any);
 };
 export const updateTransactionStatus = async (id: string, status: string) => {
+  if (useMacCollection('transactions')) return macSave('transactions', { id, status }, currentBookId, true);
   return setDoc(fsDoc( "transactions", id), { status }, { merge: true } as any);
 };
 
@@ -341,11 +487,17 @@ export const createCreditNote = async (originalTransaction: any) => {
   delete (creditNote as any).zatcaReportedAt;
   delete (creditNote as any).zatcaStatus;
   
-  await setDoc(fsDoc( 'transactions', creditNote.id), creditNote);
+  if (useMacCollection('transactions')) await macSave('transactions', creditNote);
+  else await setDoc(fsDoc( 'transactions', creditNote.id), creditNote);
   return creditNote;
 };
 
 export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: boolean }) => {
+  if (useMacCollection('transactions')) {
+    await macDelete('transactions', id);
+    await macSave('audit', { action: 'DELETE_TRANSACTION', details: `Deleted transaction ${id}`, timestamp: Date.now() }).catch(() => {});
+    return true;
+  }
   try {
     // load transaction for restock metadata
     let txData: any = null;
@@ -405,6 +557,11 @@ export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: 
 
 export const requestTransactionDeletion = async (requestorId: string, txId: string) => {
   const req = sanitize({ type: 'transaction_delete', targetCollection: 'transactions', targetId: txId, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  if (useMacCollection('approvals')) {
+    const r = await macSave('approvals', req);
+    await macSave('audit', { action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    return { id: (r as any).id } as any;
+  }
   const r = await addDoc(fsCollection( 'approvals'), req);
   await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   // Notify admins via push notification
@@ -439,10 +596,12 @@ export const getBuildings = async (opts?: { includeDeleted?: boolean }) => {
 export const saveBuilding = async (b: any) => {
   const data = sanitize(b);
   invalidateFirestoreCache('col:');
+  if (useMacCollection('buildings')) return macSave('buildings', data);
   if (!b.id) return addDoc(fsCollection( "buildings"), data);
   return setDoc(fsDoc( "buildings", b.id), data);
 };
 export const deleteBuilding = async (id: string) => {
+  if (useMacCollection('buildings')) return macDelete('buildings', id);
   return deleteDoc(fsDoc( "buildings", id));
 };
 
@@ -452,6 +611,14 @@ export const getDataFromBook = async (bookId: string): Promise<{
   transactions: any[];
   contracts: any[];
 }> => {
+  if (useMacBackend()) {
+    const [buildings, transactions, contracts] = await Promise.all([
+      macListCollection('buildings', { bookId, includeDeleted: false }),
+      macListCollection('transactions', { bookId, includeDeleted: false, orderField: 'date' }),
+      macListCollection('contracts', { bookId, includeDeleted: false }),
+    ]);
+    return { buildings, transactions, contracts };
+  }
   const colPath = (name: string): string =>
     bookId === 'default' || !BOOK_SCOPED_COLLECTIONS.has(name)
       ? name
@@ -606,6 +773,13 @@ export const saveCustomer = async (c: any) => {
   invalidateFirestoreCache('customers:');
   invalidateFirestoreCache('col:');
   const activeBook = getCurrentBookId();
+  if (useMacCollection('customers')) {
+    const saved = await macSave('customers', data, 'default');
+    if (activeBook && activeBook !== 'default') {
+      await macSave('customers', { ...data, id: (saved as any).id || c.id }, activeBook).catch(() => {});
+    }
+    return saved;
+  }
 
   // Always write to GLOBAL customers so all books share the same directory.
   // Also write to the active book's customers collection for backward-compatibility.
@@ -635,6 +809,7 @@ export const saveCustomer = async (c: any) => {
 export const deleteCustomer = async (id: string) => {
   invalidateFirestoreCache('customers:');
   invalidateFirestoreCache('col:');
+  if (useMacCollection('customers')) return macDelete('customers', id);
   return deleteDoc(fsDoc( "customers", id));
 };
 
@@ -644,6 +819,18 @@ export const deleteCustomer = async (id: string) => {
  */
 export const getCustomersAcrossBooks = async (opts?: { includeDeleted?: boolean }) => {
   const includeDeleted = !!opts?.includeDeleted;
+  if (useMacCollection('customers')) {
+    const globalCustomers = await macListCollection('customers', { bookId: 'default', includeDeleted });
+    const books = await getBooks().catch(() => []);
+    const bookCustomers = (
+      await Promise.all(
+        books
+          .filter((book: any) => book.id && book.id !== 'default')
+          .map((book: any) => macListCollection('customers', { bookId: book.id, includeDeleted }).catch(() => [])),
+      )
+    ).flat();
+    return [...globalCustomers, ...bookCustomers];
+  }
   const toArr = (snap: any) => (snap?.docs || []).map((d: any) => ({ id: d.id, ...(d.data() as any) }));
   const norm = (v: any) => String(v ?? '').trim().replace(/\s+/g, ' ').toLowerCase();
   const keyOf = (c: any): string => {
@@ -702,6 +889,18 @@ export const getUsers = async (opts?: { includeDeleted?: boolean }) => {
  */
 export const getUsersAcrossBooks = async (opts?: { includeDeleted?: boolean }) => {
   const includeDeleted = !!opts?.includeDeleted;
+  if (useMacCollection('users')) {
+    const globalUsers = await macListCollection('users', { bookId: 'default', includeDeleted });
+    const books = await getBooks().catch(() => []);
+    const bookUsers = (
+      await Promise.all(
+        books
+          .filter((book: any) => book.id && book.id !== 'default')
+          .map((book: any) => macListCollection('users', { bookId: book.id, includeDeleted }).catch(() => [])),
+      )
+    ).flat();
+    return Array.from(new Map([...globalUsers, ...bookUsers].map((u: any) => [String(u.id), u])).values());
+  }
   const toArr = (snap: any) => (snap?.docs || []).map((d: any) => ({ id: d.id, ...(d.data() as any) }));
   const uniqById = (rows: any[]) => Array.from(new Map(rows.map((u: any) => [String(u.id), u])).values());
 
@@ -735,6 +934,7 @@ export const saveUser = async (u: any) => {
     payload.password = await hashPassword(payload.password);
   }
   const data = sanitize(payload);
+  if (useMacCollection('users')) return macSave('users', data);
   if (!u.id) return addDoc(fsCollection( "users"), data);
   return setDoc(fsDoc( "users", u.id), data);
 };
@@ -772,7 +972,10 @@ export const getProfilePhoto = (userId: string): string | null => {
   return localStorage.getItem(`profilePhoto_${userId}`);
 };
 
-export const deleteUser = async (id: string) => deleteDoc(fsDoc( "users", id));
+export const deleteUser = async (id: string) => {
+  if (useMacCollection('users')) return macDelete('users', id);
+  return deleteDoc(fsDoc( "users", id));
+};
 
 export const mockLogin = async (id: string, pass: string) => {
   try {
@@ -897,6 +1100,7 @@ export const requestPasswordReset = async (userId: string, newPassword: string) 
 
 export const getBanks = async () => {
   const globalBanks = await getCollection("banks");
+  if (useMacCollection('banks')) return globalBanks;
   // Backward-compatibility: older versions stored banks per-book.
   // Migrate legacy `book_<id>_banks` docs into shared `banks` collection.
   if (currentBookId !== 'default') {
@@ -929,10 +1133,14 @@ export const getBanks = async () => {
 export const saveBank = async (b: any) => {
   const data = sanitize(b);
   const id = b.name || (b.id as string);
+  if (useMacCollection('banks')) return macSave('banks', { ...data, id: id || data.id });
   if (!id) return addDoc(fsCollection( "banks"), data);
   return setDoc(fsDoc( "banks", id), data);
 };
-export const deleteBank = async (id: string) => deleteDoc(fsDoc( "banks", id));
+export const deleteBank = async (id: string) => {
+  if (useMacCollection('banks')) return macDelete('banks', id);
+  return deleteDoc(fsDoc( "banks", id));
+};
 
 export const getContracts = async (opts?: { includeDeleted?: boolean }) => {
   return getCollection("contracts", { includeDeleted: !!opts?.includeDeleted });
@@ -940,20 +1148,30 @@ export const getContracts = async (opts?: { includeDeleted?: boolean }) => {
 export const saveContract = async (c: any) => {
   const data = sanitize(c);
   invalidateFirestoreCache('col:');
+  if (useMacCollection('contracts')) return macSave('contracts', data);
   if (!c.id) return addDoc(fsCollection( "contracts"), data);
   return setDoc(fsDoc( "contracts", c.id), data);
 };
 export const deleteContract = async (id: string) => {
+  if (useMacCollection('contracts')) return macDelete('contracts', id);
   return deleteDoc(fsDoc( "contracts", id));
 };
 
 export const isUnitOccupied = async (bid: string, uname: string) => {
+  if (useMacCollection('contracts')) {
+    const contracts = await getContracts();
+    return contracts.some((c: any) => c.buildingId === bid && c.unitName === uname && c.status === "Active");
+  }
   const q = query(fsCollection( "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
   const snap = await getDocs(q as any);
   return snap.size > 0;
 };
 
 export const getActiveContract = async (bid: string, uname: string) => {
+  if (useMacCollection('contracts')) {
+    const contracts = await getContracts({ includeDeleted: true });
+    return contracts.find((c: any) => c.buildingId === bid && c.unitName === uname && c.status === "Active" && !c.deleted) || null;
+  }
   const q = query(fsCollection( "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
   const snap = await getDocs(q as any);
   const arr = toArray(snap);
@@ -1045,6 +1263,11 @@ export const resetSystem = async () => {
 // ---- Approval Workflow Helpers ----
 export const requestTransactionEdit = async (requestorId: string, txId: string, newData: any) => {
   const req = sanitize({ type: 'transaction_edit', targetCollection: 'transactions', targetId: txId, payload: newData, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  if (useMacCollection('approvals')) {
+    const r = await macSave('approvals', req);
+    await macSave('audit', { action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    return { id: (r as any).id } as any;
+  }
   const r = await addDoc(fsCollection( 'approvals'), req);
   await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   // Notify admins via push notification
@@ -1063,6 +1286,19 @@ export const getApprovals = async (status = 'PENDING') => {
 };
 
 export const listenApprovals = (callback: (arr: any[]) => void, status = 'PENDING') => {
+  if (useMacCollection('approvals')) {
+    let cancelled = false;
+    const load = async () => {
+      const rows = await getApprovals(status === 'ALL' ? '' : status).catch(() => []);
+      if (!cancelled) callback(rows);
+    };
+    void load();
+    const timer = window.setInterval(load, 10000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }
   try {
     const colRef = fsCollection( 'approvals');
     const q =
@@ -1099,6 +1335,30 @@ export const listenApprovals = (callback: (arr: any[]) => void, status = 'PENDIN
 };
 
 export const approveRequest = async (approvalId: string, approverId: string, approve: boolean) => {
+  if (useMacCollection('approvals')) {
+    const ap = await macGetDocument<any>('approvals', approvalId, { bookId: currentBookId, includeDeleted: true });
+    if (!ap) throw new Error('Approval request not found');
+
+    if (!approve) {
+      await macSave('approvals', { id: approvalId, handledBy: approverId, handledAt: Date.now(), status: 'REJECTED' }, currentBookId, true);
+      await macSave('audit', { action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() }).catch(() => {});
+      await macDelete('approvals', approvalId).catch(() => {});
+      return true;
+    }
+
+    if (ap.type === 'transaction_delete' && ap.targetCollection === 'transactions' && ap.targetId) {
+      await deleteTransaction(ap.targetId);
+    } else if (ap.payload && ap.targetCollection && ap.targetId && useMacCollection(ap.targetCollection)) {
+      await macSave(ap.targetCollection, { ...ap.payload, id: ap.targetId }, currentBookId, true);
+    } else if (ap.type === 'password_reset' && ap.payload?.newPassword && ap.targetId) {
+      await macSave('users', { id: ap.targetId, password: ap.payload.newPassword }, currentBookId, true);
+    }
+
+    await macSave('approvals', { id: approvalId, handledBy: approverId, handledAt: Date.now(), status: 'APPROVED' }, currentBookId, true);
+    await macSave('audit', { action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() }).catch(() => {});
+    await macDelete('approvals', approvalId).catch(() => {});
+    return true;
+  }
   const docRef = fsDoc( 'approvals', approvalId);
   const approvalDoc = await getDoc(docRef).catch(() => null);
   if (!approvalDoc || !approvalDoc.exists()) {
@@ -1167,6 +1427,16 @@ export const approveRequest = async (approvalId: string, approverId: string, app
 
 export const saveUserToken = async (userId: string, token: string) => {
   try {
+    if (useMacCollection('userTokens')) {
+      await macSave('userTokens', {
+        id: token,
+        userId,
+        token,
+        updatedAt: Date.now(),
+        platform: typeof navigator !== 'undefined' ? navigator.userAgent : 'unknown',
+      }, 'default', true);
+      return true;
+    }
     await setDoc(fsDoc( 'userTokens', token), {
       userId,
       token,
@@ -1218,6 +1488,11 @@ export const getAllUsersGlobal = async (): Promise<any[]> => {
 
 export const requestContractFinalize = async (requestorId: string, contractId: string, payload: any) => {
   const req = sanitize({ type: 'contract_finalize', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  if (useMacCollection('approvals')) {
+    const r = await macSave('approvals', req);
+    await macSave('audit', { action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    return { id: (r as any).id } as any;
+  }
   const r = await addDoc(fsCollection( 'approvals'), req);
   await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   // Notify admins via push notification
@@ -1231,6 +1506,11 @@ export const requestContractFinalize = async (requestorId: string, contractId: s
 
 export const requestContractDelete = async (requestorId: string, contractId: string, payload: any) => {
   const req = sanitize({ type: 'contract_delete', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  if (useMacCollection('approvals')) {
+    const r = await macSave('approvals', req);
+    await macSave('audit', { action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    return { id: (r as any).id } as any;
+  }
   const r = await addDoc(fsCollection( 'approvals'), req);
   await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
   try {
@@ -1250,11 +1530,17 @@ export const getStockEntries = async () => {
 };
 export const saveStockItem = async (s: any) => {
   const data = sanitize(s);
+  if (useMacCollection('stocks')) return macSave('stocks', data);
   if (!s.id) return addDoc(fsCollection( 'stocks'), data);
   return setDoc(fsDoc( 'stocks', s.id), data);
 };
 
 export const deleteStockItem = async (id: string) => {
+  if (useMacCollection('stocks')) {
+    await macDelete('stocks', id);
+    await macSave('audit', { action: 'DELETE_STOCK', details: `Deleted stock item ${id}`, timestamp: Date.now() }).catch(() => {});
+    return true;
+  }
   try {
     await deleteDoc(fsDoc( 'stocks', id));
     await addDoc(fsCollection( 'audit'), sanitize({ action: 'DELETE_STOCK', details: `Deleted stock item ${id}`, timestamp: Date.now() })).catch(() => {});
@@ -1273,6 +1559,17 @@ export const restoreStockFromTransaction = async (tx: any, userId: string): Prom
     const qty = Math.abs(item.qty || 0);
     if (!qty) continue;
     try {
+      if (useMacCollection('stocks')) {
+        const stock = await macGetDocument<any>('stocks', item.stockId, { bookId: currentBookId, includeDeleted: true });
+        const currentQty = Number(stock?.quantity || 0);
+        const stockName = stock?.name || item.name || '';
+        await macSave('stocks', { ...(stock || {}), id: item.stockId, quantity: currentQty + qty }, currentBookId, true).catch(() => {});
+        await macSave('stock_entries', {
+          stockId: item.stockId, stockName, qty, unitPrice: item.unitPrice || 0,
+          by: userId, details: 'Reversal - transaction deleted', date: new Date().toISOString(),
+        }).catch(() => {});
+        continue;
+      }
       const stockSnap = await getDoc(fsDoc( 'stocks', item.stockId)).catch(() => null as any);
       const currentQty = stockSnap?.exists() ? ((stockSnap.data() as any).quantity || 0) : 0;
       const stockName = stockSnap?.exists() ? ((stockSnap.data() as any).name || item.name || '') : (item.name || '');
@@ -1293,6 +1590,17 @@ export const redeductStockFromTransaction = async (tx: any, userId: string): Pro
     const qty = Math.abs(item.qty || 0);
     if (!qty) continue;
     try {
+      if (useMacCollection('stocks')) {
+        const stock = await macGetDocument<any>('stocks', item.stockId, { bookId: currentBookId, includeDeleted: true });
+        const currentQty = Number(stock?.quantity || 0);
+        const stockName = stock?.name || item.name || '';
+        await macSave('stocks', { ...(stock || {}), id: item.stockId, quantity: Math.max(0, currentQty - qty) }, currentBookId, true).catch(() => {});
+        await macSave('stock_entries', {
+          stockId: item.stockId, stockName, qty: -qty, unitPrice: item.unitPrice || 0,
+          by: userId, details: 'Re-deduction - transaction restored from trash', date: new Date().toISOString(),
+        }).catch(() => {});
+        continue;
+      }
       const stockSnap = await getDoc(fsDoc( 'stocks', item.stockId)).catch(() => null as any);
       const currentQty = stockSnap?.exists() ? ((stockSnap.data() as any).quantity || 0) : 0;
       const stockName = stockSnap?.exists() ? ((stockSnap.data() as any).name || item.name || '') : (item.name || '');
@@ -1306,6 +1614,15 @@ export const redeductStockFromTransaction = async (tx: any, userId: string): Pro
 };
 
 export const consumeStockItem = async (stockId: string, qty: number, byUserId: string, details?: string, stockName?: string) => {
+  if (useMacCollection('stocks')) {
+    const stock = await macGetDocument<any>('stocks', stockId, { bookId: currentBookId, includeDeleted: true });
+    const currentQty = Number(stock?.quantity || 0);
+    const resolvedName = stockName || stock?.name || '';
+    await macSave('stocks', { ...(stock || {}), id: stockId, quantity: Math.max(0, currentQty - Math.abs(qty)) }, currentBookId, true).catch(() => {});
+    await macSave('stock_entries', { stockId, stockName: resolvedName, qty: -Math.abs(qty), by: byUserId, details, date: new Date().toISOString() }).catch(() => {});
+    await macSave('audit', { action: 'CONSUME_STOCK', details: `Consumed ${qty} from ${resolvedName || stockId}`, userId: byUserId, timestamp: Date.now() }).catch(() => {});
+    return true;
+  }
   // decrement stock and create stock_entries record
   const stockDoc = fsDoc( 'stocks', stockId);
   // best-effort read
@@ -1329,11 +1646,38 @@ export const consumeStockItem = async (stockId: string, qty: number, byUserId: s
 
 export const addStockEntry = async (stockId: string, qty: number, byUserId: string, details?: string) => {
   const entry = sanitize({ stockId, qty: Math.abs(qty), by: byUserId, details, date: new Date().toISOString() });
+  if (useMacCollection('stock_entries')) {
+    await macSave('stock_entries', entry).catch(() => {});
+    return true;
+  }
   await addDoc(fsCollection( 'stock_entries'), entry).catch(() => {});
   return true;
 };
 
 export const deleteStockEntry = async (entryId: string, reversalUserId: string): Promise<boolean> => {
+  if (useMacCollection('stock_entries')) {
+    const entry = await macGetDocument<any>('stock_entries', entryId, { bookId: currentBookId, includeDeleted: true });
+    if (!entry) return false;
+    const qtyChange = Number(entry.qty || 0);
+    if (qtyChange !== 0 && entry.stockId) {
+      const stock = await macGetDocument<any>('stocks', entry.stockId, { bookId: currentBookId, includeDeleted: true });
+      if (stock) {
+        const currentQty = Number(stock.quantity || 0);
+        await macSave('stocks', { ...stock, id: entry.stockId, quantity: Math.max(0, currentQty - qtyChange) }, currentBookId, true).catch(() => {});
+        await macSave('stock_entries', {
+          stockId: entry.stockId,
+          stockName: entry.stockName || '',
+          qty: -qtyChange,
+          by: reversalUserId,
+          details: `Reversal of ${entry.details || 'entry'}`,
+          date: new Date().toISOString(),
+        }).catch(() => {});
+      }
+    }
+    await macDelete('stock_entries', entryId).catch(() => {});
+    await macSave('audit', { action: 'DELETE_STOCK_ENTRY', details: `Reversed stock entry ${entryId}`, userId: reversalUserId, timestamp: Date.now() }).catch(() => {});
+    return true;
+  }
   try {
     // Load the entry first so we can reverse the qty
     const entrySnap = await getDoc(fsDoc( 'stock_entries', entryId)).catch(() => null as any);
@@ -1598,6 +1942,11 @@ export const getTransfersFromBook = async (bookId: string, opts?: { includeDelet
 
 export const saveTransfer = async (t: any) => {
   const data = sanitize(t);
+  if (useMacCollection('transfers')) {
+    const saved = await macSave('transfers', data);
+    invalidateFirestoreCache('col:');
+    return saved;
+  }
   try {
     const batch = writeBatch(assertDb());
     const activeBookId = getCurrentBookId();
@@ -2035,6 +2384,10 @@ const resolveTransferBooks = async (transferId: string): Promise<{
 };
 
 export const deleteTransfer = async (id: string) => {
+  if (useMacCollection('transfers')) {
+    await macDelete('transfers', id);
+    return true;
+  }
   try {
     const { transfer, transferBooks, sourceTx, destTx } = await resolveTransferBooks(id);
     const batch = writeBatch(assertDb());
@@ -2055,6 +2408,10 @@ export const deleteTransfer = async (id: string) => {
 // Soft-delete a transfer document (and its linked transactions) across every
 // book that holds a mirror copy, so the deletion propagates to both sides.
 export const softDeleteTransfer = async (transferId: string, deletedBy?: string) => {
+  if (useMacCollection('transfers')) {
+    await macSave('transfers', { id: transferId, deleted: true, deletedAt: Date.now(), deletedBy: deletedBy || 'SYSTEM' }, currentBookId, true);
+    return;
+  }
   try {
     const { transferBooks, sourceTx, destTx } = await resolveTransferBooks(transferId);
     const patch = { deleted: true, deletedAt: Date.now(), deletedBy: deletedBy || 'SYSTEM' };
@@ -2069,6 +2426,10 @@ export const softDeleteTransfer = async (transferId: string, deletedBy?: string)
   }
 };
 export const restoreTransfer = async (transferId: string) => {
+  if (useMacCollection('transfers')) {
+    await macSave('transfers', { id: transferId, deleted: false, deletedAt: null, deletedBy: null }, currentBookId, true);
+    return;
+  }
   try {
     const { transferBooks, sourceTx, destTx } = await resolveTransferBooks(transferId);
     const patch = { deleted: false, deletedAt: null, deletedBy: null };
@@ -2089,10 +2450,14 @@ export const getServiceAgreements = async (opts?: { includeDeleted?: boolean }) 
 };
 export const saveServiceAgreement = async (a: any) => {
   const data = sanitize(a);
+  if (useMacCollection('service_agreements')) return macSave('service_agreements', data);
   if (!a.id) return addDoc(fsCollection( "service_agreements"), data);
   return setDoc(fsDoc( "service_agreements", a.id), data);
 };
-export const deleteServiceAgreement = async (id: string) => deleteDoc(fsDoc( "service_agreements", id));
+export const deleteServiceAgreement = async (id: string) => {
+  if (useMacCollection('service_agreements')) return macDelete('service_agreements', id);
+  return deleteDoc(fsDoc( "service_agreements", id));
+};
 
 // ---- Backup Management (Firestore) ----
 export interface BackupRecord { id: string; timestamp: string; date: string; size: number; data: string; createdAt: number; }
@@ -2107,7 +2472,11 @@ export const saveBackupToFirestore = async (backupData: string) => {
       data: backupData,
       createdAt: Date.now()
     };
-    
+
+    if (useMacCollection('backups')) {
+      await macSave('backups', backupRecord, currentBookId, true);
+      return backupRecord;
+    }
     await setDoc(fsDoc( 'backups', backupRecord.id), backupRecord);
     return backupRecord;
   } catch (e) {
@@ -2117,6 +2486,10 @@ export const saveBackupToFirestore = async (backupData: string) => {
 };
 
 export const getBackupsFromFirestore = async (): Promise<BackupRecord[]> => {
+  if (useMacCollection('backups')) {
+    const backups = await macListCollection<BackupRecord>('backups', { bookId: currentBookId, includeDeleted: false });
+    return backups.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+  }
   try {
     const snap = await getDocs(fsCollection( 'backups'));
     const backups = snap.docs.map(d => d.data() as BackupRecord).sort((a, b) => 
@@ -2131,6 +2504,10 @@ export const getBackupsFromFirestore = async (): Promise<BackupRecord[]> => {
 
 export const deleteBackupFromFirestore = async (id: string) => {
   try {
+    if (useMacCollection('backups')) {
+      await macDelete('backups', id);
+      return;
+    }
     await deleteDoc(fsDoc( 'backups', id));
   } catch (e) {
     console.error('Failed to delete backup:', e);
@@ -2140,6 +2517,11 @@ export const deleteBackupFromFirestore = async (id: string) => {
 
 export const restoreFromFirestoreBackup = async (backupId: string) => {
   try {
+    if (useMacCollection('backups')) {
+      const backup = await macGetDocument<BackupRecord>('backups', backupId, { bookId: currentBookId, includeDeleted: true });
+      if (!backup) throw new Error('Backup not found');
+      return await restoreBackup(backup.data);
+    }
     const snap = await getDoc(fsDoc( 'backups', backupId));
     if (!snap.exists()) throw new Error('Backup not found');
     
@@ -2156,6 +2538,9 @@ export const restoreFromFirestoreBackup = async (backupId: string) => {
 export interface BookRecord { id: string; name: string; nameAr?: string; createdAt?: number; updatedAt?: number; }
 
 export const getBooks = async (): Promise<BookRecord[]> => {
+  if (useMacCollection('books')) {
+    return macListCollection<BookRecord>('books', { bookId: 'default', includeDeleted: false });
+  }
   try {
     const snap = await getDocs(_colRef(assertDb(), 'books'));
     return snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }) as BookRecord);
@@ -2326,6 +2711,9 @@ export const getBuildingsAllBooks = async (opts?: { includeDeleted?: boolean }):
 
 export const saveBook = async (book: Partial<BookRecord> & { name: string }): Promise<BookRecord> => {
   const data = sanitize({ ...book, updatedAt: Date.now() });
+  if (useMacCollection('books')) {
+    return macSave('books', data, 'default', !!book.id) as Promise<BookRecord>;
+  }
   if (book.id) {
     await setDoc(_docRef(assertDb(), 'books', book.id), data, { merge: true } as any);
     return { id: book.id, ...data } as BookRecord;
@@ -2335,6 +2723,10 @@ export const saveBook = async (book: Partial<BookRecord> & { name: string }): Pr
 };
 
 export const deleteBook = async (id: string): Promise<void> => {
+  if (useMacCollection('books')) {
+    await macDelete('books', id, 'default');
+    return;
+  }
   await deleteDoc(_docRef(assertDb(), 'books', id));
 };
 
@@ -2342,73 +2734,104 @@ export const deleteBook = async (id: string): Promise<void> => {
 export const getSadadBills = async () => {  return getCollection('sadad_bills', 'dueDate'); };
 export const saveSadadBill = async (b: any) => {
   const data = sanitize(b);
+  if (useMacCollection('sadad_bills')) return macSaveId('sadad_bills', data);
   if (!b.id) { const ref = await addDoc(fsCollection( 'sadad_bills'), data); return ref.id; }
   await setDoc(fsDoc( 'sadad_bills', b.id), data);
   return b.id;
 };
-export const deleteSadadBill = async (id: string) => {  return deleteDoc(fsDoc( 'sadad_bills', id)); };
+export const deleteSadadBill = async (id: string) => {
+  if (useMacCollection('sadad_bills')) return macDelete('sadad_bills', id);
+  return deleteDoc(fsDoc( 'sadad_bills', id));
+};
 
 // ---- Ejar Contracts ----
 export const getEjarContracts = async () => {  return getCollection('ejar_contracts', 'registrationDate'); };
 export const saveEjarContract = async (c: any) => {
   const data = sanitize(c);
+  if (useMacCollection('ejar_contracts')) return macSaveId('ejar_contracts', data);
   if (!c.id) { const ref = await addDoc(fsCollection( 'ejar_contracts'), data); return ref.id; }
   await setDoc(fsDoc( 'ejar_contracts', c.id), data);
   return c.id;
 };
-export const deleteEjarContract = async (id: string) => {  return deleteDoc(fsDoc( 'ejar_contracts', id)); };
+export const deleteEjarContract = async (id: string) => {
+  if (useMacCollection('ejar_contracts')) return macDelete('ejar_contracts', id);
+  return deleteDoc(fsDoc( 'ejar_contracts', id));
+};
 
 // ---- Utility Readings ----
 export const getUtilityReadings = async () => {  return getCollection('utility_readings', 'readingDate'); };
 export const saveUtilityReading = async (r: any) => {
   const data = sanitize(r);
+  if (useMacCollection('utility_readings')) return macSaveId('utility_readings', data);
   if (!r.id) { const ref = await addDoc(fsCollection( 'utility_readings'), data); return ref.id; }
   await setDoc(fsDoc( 'utility_readings', r.id), data);
   return r.id;
 };
-export const deleteUtilityReading = async (id: string) => {  return deleteDoc(fsDoc( 'utility_readings', id)); };
+export const deleteUtilityReading = async (id: string) => {
+  if (useMacCollection('utility_readings')) return macDelete('utility_readings', id);
+  return deleteDoc(fsDoc( 'utility_readings', id));
+};
 
 // ---- Security Deposits ----
 export const getSecurityDeposits = async () => {  return getCollection('security_deposits', 'depositDate'); };
 export const saveSecurityDeposit = async (d: any) => {
   const data = sanitize(d);
+  if (useMacCollection('security_deposits')) return macSaveId('security_deposits', data);
   if (!d.id) { const ref = await addDoc(fsCollection( 'security_deposits'), data); return ref.id; }
   await setDoc(fsDoc( 'security_deposits', d.id), data);
   return d.id;
 };
-export const deleteSecurityDeposit = async (id: string) => {  return deleteDoc(fsDoc( 'security_deposits', id)); };
+export const deleteSecurityDeposit = async (id: string) => {
+  if (useMacCollection('security_deposits')) return macDelete('security_deposits', id);
+  return deleteDoc(fsDoc( 'security_deposits', id));
+};
 
 // ---- WhatsApp Messages ----
 export const getWhatsAppMessages = async () => {  return getCollection('whatsapp_messages', 'createdAt'); };
 export const saveWhatsAppMessage = async (m: any) => {
   const data = sanitize(m);
+  if (useMacCollection('whatsapp_messages')) return macSaveId('whatsapp_messages', data);
   if (!m.id) { const ref = await addDoc(fsCollection( 'whatsapp_messages'), data); return ref.id; }
   await setDoc(fsDoc( 'whatsapp_messages', m.id), data);
   return m.id;
 };
-export const deleteWhatsAppMessage = async (id: string) => {  return deleteDoc(fsDoc( 'whatsapp_messages', id)); };
+export const deleteWhatsAppMessage = async (id: string) => {
+  if (useMacCollection('whatsapp_messages')) return macDelete('whatsapp_messages', id);
+  return deleteDoc(fsDoc( 'whatsapp_messages', id));
+};
 
 // WhatsApp Config (singleton)
 export const getWhatsAppConfig = async (): Promise<any> => {
+  if (useMacCollection('meta')) {
+    return macGetDocument('meta', 'whatsapp_config', { bookId: currentBookId, includeDeleted: true });
+  }
   try {
     const snap = await getDoc(fsDoc( 'meta', 'whatsapp_config'));
     return snap.exists() ? snap.data() : null;
   } catch { return null; }
 };
-export const saveWhatsAppConfig = async (c: any) => {  return setDoc(fsDoc( 'meta', 'whatsapp_config'), sanitize(c)); };
+export const saveWhatsAppConfig = async (c: any) => {
+  if (useMacCollection('meta')) return macSave('meta', { ...sanitize(c), id: 'whatsapp_config' }, currentBookId, true);
+  return setDoc(fsDoc( 'meta', 'whatsapp_config'), sanitize(c));
+};
 
 // ---- Bank Statements / Reconciliation ----
 export const getBankStatements = async () => {  return getCollection('bank_statements', 'transactionDate'); };
 export const saveBankStatement = async (s: any) => {
   const data = sanitize(s);
+  if (useMacCollection('bank_statements')) return macSaveId('bank_statements', data);
   if (!s.id) { const ref = await addDoc(fsCollection( 'bank_statements'), data); return ref.id; }
   await setDoc(fsDoc( 'bank_statements', s.id), data);
   return s.id;
 };
-export const deleteBankStatement = async (id: string) => {  return deleteDoc(fsDoc( 'bank_statements', id)); };
+export const deleteBankStatement = async (id: string) => {
+  if (useMacCollection('bank_statements')) return macDelete('bank_statements', id);
+  return deleteDoc(fsDoc( 'bank_statements', id));
+};
 export const getReconciliationRecords = async () => {  return getCollection('reconciliation_records', 'createdAt'); };
 export const saveReconciliationRecord = async (r: any) => {
   const data = sanitize(r);
+  if (useMacCollection('reconciliation_records')) return macSaveId('reconciliation_records', data);
   if (!r.id) { const ref = await addDoc(fsCollection( 'reconciliation_records'), data); return ref.id; }
   await setDoc(fsDoc( 'reconciliation_records', r.id), data);
   return r.id;
@@ -2418,38 +2841,54 @@ export const saveReconciliationRecord = async (r: any) => {
 export const getNafathVerifications = async () => {  return getCollection('nafath_verifications', 'createdAt'); };
 export const saveNafathVerification = async (v: any) => {
   const data = sanitize(v);
+  if (useMacCollection('nafath_verifications')) return macSaveId('nafath_verifications', data);
   if (!v.id) { const ref = await addDoc(fsCollection( 'nafath_verifications'), data); return ref.id; }
   await setDoc(fsDoc( 'nafath_verifications', v.id), data);
   return v.id;
 };
-export const deleteNafathVerification = async (id: string) => {  return deleteDoc(fsDoc( 'nafath_verifications', id)); };
+export const deleteNafathVerification = async (id: string) => {
+  if (useMacCollection('nafath_verifications')) return macDelete('nafath_verifications', id);
+  return deleteDoc(fsDoc( 'nafath_verifications', id));
+};
 
 // ---- Municipality Licenses ----
 export const getMunicipalityLicenses = async () => {  return getCollection('municipality_licenses', 'expiryDate'); };
 export const saveMunicipalityLicense = async (l: any) => {
   const data = sanitize(l);
+  if (useMacCollection('municipality_licenses')) return macSaveId('municipality_licenses', data);
   if (!l.id) { const ref = await addDoc(fsCollection( 'municipality_licenses'), data); return ref.id; }
   await setDoc(fsDoc( 'municipality_licenses', l.id), data);
   return l.id;
 };
-export const deleteMunicipalityLicense = async (id: string) => {  return deleteDoc(fsDoc( 'municipality_licenses', id)); };
+export const deleteMunicipalityLicense = async (id: string) => {
+  if (useMacCollection('municipality_licenses')) return macDelete('municipality_licenses', id);
+  return deleteDoc(fsDoc( 'municipality_licenses', id));
+};
 
 // ---- Civil Defense Records ----
 export const getCivilDefenseRecords = async () => {  return getCollection('civil_defense_records', 'expiryDate'); };
 export const saveCivilDefenseRecord = async (r: any) => {
   const data = sanitize(r);
+  if (useMacCollection('civil_defense_records')) return macSaveId('civil_defense_records', data);
   if (!r.id) { const ref = await addDoc(fsCollection( 'civil_defense_records'), data); return ref.id; }
   await setDoc(fsDoc( 'civil_defense_records', r.id), data);
   return r.id;
 };
-export const deleteCivilDefenseRecord = async (id: string) => {  return deleteDoc(fsDoc( 'civil_defense_records', id)); };
+export const deleteCivilDefenseRecord = async (id: string) => {
+  if (useMacCollection('civil_defense_records')) return macDelete('civil_defense_records', id);
+  return deleteDoc(fsDoc( 'civil_defense_records', id));
+};
 
 // ---- Absher Records ----
 export const getAbsherRecords = async () => {  return getCollection('absher_records', 'createdAt'); };
 export const saveAbsherRecord = async (r: any) => {
   const data = sanitize(r);
+  if (useMacCollection('absher_records')) return macSaveId('absher_records', data);
   if (!r.id) { const ref = await addDoc(fsCollection( 'absher_records'), data); return ref.id; }
   await setDoc(fsDoc( 'absher_records', r.id), data);
   return r.id;
 };
-export const deleteAbsherRecord = async (id: string) => {  return deleteDoc(fsDoc( 'absher_records', id)); };
+export const deleteAbsherRecord = async (id: string) => {
+  if (useMacCollection('absher_records')) return macDelete('absher_records', id);
+  return deleteDoc(fsDoc( 'absher_records', id));
+};

@@ -3,12 +3,13 @@ import React, { useState, useEffect } from 'react';
 import { User, UserRole, Building } from '../types';
 import { getUsers, saveUser, deleteUser, getBuildings, getBuildingsAllBooks, ownerStakeBuildingIdsMatch } from '../services/firestoreService';
 import { useBook } from '../contexts/BookContext';
-import { UserCheck, Plus, Trash2, Edit, Save, X, Lock, Key, Building2, RotateCcw, AlertTriangle, CreditCard, Calendar, Crown } from 'lucide-react';
+import { UserCheck, Plus, Trash2, Edit, Save, X, RotateCcw, AlertTriangle, CreditCard, Calendar, Crown, MapPin, Navigation, Plane } from 'lucide-react';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
 import { fmtDate } from '../utils/dateFormat';
 import { useLanguage } from '../i18n';
+import { listenStaffLiveLocations, StaffLiveLocation } from '../services/staffLocationService';
 
 const EmployeeManager: React.FC = () => {
     const { t, isRTL } = useLanguage();
@@ -16,6 +17,7 @@ const EmployeeManager: React.FC = () => {
     const { showSuccess, showError, showWarning } = useToast();
   const [employees, setEmployees] = useState<User[]>([]);
   const [buildings, setBuildings] = useState<Building[]>([]);
+  const [liveLocations, setLiveLocations] = useState<Record<string, StaffLiveLocation>>({});
   /** All books, composite ids — used for Owner's Buildings (stake) only */
   const [ownerStakeBuildings, setOwnerStakeBuildings] = useState<Building[]>([]);
   const [showDeleted, setShowDeleted] = useState(false);
@@ -58,6 +60,8 @@ const EmployeeManager: React.FC = () => {
         ownerBuildingIds: [],
         phone: ''
     });
+
+    useEffect(() => listenStaffLiveLocations(setLiveLocations), []);
 
     useEffect(() => {
         const load = async () => {
@@ -212,7 +216,9 @@ const EmployeeManager: React.FC = () => {
             isOwner: user.isOwner || false,
             sharePercentage: user.sharePercentage || 0,
             ownerBuildingIds: user.ownerBuildingIds || [],
-            phone: user.phone || ''
+            phone: user.phone || '',
+            onVacation: !!(user as any).onVacation,
+            vacationNote: (user as any).vacationNote || ''
         });
         setView('FORM');
   };
@@ -232,6 +238,37 @@ const EmployeeManager: React.FC = () => {
       const s = getIqamaExpiryStatus(e.iqamaExpiry);
       return s && s.days <= 30;
   });
+
+  const locationAgeLabel = (location?: StaffLiveLocation) => {
+      if (!location?.updatedAtMs) return 'No location yet';
+      const minutes = Math.max(0, Math.round((Date.now() - location.updatedAtMs) / 60000));
+      if (minutes < 1) return 'Just now';
+      if (minutes < 60) return `${minutes}m ago`;
+      return `${Math.round(minutes / 60)}h ago`;
+  };
+
+  const locationMapUrl = (location?: StaffLiveLocation) => {
+      if (typeof location?.latitude !== 'number' || typeof location?.longitude !== 'number') return '';
+      return `https://www.google.com/maps?q=${location.latitude},${location.longitude}`;
+  };
+
+  const staffLocationRows = employees
+      .filter(emp => !(emp as any).deleted && !emp.isOwner && emp.role !== UserRole.OWNER && emp.role !== UserRole.ADMIN)
+      .map(emp => ({ employee: emp, location: liveLocations[emp.id] }))
+      .sort((a, b) => Number(b.location?.updatedAtMs || 0) - Number(a.location?.updatedAtMs || 0));
+
+  const toggleVacation = async (employee: User) => {
+      const nextVacation = !(employee as any).onVacation;
+      await saveUser({
+          ...employee,
+          onVacation: nextVacation,
+          vacationUpdatedAt: Date.now(),
+          vacationUpdatedBy: 'admin',
+      } as any);
+      const usrs = await getUsers({ includeDeleted: true });
+      setEmployees(usrs || []);
+      showSuccess(`${employee.name} is now ${nextVacation ? 'on vacation read-only mode' : 'active for editing'}.`);
+  };
 
   return (
     <div className="premium-card overflow-hidden min-h-[600px] animate-fade-in">
@@ -274,6 +311,64 @@ const EmployeeManager: React.FC = () => {
       </div>
 
       <div className="p-4 sm:p-6">
+        {view === 'LIST' && (
+            <div className="mb-4 rounded-2xl border border-emerald-100 bg-gradient-to-br from-emerald-50 to-sky-50 p-4">
+                <div className="mb-3 flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <div>
+                        <h3 className="flex items-center gap-2 text-sm font-black text-emerald-900">
+                            <MapPin size={17} /> Live Staff Locations
+                        </h3>
+                        <p className="text-xs font-bold text-emerald-700">Visible only in admin Employee Management. Staff do not get a location viewer.</p>
+                    </div>
+                    <span className="rounded-full bg-white/80 px-3 py-1 text-[11px] font-black text-emerald-700">
+                        Auto refresh
+                    </span>
+                </div>
+                <div className="grid grid-cols-1 gap-2 md:grid-cols-2 xl:grid-cols-3">
+                    {staffLocationRows.map(({ employee, location }) => {
+                        const mapUrl = locationMapUrl(location);
+                        const hasLocation = !!mapUrl;
+                        return (
+                            <div key={employee.id} className="rounded-xl border border-white/80 bg-white/90 p-3 shadow-sm">
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="min-w-0">
+                                        <p className="truncate text-sm font-black text-slate-800">{employee.name}</p>
+                                        <p className={`mt-0.5 text-xs font-bold ${hasLocation ? 'text-emerald-700' : location?.permission === 'denied' ? 'text-rose-600' : 'text-slate-500'}`}>
+                                            {location?.permission === 'denied'
+                                                ? 'Location permission denied'
+                                                : hasLocation
+                                                    ? `${locationAgeLabel(location)}${location?.online ? ' · Online' : ' · Last seen'}`
+                                                    : 'Waiting for location'}
+                                        </p>
+                                        {hasLocation && (
+                                            <p className="mt-1 text-[11px] font-mono text-slate-500">
+                                                {location?.latitude?.toFixed(5)}, {location?.longitude?.toFixed(5)}
+                                                {location?.accuracy ? ` · ${Math.round(location.accuracy)}m` : ''}
+                                            </p>
+                                        )}
+                                    </div>
+                                    <a
+                                        href={mapUrl || undefined}
+                                        target="_blank"
+                                        rel="noreferrer"
+                                        aria-disabled={!mapUrl}
+                                        className={`shrink-0 inline-flex items-center gap-1 rounded-lg px-3 py-2 text-xs font-black ${mapUrl ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-slate-200 text-slate-400 pointer-events-none'}`}
+                                    >
+                                        <Navigation size={13} /> Map
+                                    </a>
+                                </div>
+                            </div>
+                        );
+                    })}
+                    {staffLocationRows.length === 0 && (
+                        <div className="rounded-xl border border-white/80 bg-white/90 p-4 text-sm font-bold text-slate-500">
+                            No staff accounts found for live location tracking.
+                        </div>
+                    )}
+                </div>
+            </div>
+        )}
+
         {/* Iqama Expiry Alert Banner */}
         {view === 'LIST' && expiringIqamas.length > 0 && (
             <div className="mb-4 bg-gradient-to-r from-amber-50 to-orange-50 border border-amber-200 rounded-xl p-4 animate-fade-in">
@@ -342,6 +437,11 @@ const EmployeeManager: React.FC = () => {
                                         <Crown size={10} /> Owner {emp.sharePercentage ? `(${emp.sharePercentage}%)` : ''}
                                     </span>
                                 )}
+                                {(emp as any).onVacation && (
+                                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-sky-100 text-sky-700 text-xs font-bold">
+                                        <Plane size={10} /> Vacation
+                                    </span>
+                                )}
                             </div>
                         </div>
                     </div>
@@ -390,6 +490,49 @@ const EmployeeManager: React.FC = () => {
                             <span className="text-slate-700">{fmtDate(emp.joinedDate)}</span>
                         </div>
                     </div>
+
+                    <div className="mt-4 grid grid-cols-1 gap-2 rounded-xl border border-slate-100 bg-slate-50/70 p-3">
+                        {(() => {
+                            const location = liveLocations[emp.id];
+                            const mapUrl = locationMapUrl(location);
+                            return (
+                                <>
+                                    <div className="flex items-center justify-between gap-3">
+                                        <div className="min-w-0">
+                                            <p className="text-[11px] font-black uppercase tracking-wide text-slate-500 flex items-center gap-1"><MapPin size={12} /> Live location</p>
+                                            <p className="text-xs font-bold text-slate-700 truncate">
+                                                {location?.permission === 'denied'
+                                                    ? 'Permission denied on staff device'
+                                                    : mapUrl
+                                                        ? `${locationAgeLabel(location)}${location.accuracy ? ` · ${Math.round(location.accuracy)}m` : ''}`
+                                                        : locationAgeLabel(location)}
+                                            </p>
+                                        </div>
+                                        <a
+                                            href={mapUrl || undefined}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            aria-disabled={!mapUrl}
+                                            className={`shrink-0 inline-flex items-center gap-1 rounded-lg px-3 py-2 text-xs font-black ${mapUrl ? 'bg-emerald-600 text-white hover:bg-emerald-700' : 'bg-slate-200 text-slate-400 pointer-events-none'}`}
+                                        >
+                                            <Navigation size={13} /> Map
+                                        </a>
+                                    </div>
+                                    <button
+                                        type="button"
+                                        onClick={() => toggleVacation(emp)}
+                                        className={`w-full inline-flex items-center justify-center gap-2 rounded-lg px-3 py-2 text-xs font-black border ${
+                                            (emp as any).onVacation
+                                                ? 'bg-sky-50 text-sky-700 border-sky-200 hover:bg-sky-100'
+                                                : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-100'
+                                        }`}
+                                    >
+                                        <Plane size={14} /> {(emp as any).onVacation ? 'Turn off vacation read-only' : 'Put on vacation read-only'}
+                                    </button>
+                                </>
+                            );
+                        })()}
+                    </div>
                 </div>
             ))}
             {employees.length === 0 && (
@@ -427,6 +570,35 @@ const EmployeeManager: React.FC = () => {
                                 <span className="text-xs text-slate-400">If unchecked, employee cannot log in (e.g., Cleaners, Security)</span>
                             </div>
                         </label>
+                    </div>
+
+                    <div className="col-span-2 p-4 bg-sky-50 rounded-xl border border-sky-200">
+                        <label className="flex items-center gap-3 cursor-pointer">
+                            <input
+                                type="checkbox"
+                                checked={!!(formData as any).onVacation}
+                                onChange={e => setFormData({
+                                    ...formData,
+                                    onVacation: e.target.checked,
+                                    vacationUpdatedAt: Date.now(),
+                                    vacationUpdatedBy: 'admin',
+                                } as any)}
+                                className="w-5 h-5 rounded text-sky-600 focus:ring-sky-500"
+                            />
+                            <div>
+                                <span className="block font-bold text-sky-800">Vacation read-only mode</span>
+                                <span className="text-xs text-sky-600">When enabled, this staff can open the app for viewing only and cannot enter or edit data.</span>
+                            </div>
+                        </label>
+                        {(formData as any).onVacation && (
+                            <input
+                                type="text"
+                                value={(formData as any).vacationNote || ''}
+                                onChange={e => setFormData({ ...formData, vacationNote: e.target.value } as any)}
+                                className="mt-3 w-full px-4 py-2.5 rounded-lg border border-sky-200 focus:ring-2 focus:ring-sky-400 outline-none bg-white text-sm"
+                                placeholder="Optional note, e.g. annual leave until 15 June"
+                            />
+                        )}
                     </div>
 
                     <div>

@@ -5,6 +5,7 @@ import { auth } from "./firebase";
 import GlobalSearchWithResults from './components/GlobalSearchWithResults';
 import { setupCloudBackup } from './services/cloudBackupService';
 import { startSession, endSession, updateSession } from './services/screenTimeService'; 
+import { setPresence as setChatPresence } from './services/chatService';
 import { fmtDate } from './utils/dateFormat';
 import SoundService from './services/soundService';
 import { useLanguage } from './i18n';
@@ -25,20 +26,16 @@ import History from './components/History';
 import CustomerManager from './components/CustomerManager';
 import EmployeeManager from './components/EmployeeManager';
 import ContractForm from './components/ContractForm';
-import Monitoring from './components/Monitoring';
 import BuildingManager from './components/BuildingManager';
 import BuildingDirectory from './components/BuildingDirectory';
 import CalendarView from './components/CalendarView';
 import VendorManager from './components/VendorManager';
 import ServiceAgreements from './components/ServiceAgreements';
 import TaskManager from './components/TaskManager';
-import Reports from './components/Reports';
 import Settings from './components/Settings';
 import About from './components/About';
 import CarRegistry from './components/CarRegistry'; 
 import StockManager from './components/StockManager';
-import TransferManager from './components/TransferManager';
-import VATReport from './components/VATReport';
 import Invoice from './components/Invoice';
 import BulkImportCustomers from './components/BulkImportCustomers';
 import BulkRentEntry from './components/BulkRentEntry';
@@ -47,28 +44,27 @@ import BackupManager from './components/BackupManager';
 import CloudBackupManager from './components/CloudBackupManager';
 import BorrowingTracker from './components/BorrowingTracker';
 import StaffPortfolio from './components/StaffPortfolio';
-import OwnerPortal from './components/OwnerPortal';
 import ArchetypeCard from './components/ArchetypeCard';
 import ApprovalCenter from './components/ApprovalCenter';
 import ImmersiveLanding from '@/components/landing/ImmersiveLanding';
 import ReportBugButton from './components/ReportBugButton';
 import AdminBugDashboard from './components/AdminBugDashboard';
-import SheetsImport from './components/SheetsImport';
-import AmlakSheets from './components/AmlakSheets';
+import AdminRemoteSupport from './components/AdminRemoteSupport';
+import RemoteSupportListener from './components/RemoteSupportListener';
 
 import { NotificationBell, NotificationPanel, useNotifications } from './components/Notifications';
 import QuickActions, { QuickActionButton, QuickActionFAB } from './components/QuickActions';
 import { ToastProvider } from './components/Toast';
 import ErrorBoundary from './components/ErrorBoundary';
 import VoiceAssistant from './components/VoiceAssistant';
-import StaffChat from './components/StaffChat';
 import ChatBubble from './components/ChatBubble';
 import AIAssistant from './components/AIAssistant';
 import FloatingToolsDock from './components/FloatingToolsDock';
 import FloatingCalculator from './components/FloatingCalculator';
 import OfflineBanner from './components/OfflineBanner';
 import { UserRole } from './types';
-import { setUserScope } from './services/firestoreService';
+import { getUsers, setUserScope } from './services/firestoreService';
+import { startStaffLocationReporting } from './services/staffLocationService';
 import { BookProvider, useBook } from './contexts/BookContext';
 import BookManager from './components/BookManager';
 import SadadBillManager from './components/SadadBillManager';
@@ -77,11 +73,20 @@ import UtilitiesTracker from './components/UtilitiesTracker';
 import SecurityDeposits from './components/SecurityDeposits';
 import WhatsAppIntegration from './components/WhatsAppIntegration';
 import BankReconciliation from './components/BankReconciliation';
-import AccountingModule from './components/AccountingModule';
 import MunicipalityLicenseTracker from './components/MunicipalityLicenseTracker';
 import CivilDefenseCompliance from './components/CivilDefenseCompliance';
 import AbsherIntegration from './components/AbsherIntegration';
 import { isTenantMode } from './services/tenantPortalService';
+
+const AmlakSheets = React.lazy(() => import('./components/AmlakSheets'));
+const Monitoring = React.lazy(() => import('./components/Monitoring'));
+const Reports = React.lazy(() => import('./components/Reports'));
+const TransferManager = React.lazy(() => import('./components/TransferManager'));
+const VATReport = React.lazy(() => import('./components/VATReport'));
+const OwnerPortal = React.lazy(() => import('./components/OwnerPortal'));
+const SheetsImport = React.lazy(() => import('./components/SheetsImport'));
+const StaffChat = React.lazy(() => import('./components/StaffChat'));
+const AccountingModule = React.lazy(() => import('./components/AccountingModule'));
 
 SoundService.init();
 
@@ -92,6 +97,11 @@ const getRouteFromHash = (hash: string): string => {
   const withoutHash = normalized.startsWith('#') ? normalized.slice(1) : normalized;
   const [path] = withoutHash.split('?');
   return path || '/';
+};
+
+const isAdminLikeUser = (value: any): boolean => {
+  const role = String(value?.role || '').toUpperCase();
+  return role === 'ADMIN' || role === 'MANAGER';
 };
 
 const getPersistableControls = (): Array<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement> => {
@@ -220,9 +230,12 @@ const AppContent: React.FC = () => {
       window.removeEventListener('popstate', handler);
     };
   }, []);
-  const isOnChatPage = currentHash.replace(/\/$/, '') === '#/chat';
-  const isOnSheetsPage = getRouteFromHash(currentHash).replace(/\/$/, '') === '/amlak-sheets';
-  const isStandaloneWorkspace = isOnChatPage || isOnSheetsPage;
+  const currentRoute = getRouteFromHash(currentHash).replace(/\/$/, '');
+  const isOnChatPage = currentRoute === '/chat';
+  const isOnSheetsPage = currentRoute === '/amlak-sheets';
+  const isRemoteSupportPage = currentRoute === '/admin/remote-support';
+  const isStandaloneWorkspace = isOnChatPage || isOnSheetsPage || isRemoteSupportPage;
+  const vacationReadOnly = !!user && !isAdminLikeUser(user) && !!(user as any).onVacation;
 
   // Keep tab inputs (filters/search/forms) when switching routes.
   useEffect(() => {
@@ -331,7 +344,8 @@ const AppContent: React.FC = () => {
     
     // Start screen time tracking
     if (user) {
-      startSession(user.uid, (user as any).name || (user as any).email || 'User');
+      const userId = user.id || user.uid || 'unknown';
+      startSession(userId, (user as any).name || (user as any).email || 'User');
       
       // Update session every minute
       const interval = setInterval(() => {
@@ -345,6 +359,108 @@ const AppContent: React.FC = () => {
       };
     }
   }, [user]);
+
+  // Keep chat/remote-support presence fresh for every logged-in user, not only
+  // users who open the chat page.
+  useEffect(() => {
+    if (!user) return;
+    const userId = user.id || user.uid || 'unknown';
+    const userName = (user as any).name || (user as any).displayName || (user as any).email || 'User';
+
+    const markOnline = () => setChatPresence(userId, userName, true);
+    const markOffline = () => setChatPresence(userId, userName, false);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        markOnline();
+      } else {
+        markOffline();
+      }
+    };
+
+    markOnline();
+    const heartbeat = window.setInterval(markOnline, 45000);
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('beforeunload', markOffline);
+
+    return () => {
+      window.clearInterval(heartbeat);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('beforeunload', markOffline);
+      markOffline();
+    };
+  }, [user]);
+
+  useEffect(() => {
+    if (!user || isAdminLikeUser(user) || String((user as any).role || '').toUpperCase() === 'OWNER') return;
+    return startStaffLocationReporting(user as any);
+  }, [user?.id, user?.role]);
+
+  useEffect(() => {
+    const userId = user?.id || user?.uid;
+    if (!userId) return;
+    let cancelled = false;
+    const refreshUserFlags = async () => {
+      try {
+        const users = await getUsers({ includeDeleted: true });
+        if (cancelled) return;
+        const latest = users.find((item: any) => item.id === userId);
+        if (!latest) return;
+        const watchedKeys = ['onVacation', 'vacationNote', 'vacationUpdatedAt', 'status', 'hasSystemAccess'];
+        const changed = watchedKeys.some(key => (latest as any)[key] !== (user as any)[key]);
+        if (!changed) return;
+        const merged = { ...user, ...watchedKeys.reduce<Record<string, any>>((acc, key) => {
+          acc[key] = (latest as any)[key];
+          return acc;
+        }, {}) };
+        setUser(merged);
+        try {
+          const saved = JSON.parse(localStorage.getItem('savedUserSession') || '{}');
+          localStorage.setItem('savedUserSession', JSON.stringify({ ...saved, ...merged }));
+        } catch {
+          localStorage.setItem('savedUserSession', JSON.stringify(merged));
+        }
+      } catch {
+        // Keep the app usable if the refresh is temporarily unavailable.
+      }
+    };
+    refreshUserFlags();
+    const interval = window.setInterval(refreshUserFlags, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [user?.id, user?.uid, (user as any)?.onVacation, (user as any)?.status, (user as any)?.hasSystemAccess]);
+
+  useEffect(() => {
+    if (!vacationReadOnly) return;
+    const blockEvent = (event: Event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      (event as any).stopImmediatePropagation?.();
+    };
+    const actionSelector = 'button, input, textarea, select, [contenteditable="true"], [role="button"]';
+    const allowedSelector = '.app-sidebar, nav, .mobile-bottom-nav-wrap, [data-vacation-allow="true"], a[href]';
+    const clickHandler = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target || target.closest(allowedSelector)) return;
+      if (target.closest(actionSelector)) blockEvent(event);
+    };
+    const keyHandler = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (!target || target.closest(allowedSelector)) return;
+      if (target.closest('input, textarea, select, [contenteditable="true"]')) blockEvent(event);
+    };
+    document.addEventListener('submit', blockEvent, true);
+    document.addEventListener('click', clickHandler, true);
+    document.addEventListener('keydown', keyHandler, true);
+    document.addEventListener('paste', keyHandler as any, true);
+    return () => {
+      document.removeEventListener('submit', blockEvent, true);
+      document.removeEventListener('click', clickHandler, true);
+      document.removeEventListener('keydown', keyHandler, true);
+      document.removeEventListener('paste', keyHandler as any, true);
+    };
+  }, [vacationReadOnly]);
 
   // Initialize push notifications for ALL users (so admin tokens are registered from all devices)
   useEffect(() => {
@@ -538,7 +654,7 @@ const AppContent: React.FC = () => {
     return <Login onLogin={(u: any) => {
       // Save session to localStorage so login persists across page reloads
       try {
-        const sessionData = { id: u.id || u.uid, name: u.name || u.displayName, email: u.email, role: u.role, buildingId: u.buildingId, buildingIds: u.buildingIds, hasSystemAccess: u.hasSystemAccess, status: u.status, bookId: u.bookId };
+        const sessionData = { id: u.id || u.uid, name: u.name || u.displayName, email: u.email, role: u.role, buildingId: u.buildingId, buildingIds: u.buildingIds, hasSystemAccess: u.hasSystemAccess, status: u.status, bookId: u.bookId, onVacation: u.onVacation, vacationNote: u.vacationNote, vacationUpdatedAt: u.vacationUpdatedAt };
         localStorage.setItem('savedUserSession', JSON.stringify(sessionData));
       } catch { /* ignore */ }
       setUser(u);
@@ -554,7 +670,7 @@ const AppContent: React.FC = () => {
     <div className={`${darkMode ? 'dark' : 'light'} app-theme`} dir={isRTL ? 'rtl' : 'ltr'}>
       <OfflineBanner />
       <div className={`app-shell flex min-h-screen bg-gradient-to-br from-green-50 via-emerald-50 to-teal-50 dark:from-gray-900 dark:via-gray-900 dark:to-gray-900 dark:bg-none font-sans text-emerald-900 dark:text-slate-100 transition-colors duration-300 ${isRTL ? 'flex-row-reverse' : ''}`}>
-        {!isOnSheetsPage && <Sidebar user={user} onLogout={handleLogout} onToggleCollapse={setSidebarCollapsed} pendingApprovals={pendingApprovals} />}
+        {!isOnSheetsPage && !isRemoteSupportPage && <Sidebar user={user} onLogout={handleLogout} onToggleCollapse={setSidebarCollapsed} pendingApprovals={pendingApprovals} />}
         {/* Dedicated mobile top bar (hidden on desktop) */}
         {!isStandaloneWorkspace && (
           <MobileHeader
@@ -567,7 +683,13 @@ const AppContent: React.FC = () => {
             pendingApprovals={pendingApprovals}
           />
         )}
-        <main className={`app-main flex-1 ${isOnSheetsPage ? '' : (sidebarCollapsed ? (isRTL ? 'md:mr-20' : 'md:ml-20') : (isRTL ? 'md:mr-72' : 'md:ml-72'))} ${isRTL ? 'mr-0' : 'ml-0'} ${isStandaloneWorkspace ? 'overflow-hidden h-screen' : 'md:p-8 p-3 mobile-main-top-pad mobile-main-bottom-pad overflow-y-visible md:overflow-y-auto'} transition-all duration-300`}>
+        <main className={`app-main flex-1 ${isStandaloneWorkspace ? '' : (sidebarCollapsed ? (isRTL ? 'md:mr-20' : 'md:ml-20') : (isRTL ? 'md:mr-72' : 'md:ml-72'))} ${isRTL ? 'mr-0' : 'ml-0'} ${isStandaloneWorkspace ? 'overflow-hidden h-screen' : 'md:p-8 p-3 mobile-main-top-pad mobile-main-bottom-pad overflow-y-visible md:overflow-y-auto'} transition-all duration-300`}>
+          {vacationReadOnly && (
+            <div className="sticky top-0 z-[70] mx-1 mb-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm font-black text-sky-800 shadow-sm">
+              Vacation mode is on. Your account is view-only until admin turns vacation mode off.
+              {(user as any).vacationNote ? <span className="ml-2 font-bold text-sky-700">{(user as any).vacationNote}</span> : null}
+            </div>
+          )}
           {!isStandaloneWorkspace && (
             <GlobalSearchWithResults searching={searching} searchResults={searchResults} setSearching={setSearching} setSearchResults={setSearchResults} />
           )}
@@ -613,6 +735,7 @@ const AppContent: React.FC = () => {
             )}
 
             <ErrorBoundary>
+              <React.Suspense fallback={<div className="min-h-[40vh] grid place-items-center text-sm font-bold text-slate-500">Loading...</div>}>
               <Routes>
                 {user?.role === UserRole.ENGINEER && user.role !== UserRole.ADMIN ? (
                   <>
@@ -675,25 +798,28 @@ const AppContent: React.FC = () => {
                         <Route path="/admin/bulk-import" element={<BulkImportCustomers />} />
                         <Route path="/admin/sheets-import" element={<SheetsImport currentUser={user} />} />
                         <Route path="/admin/books" element={<BookManager currentUser={user} />} />
+                        <Route path="/admin/remote-support" element={<AdminRemoteSupport currentUser={user} />} />
                       </>
                     )}
                     <Route path="*" element={<Navigate to="/" />} />
                   </>
                 )}
               </Routes>
+              </React.Suspense>
             </ErrorBoundary>
           </div>
         </main>
-        {!isOnSheetsPage && (
+        {!isOnSheetsPage && !isRemoteSupportPage && (
           <div className="md:hidden fixed bottom-0 left-0 right-0 z-50 mobile-bottom-nav-wrap">
             <BottomNav user={user} onMenuClick={() => setMobileMenuOpen(true)} pendingApprovals={pendingApprovals} />
           </div>
         )}
-        {!isOnSheetsPage && <MobileMenu user={user} isOpen={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} onLogout={handleLogout} pendingApprovals={pendingApprovals} />}
+        {!isOnSheetsPage && !isRemoteSupportPage && <MobileMenu user={user} isOpen={mobileMenuOpen} onClose={() => setMobileMenuOpen(false)} onLogout={handleLogout} pendingApprovals={pendingApprovals} />}
         <NotificationPanel isOpen={notifOpen} onClose={() => setNotifOpen(false)} notifications={notif.notifications} onMarkRead={notif.markRead} onMarkAllRead={notif.markAllRead} onDismiss={notif.dismiss} onDismissAll={notif.dismissAll} />
-        {!isOnSheetsPage && <QuickActions user={user} isOpen={quickActionsOpen} onClose={() => setQuickActionsOpen(false)} />}
-        {!isOnSheetsPage && <FloatingToolsDock user={user} />}
-        {!isOnSheetsPage && <FloatingCalculator />}
+        {!isOnSheetsPage && !isRemoteSupportPage && <QuickActions user={user} isOpen={quickActionsOpen} onClose={() => setQuickActionsOpen(false)} />}
+        {!isOnSheetsPage && !isRemoteSupportPage && <FloatingToolsDock user={user} />}
+        {!isOnSheetsPage && !isRemoteSupportPage && <FloatingCalculator />}
+        <RemoteSupportListener currentUser={user} />
       </div>
     </div>
   );
@@ -712,7 +838,7 @@ const AppContent: React.FC = () => {
             !user ? (
               <Login onLogin={(u: any) => {
                 try {
-                  const sessionData = { id: u.id || u.uid, name: u.name || u.displayName, email: u.email, role: u.role, buildingId: u.buildingId, buildingIds: u.buildingIds, hasSystemAccess: u.hasSystemAccess, status: u.status, bookId: u.bookId };
+                  const sessionData = { id: u.id || u.uid, name: u.name || u.displayName, email: u.email, role: u.role, buildingId: u.buildingId, buildingIds: u.buildingIds, hasSystemAccess: u.hasSystemAccess, status: u.status, bookId: u.bookId, onVacation: u.onVacation, vacationNote: u.vacationNote, vacationUpdatedAt: u.vacationUpdatedAt };
                   localStorage.setItem('savedUserSession', JSON.stringify(sessionData));
                 } catch { }
                 setUser(u);

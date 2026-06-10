@@ -187,7 +187,7 @@ function templateName(template: AmlakSheetTemplateKind): string {
 function templateHeaders(template: AmlakSheetTemplateKind): string[] {
   const kind = canonicalKind(template);
   if (kind === 'expense') {
-    return ['Date', 'Category', 'Target', 'Notes / Period', 'Details', 'Payment Method', 'Amount', 'Extra', 'Entered By', 'Status'];
+    return ['Date', 'Category', 'Target', 'Month', 'Details', 'Payment Method', 'Amount', 'Extra', 'Entered By', 'Status'];
   }
   if (kind === 'ownerExpense') {
     return ['Date', 'Owner', 'Details', 'Payment Method', 'Amount', 'Entered By', 'Status'];
@@ -246,7 +246,7 @@ export function createAmlakPostingTemplateSheet(
     sheetKind: kind,
     buildingId: building?.id,
     buildingName: building?.name,
-    rowCount: 100,
+    rowCount: 15,
     colCount: headers.length,
     cells,
     rowsMeta: {},
@@ -595,7 +595,7 @@ export function validateWorksheetPostingRows(
       ownerId: postType === 'OWNER_EXPENSE' ? person?.id : undefined,
       ownerName: postType === 'OWNER_EXPENSE' ? person?.name || employeeOrOwner : undefined,
       borrowingType: postType === 'BORROWING' ? 'BORROW' : undefined,
-      salaryPeriod: postType === 'SALARY' && date ? date.slice(0, 7) : undefined,
+      salaryPeriod: postType === 'SALARY' ? (related || (date ? date.slice(0, 7) : undefined)) : undefined,
       vendorName: kind === 'vatExpense' ? vendorName : (category === ExpenseCategory.MAINTENANCE || category === ExpenseCategory.VENDOR_PAYMENT ? target || undefined : undefined),
       vendorVATNumber: kind === 'vatExpense' ? vendorVAT : undefined,
       vendorRefNo: kind === 'vatExpense' ? vendorRefNo : undefined,
@@ -604,7 +604,7 @@ export function validateWorksheetPostingRows(
       discountAmount: kind === 'fees' ? Math.max(0, cellNumber(sheet, config.mapping.discount, row)) || undefined : undefined,
       details: details || (
         category === ExpenseCategory.SALARY || category === 'Salary'
-          ? `Salary ${date ? date.slice(0, 7) : ''} - ${person?.name || target}`.trim()
+          ? `Salary ${related || (date ? date.slice(0, 7) : '')} - ${person?.name || target}`.trim()
           : category === ExpenseCategory.PROPERTY_RENT || category === 'Property Rent'
             ? `Property Rent - ${targetBuilding?.name || target}`
             : `${templateName(kind)}${unit ? ` - Unit ${unit}` : ''}`
