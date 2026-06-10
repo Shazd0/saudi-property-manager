@@ -23,6 +23,7 @@ import {
   getCustomIncomeCategories,
   getTransactions,
   getUsers,
+  getUsersAcrossBooks,
   getVendors,
   listenAmlakWorkbooks,
   saveAmlakWorkbook,
@@ -1659,6 +1660,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
   const [contracts, setContracts] = useState<Contract[]>([]);
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const [users, setUsers] = useState<User[]>([]);
+  const [ownerStakeUsers, setOwnerStakeUsers] = useState<User[]>([]);
   const [customers, setCustomers] = useState<any[]>([]);
   const [vendors, setVendors] = useState<any[]>([]);
   const [customExpenseCategories, setCustomExpenseCategories] = useState<string[]>([]);
@@ -1730,14 +1732,14 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
       const key = cleanName.toLowerCase();
       if (!byName.has(key)) byName.set(key, { id: String(id || key), name: cleanName });
     };
-    users
+    ownerStakeUsers
       .filter((u: any) => {
         const stakeIds = Array.isArray(u.ownerBuildingIds) ? u.ownerBuildingIds.filter(Boolean) : [];
         return stakeIds.length > 0 && (u.isOwner || String(u.role).toUpperCase() === 'OWNER');
       })
       .forEach((u: any) => addOwner(u.id, u.name || u.email || u.ownerName));
     return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [users]);
+  }, [ownerStakeUsers]);
   const sharedUsers = useMemo(() => {
     if (!selectedBuilding) return [];
     return users.filter((u: any) => {
@@ -1893,12 +1895,13 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
     (async () => {
       setLoading(true);
       try {
-        const [b, wb, c, tx, u, cust, v, expenseCats, incomeCats] = await Promise.all([
+        const [b, wb, c, tx, u, ownerUsers, cust, v, expenseCats, incomeCats] = await Promise.all([
           getBuildings(),
           getAmlakWorkbooks(),
           getContracts({ includeDeleted: true }),
           getTransactions(),
           getUsers(),
+          getUsersAcrossBooks({ includeDeleted: true }).catch(() => []),
           getCustomers(),
           getVendors(),
           getCustomExpenseCategories().catch(() => []),
@@ -1908,6 +1911,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
         setContracts(c || []);
         setTransactions(tx || []);
         setUsers(u || []);
+        setOwnerStakeUsers(((ownerUsers || []) as User[]).filter((user: any) => !user?.deleted));
         setCustomers(cust || []);
         setVendors((v || []).filter((vendor: any) => vendor?.status !== 'Inactive'));
         setCustomExpenseCategories(Array.isArray(expenseCats) ? expenseCats : []);
@@ -3662,15 +3666,18 @@ const SheetCellBase: React.FC<SheetCellProps> = ({
   if (column.key === 'date' || column.key === 'dueDate' || column.key === 'paidDate') {
     if (column.key === 'paidDate') {
       return (
-        <div {...cellWrapperProps} className={cellClass}>
+        <div {...cellWrapperProps} className={`${cellClass} relative`}>
           <input
             {...controlProps}
             disabled={disabled}
             type="date"
             value={draftValue}
             onChange={e => handleControlChange(e.target.value, true)}
-            className={`${inputClass} text-center tabular-nums`}
+            onClick={e => (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.()}
+            className={`${inputClass} border-slate-200 bg-white pr-8 text-center tabular-nums`}
+            title="Pick paid date"
           />
+          <CalendarDays size={13} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600" />
         </div>
       );
     }
