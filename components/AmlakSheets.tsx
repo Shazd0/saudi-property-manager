@@ -2046,7 +2046,100 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
     };
   }, [dirty, activeWorkbook]);
 
-  const updateWorkbook = (next: AmlakWorkbook) => {
+  const pushUndoSnapshot = (workbook: AmlakWorkbook) => {
+    const snapshot = cloneWorkbookSnapshot(workbook);
+    setUndoStack(previous => {
+      const next = [...previous, snapshot].slice(-HISTORY_LIMIT);
+      undoStackRef.current = next;
+      return next;
+    });
+    setRedoStack([]);
+    redoStackRef.current = [];
+  };
+
+  const restoreWorkbookSnapshot = (snapshot: AmlakWorkbook) => {
+    const restored = {
+      ...cloneWorkbookSnapshot(snapshot),
+      updatedAt: Date.now(),
+    };
+    activeWorkbookRef.current = restored;
+    dirtyRef.current = true;
+    setWorkbooks(prev => prev.map(w => w.id === restored.id ? restored : w));
+    setDirty(true);
+    setSelectedRows(new Set());
+    setSelectedCells(new Set());
+    setSheetRowMenu(null);
+    lastSelectedCellRef.current = null;
+  };
+
+  const undoSheetChange = () => {
+    const current = activeWorkbookRef.current?.id === activeWorkbook?.id ? activeWorkbookRef.current : activeWorkbook;
+    const previous = undoStackRef.current[undoStackRef.current.length - 1];
+    if (!current || !previous) return;
+    setUndoStack(stack => {
+      const next = stack.slice(0, -1);
+      undoStackRef.current = next;
+      return next;
+    });
+    setRedoStack(stack => {
+      const next = [...stack, cloneWorkbookSnapshot(current)].slice(-HISTORY_LIMIT);
+      redoStackRef.current = next;
+      return next;
+    });
+    restoreWorkbookSnapshot(previous);
+    showInfo('Undid last sheet change');
+  };
+
+  const redoSheetChange = () => {
+    const current = activeWorkbookRef.current?.id === activeWorkbook?.id ? activeWorkbookRef.current : activeWorkbook;
+    const nextSnapshot = redoStackRef.current[redoStackRef.current.length - 1];
+    if (!current || !nextSnapshot) return;
+    setRedoStack(stack => {
+      const next = stack.slice(0, -1);
+      redoStackRef.current = next;
+      return next;
+    });
+    setUndoStack(stack => {
+      const next = [...stack, cloneWorkbookSnapshot(current)].slice(-HISTORY_LIMIT);
+      undoStackRef.current = next;
+      return next;
+    });
+    restoreWorkbookSnapshot(nextSnapshot);
+    showInfo('Redid sheet change');
+  };
+
+  useEffect(() => {
+    setUndoStack([]);
+    setRedoStack([]);
+    undoStackRef.current = [];
+    redoStackRef.current = [];
+  }, [activeWorkbook?.id]);
+
+  useEffect(() => {
+    const onKey = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      const tag = target?.tagName?.toUpperCase();
+      const editingText = tag === 'INPUT' || tag === 'TEXTAREA' || target?.isContentEditable;
+      const commandKey = event.metaKey || event.ctrlKey;
+      if (!commandKey || event.altKey || editingText) return;
+      const key = event.key.toLowerCase();
+      if (key === 'z' && !event.shiftKey) {
+        event.preventDefault();
+        undoSheetChange();
+      } else if ((key === 'z' && event.shiftKey) || key === 'y') {
+        event.preventDefault();
+        redoSheetChange();
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [activeWorkbook?.id, showInfo]);
+
+  const updateWorkbook = (next: AmlakWorkbook, options?: { trackHistory?: boolean }) => {
+    const previous = activeWorkbookRef.current?.id === next.id ? activeWorkbookRef.current : activeWorkbook;
+    if (options?.trackHistory && previous?.id === next.id && previous !== next) {
+      pushUndoSnapshot(previous);
+    }
     if (activeWorkbookRef.current?.id === next.id) activeWorkbookRef.current = next;
     dirtyRef.current = true;
     setWorkbooks(prev => prev.map(w => w.id === next.id ? next : w));
@@ -2062,7 +2155,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
       updatedAt: Date.now(),
     };
     activeWorkbookRef.current = nextWorkbook;
-    updateWorkbook(nextWorkbook);
+    updateWorkbook(nextWorkbook, { trackHistory: true });
   };
 
   const manualSheetEmptyRowLimit = (sheet: AmlakWorksheet | undefined) => Math.max(0, Number(sheet?.visibleEmptyRowLimit ?? 10) || 0);
@@ -3025,6 +3118,24 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
             )}
             <button onClick={exportCurrentSheetPdf} className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl border border-emerald-200 bg-white/95 px-3 sm:px-4 py-2.5 text-sm font-black text-emerald-700 shadow-sm active:scale-[0.98]">
               <Printer size={16} /> PDF
+            </button>
+            <button
+              type="button"
+              onClick={undoSheetChange}
+              disabled={!undoStack.length || saving}
+              title="Undo last sheet change"
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white/95 px-3 sm:px-4 py-2.5 text-sm font-black text-slate-700 shadow-sm disabled:bg-slate-50 disabled:text-slate-400 disabled:opacity-60 active:scale-[0.98]"
+            >
+              <Undo2 size={16} /> Undo
+            </button>
+            <button
+              type="button"
+              onClick={redoSheetChange}
+              disabled={!redoStack.length || saving}
+              title="Redo sheet change"
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl border border-slate-200 bg-white/95 px-3 sm:px-4 py-2.5 text-sm font-black text-slate-700 shadow-sm disabled:bg-slate-50 disabled:text-slate-400 disabled:opacity-60 active:scale-[0.98]"
+            >
+              <Redo2 size={16} /> Redo
             </button>
             <button onClick={() => void saveWorkbook(false)} disabled={saving} className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-emerald-600 to-green-600 text-white px-3 sm:px-4 py-2.5 text-sm font-black shadow-lg shadow-emerald-100 disabled:opacity-60 active:scale-[0.98]">
               <Save size={16} /> {saving ? 'Saving...' : dirty ? 'Save draft' : 'Saved'}
