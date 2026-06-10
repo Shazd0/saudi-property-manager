@@ -1731,29 +1731,13 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
       if (!byName.has(key)) byName.set(key, { id: String(id || key), name: cleanName });
     };
     users
-      .filter((u: any) => u.isOwner || String(u.role).toUpperCase() === 'OWNER' || Array.isArray((u as any).ownerBuildingIds))
+      .filter((u: any) => {
+        const stakeIds = Array.isArray(u.ownerBuildingIds) ? u.ownerBuildingIds.filter(Boolean) : [];
+        return stakeIds.length > 0 && (u.isOwner || String(u.role).toUpperCase() === 'OWNER');
+      })
       .forEach((u: any) => addOwner(u.id, u.name || u.email || u.ownerName));
-    customers.forEach((customer: any) => {
-      if (customer?.isOwner || customer?.ownerBuildingIds || String(customer?.type || '').toUpperCase() === 'OWNER') {
-        addOwner(customer.id, customer.nameEn || customer.nameAr || customer.name);
-      }
-    });
-    buildings.forEach((building: any) => {
-      addOwner(building.ownerId || building.id, building.ownerName || building.owner || building.landlordName || building.lease?.landlordName);
-    });
-    transactions.forEach((tx: any) => {
-      if (tx?.deleted) return;
-      if (tx.ownerName || tx.ownerId) addOwner(tx.ownerId || tx.ownerName, tx.ownerName);
-    });
-    activeWorkbook?.sheets
-      .filter(sheet => (sheet.sheetKind === 'ownerExpense'))
-      .forEach(sheet => {
-        for (let row = 2; row <= sheet.rowCount; row++) {
-          addOwner(`sheet-owner-${row}-${cellRaw(sheet, 'B', row)}`, cellRaw(sheet, 'B', row));
-        }
-      });
     return Array.from(byName.values()).sort((a, b) => a.name.localeCompare(b.name));
-  }, [users, customers, buildings, transactions, activeWorkbook?.id, activeWorkbook?.updatedAt]);
+  }, [users]);
   const sharedUsers = useMemo(() => {
     if (!selectedBuilding) return [];
     return users.filter((u: any) => {
