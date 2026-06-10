@@ -260,21 +260,6 @@ function nextMonthPeriod(period: string): string {
   return dateToLocalStr(date).slice(0, 7);
 }
 
-function parseCompactSheetDate(value: string): string {
-  const text = String(value || '').trim();
-  if (!text) return '';
-  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) return text;
-  const match = text.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})$/);
-  if (!match) return '';
-  const day = Number(match[1]);
-  const month = Number(match[2]);
-  const year = Number(match[3].length === 2 ? `20${match[3]}` : match[3]);
-  if (!Number.isFinite(day) || !Number.isFinite(month) || !Number.isFinite(year)) return '';
-  const candidate = new Date(year, month - 1, day);
-  if (candidate.getFullYear() !== year || candidate.getMonth() !== month - 1 || candidate.getDate() !== day) return '';
-  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-}
-
 function monthLabel(monthKey: string): string {
   const [year, month] = monthKey.split('-');
   const index = Number(month) - 1;
@@ -3435,7 +3420,6 @@ const SheetCellBase: React.FC<SheetCellProps> = ({
 }) => {
   const value = cellRaw(sheet, column.col, row);
   const [draftValue, setDraftValue] = useState(value);
-  const [compactDateDraft, setCompactDateDraft] = useState(formatCompactSheetDate(value));
   const editingRef = useRef(false);
   const commitTimerRef = useRef<number | null>(null);
   const categoryValue = cellRaw(sheet, sheetColumns(kind).find(c => c.key === 'category')?.col, row);
@@ -3445,7 +3429,6 @@ const SheetCellBase: React.FC<SheetCellProps> = ({
   useEffect(() => {
     if (!editingRef.current) {
       setDraftValue(value);
-      setCompactDateDraft(formatCompactSheetDate(value));
     }
   }, [value]);
   useEffect(() => () => {
@@ -3466,34 +3449,6 @@ const SheetCellBase: React.FC<SheetCellProps> = ({
   const handleControlChange = (nextValue: string, immediate = false) => {
     setDraftValue(nextValue);
     commitDraft(nextValue, immediate);
-  };
-  const handleCompactDateChange = (nextValue: string) => {
-    setCompactDateDraft(nextValue);
-    const parsed = parseCompactSheetDate(nextValue);
-    if (parsed) {
-      setDraftValue(parsed);
-      commitDraft(parsed, true);
-    } else if (!nextValue.trim()) {
-      setDraftValue('');
-      commitDraft('', true);
-    }
-  };
-  const flushCompactDateDraft = () => {
-    editingRef.current = false;
-    const parsed = parseCompactSheetDate(compactDateDraft);
-    if (parsed) {
-      setDraftValue(parsed);
-      setCompactDateDraft(formatCompactSheetDate(parsed));
-      if (parsed !== value) onChange(parsed);
-      return;
-    }
-    if (!compactDateDraft.trim()) {
-      setDraftValue('');
-      if (value) onChange('');
-      return;
-    }
-    setCompactDateDraft(formatCompactSheetDate(value));
-    setDraftValue(value);
   };
   const handleAmountChange = (nextValue: string) => {
     setDraftValue(nextValue);
@@ -3551,10 +3506,6 @@ const SheetCellBase: React.FC<SheetCellProps> = ({
     if (draftValue !== value) onChange(draftValue);
   };
   const flushActiveControl = () => {
-    if (column.key === 'date' || column.key === 'dueDate' || column.key === 'paidDate') {
-      flushCompactDateDraft();
-      return;
-    }
     if (column.key === 'unit') {
       flushUnitDraft();
       return;
@@ -3664,35 +3615,17 @@ const SheetCellBase: React.FC<SheetCellProps> = ({
     );
   }
   if (column.key === 'date' || column.key === 'dueDate' || column.key === 'paidDate') {
-    if (column.key === 'paidDate') {
-      return (
-        <div {...cellWrapperProps} className={`${cellClass} relative`}>
-          <input
-            {...controlProps}
-            disabled={disabled}
-            type="date"
-            value={draftValue}
-            onChange={e => handleControlChange(e.target.value, true)}
-            onClick={e => (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.()}
-            className={`${inputClass} border-slate-200 bg-white pr-8 text-center tabular-nums`}
-            title="Pick paid date"
-          />
-          <CalendarDays size={13} className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-emerald-600" />
-        </div>
-      );
-    }
     return (
       <div {...cellWrapperProps} className={cellClass}>
         <input
           {...controlProps}
           disabled={disabled}
-          type="text"
-          inputMode="numeric"
-          value={compactDateDraft}
-          onChange={e => handleCompactDateChange(e.target.value)}
-          onBlur={flushCompactDateDraft}
-          className={`${inputClass} text-center tabular-nums`}
-          placeholder="dd-m-yy"
+          type="date"
+          value={draftValue}
+          onChange={e => handleControlChange(e.target.value, true)}
+          onClick={e => (e.currentTarget as HTMLInputElement & { showPicker?: () => void }).showPicker?.()}
+          className={`${inputClass} border-slate-200 bg-white text-center tabular-nums`}
+          title={`Pick ${column.label.toLowerCase()}`}
         />
       </div>
     );
