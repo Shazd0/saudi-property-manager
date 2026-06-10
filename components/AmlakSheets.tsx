@@ -1,5 +1,5 @@
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Banknote, CalendarDays, CheckCircle, ChevronLeft, ChevronRight, CircleDollarSign, Download, Eye, FileSpreadsheet, Home, Landmark, Loader2, Lock, Maximize2, Minimize2, Plus, Printer, Save, Search, UsersRound, Wallet } from 'lucide-react';
+import { Banknote, CalendarDays, CheckCircle, ChevronLeft, ChevronRight, CircleDollarSign, Download, Eye, FileSpreadsheet, Home, Landmark, Loader2, Lock, Maximize2, Minimize2, Plus, Printer, Redo2, Save, Search, Undo2, UsersRound, Wallet } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import {
   AmlakSheetKind,
@@ -167,6 +167,12 @@ const isAdminUser = (user: User) => user.role === UserRole.ADMIN || String(user.
 const isManagerUser = (user: User) => user.role === UserRole.MANAGER || String(user.role) === 'MANAGER';
 const AMLAK_FIRST_MONTH = '2026-01';
 const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+const HISTORY_LIMIT = 30;
+
+function cloneWorkbookSnapshot(workbook: AmlakWorkbook): AmlakWorkbook {
+  if (typeof structuredClone === 'function') return structuredClone(workbook);
+  return JSON.parse(JSON.stringify(workbook)) as AmlakWorkbook;
+}
 
 function currentMonthKey(): string {
   return dateToLocalStr(new Date()).slice(0, 7);
@@ -1662,6 +1668,8 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
   const [sheetSearchTerm, setSheetSearchTerm] = useState('');
   const deferredSheetSearchTerm = useDeferredValue(sheetSearchTerm);
   const [sheetFocusMode, setSheetFocusMode] = useState(false);
+  const [undoStack, setUndoStack] = useState<AmlakWorkbook[]>([]);
+  const [redoStack, setRedoStack] = useState<AmlakWorkbook[]>([]);
   const [addRowsCount, setAddRowsCount] = useState(15);
   const [sheetRowMenu, setSheetRowMenu] = useState<{ row: number; x: number; y: number } | null>(null);
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
@@ -1672,6 +1680,8 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
   const activeWorkbookRef = useRef<AmlakWorkbook | undefined>(undefined);
   const activeSheetIdRef = useRef<string | undefined>(undefined);
   const lastSelectedCellRef = useRef<{ row: number; key: ColumnKind } | null>(null);
+  const undoStackRef = useRef<AmlakWorkbook[]>([]);
+  const redoStackRef = useRef<AmlakWorkbook[]>([]);
 
   const isAdmin = isAdminUser(currentUser);
   const canSeeAllBuildings = isAdmin || isManagerUser(currentUser);
