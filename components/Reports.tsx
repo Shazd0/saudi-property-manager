@@ -1,12 +1,13 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
-import { Transaction, TransactionType, TransactionStatus, Contract, Building, Customer, ExpenseCategory, PaymentMethod, UserRole, User } from '../types';
-import { normalizePaymentMethod, normalizeTransactionType } from '../utils/transactionUtils';
+import { Transaction, TransactionType, TransactionStatus, Contract, Building, Customer, ExpenseCategory, PaymentMethod, UserRole, User, Bank } from '../types';
+import { normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit } from '../utils/transactionUtils';
 import { addMoneyFingerprint, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import {
   getTransactions, getContracts, getBuildings, getCustomers,
   getOccupancyStats, getIncomeExpenseSummary, getIncomeExpenseByPeriod,
   getSalaryReport, getMaintenanceReport, getVendors, getTransfers, getSettings,
+  getBanks,
   getTransactionsAllBooks, getBuildingsAllBooks, getTransfersAllBooks, getUsersAcrossBooks,
   ownerStakeBuildingIdsMatch,
 } from '../services/firestoreService';
@@ -26,7 +27,7 @@ import {
 } from 'lucide-react';
 
 // ── Types ──
-type ReportTab = 'overview' | 'financial' | 'occupancy' | 'tenant' | 'expense' | 'salary' | 'building' | 'collection' | 'ownerExpense';
+type ReportTab = 'overview' | 'financial' | 'occupancy' | 'tenant' | 'expense' | 'salary' | 'building' | 'collection' | 'bank' | 'ownerExpense';
 type DatePreset =
   | 'thisMonth'
   | 'lastMonth'
@@ -46,6 +47,7 @@ interface KPICard {
 // ── Helpers ──
 const fmt = (n: number) => new Intl.NumberFormat('en-SA', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(n);
 const fmtK = (n: number) => n >= 1_000_000 ? (n / 1_000_000).toFixed(1) + 'M' : n >= 1_000 ? (n / 1_000).toFixed(1) + 'K' : fmt(n);
+const bankKey = (value: unknown): string => String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
 
 const getDateRange = (preset: DatePreset): { start: string; end: string } => {
   const now = new Date();
@@ -482,6 +484,10 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   /** When specific buildings are selected, Head Office ↔ Owner treasury synthetics are off unless this is true. */
   const [ownerExpenseIncludeTreasury, setOwnerExpenseIncludeTreasury] = useState(false);
   const [ownerFilter, setOwnerFilter] = useState('all');
+  const [bankReportFilter, setBankReportFilter] = useState('all');
+  const [bankMonthFilter, setBankMonthFilter] = useState('all');
+  const [bankMovementFilter, setBankMovementFilter] = useState<'all' | 'in' | 'out'>('all');
+  const [bankReportSearch, setBankReportSearch] = useState('');
   const [showFilters, setShowFilters] = useState(false);
   const [collectionSearch, setCollectionSearch] = useState('');
   const [selectedTenantHistory, setSelectedTenantHistory] = useState<{ id: string; name: string; transactions: Transaction[] } | null>(null);
@@ -495,6 +501,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const [occupancy, setOccupancy] = useState({ totalUnits: 0, occupiedUnits: 0, percentage: 0 });
   const [vendors, setVendors] = useState<any[]>([]);
   const [transfers, setTransfers] = useState<any[]>([]);
+  const [banks, setBanks] = useState<Bank[]>([]);
   /** Main Book only: owner-related txs from other partitions for Owner Expense report */
   const [ownerSupplementTxs, setOwnerSupplementTxs] = useState<Transaction[]>([]);
   const [ownerSupplementTransfers, setOwnerSupplementTransfers] = useState<any[]>([]);
@@ -563,10 +570,11 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
   const loadData = async () => {
     setLoading(true);
     try {
-      const [txs, cons, blds, custs, usrs, occ, vnds, trsf, sett] = await Promise.all([
+      const [txs, cons, blds, custs, usrs, occ, vnds, trsf, sett, bks] = await Promise.all([
         getTransactions(), getContracts(), getBuildings(),
         getCustomers({ acrossBooks: true }), getUsersAcrossBooks(), getOccupancyStats(), getVendors(), getTransfers({}),
-        getSettings().catch(() => null)
+        getSettings().catch(() => null),
+        getBanks().catch(() => []),
       ]);
       setTransactions(txs as Transaction[]);
       setContracts(cons as Contract[]);
@@ -577,6 +585,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
       setVendors(vnds as any[]);
       setTransfers(trsf as any[]);
       setReportSettings(sett || null);
+      setBanks((bks || []) as Bank[]);
 
       if (!(activeBookId === 'default' && activeTab === 'ownerExpense')) {
         setOwnerSupplementTxs([]);
@@ -1042,6 +1051,316 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     const vatPaid = expenses.filter(t => t.vatAmount).reduce((s, t) => s + (Number(t.vatAmount) || 0), 0);
     return { collected: vatCollected, paid: vatPaid, net: vatCollected - vatPaid };
   }, [income, expenses]);
+
+  const bankReportData = useMemo(() => {
+    type BankMovement = {
+      id: string;
+      date: string;
+      bankName: string;
+      type: string;
+      direction: 'in' | 'out';
+      amount: number;
+      signedAmount: number;
+      details: string;
+      building: string;
+      method: string;
+      status: string;
+    };
+    type BankSummary = {
+      key: string;
+      name: string;
+      iban: string;
+      opening: number;
+      income: number;
+      expense: number;
+      closing: number;
+      transactionCount: number;
+      movements: BankMovement[];
+    };
+    const selectedMonthStart = bankMonthFilter !== 'all' ? `${bankMonthFilter}-01` : '';
+    const selectedMonthEnd = selectedMonthStart
+      ? new Date(Number(bankMonthFilter.slice(0, 4)), Number(bankMonthFilter.slice(5, 7)), 0).toISOString().slice(0, 10)
+      : '';
+    const periodStart = selectedMonthStart || '';
+    const periodEnd = selectedMonthEnd || '9999-12-31';
+    const search = bankReportSearch.trim().toLowerCase();
+    const unassignedBankName = 'Unassigned Bank';
+
+    const bankNames = new Map<string, { name: string; iban: string }>();
+    const addBankName = (name: any, iban = '') => {
+      const clean = String(name || '').trim();
+      const key = bankKey(clean);
+      if (!key) return;
+      if (!bankNames.has(key)) bankNames.set(key, { name: clean, iban });
+      else if (iban && !bankNames.get(key)?.iban) bankNames.set(key, { name: bankNames.get(key)!.name, iban });
+    };
+
+    banks.forEach(b => addBankName(b.name, b.iban));
+    buildings.forEach(b => addBankName((b as any).bankName));
+    transactions.forEach((t: any) => {
+      addBankName(t.bankName);
+      addBankName(t.fromBankName);
+      addBankName(t.toBankName);
+    });
+    transfers.forEach((tr: any) => {
+      addBankName(tr.bankName);
+      addBankName(tr.fromBankName);
+      addBankName(tr.toBankName);
+    });
+
+    const summaries = new Map<string, BankSummary>();
+    const ensure = (name: string): BankSummary => {
+      const key = bankKey(name);
+      const configured = bankNames.get(key);
+      if (!summaries.has(key)) {
+        summaries.set(key, {
+          key,
+          name: configured?.name || name,
+          iban: configured?.iban || '',
+          opening: 0,
+          income: 0,
+          expense: 0,
+          closing: 0,
+          transactionCount: 0,
+          movements: [],
+        });
+      }
+      return summaries.get(key)!;
+    };
+
+    bankNames.forEach((_, key) => ensure(bankNames.get(key)!.name));
+
+    const openingBalancesByBuilding = (reportSettings?.openingBalancesByBuilding || {}) as Record<string, { cash?: number; bank?: number }>;
+    Object.entries(openingBalancesByBuilding).forEach(([buildingId, row]) => {
+      if (buildingFilter !== 'all' && String(buildingId) !== String(buildingFilter)) return;
+      const bankAmount = Number(row?.bank) || 0;
+      if (!bankAmount) return;
+      const building = buildings.find(b => String(b.id) === String(buildingId));
+      const bankName = String((building as any)?.bankName || '').trim();
+      if (!bankName) return;
+      const summary = ensure(bankName);
+      summary.opening += bankAmount;
+    });
+
+    const isApprovedBankRow = (row: any) => {
+      if (!row || row.deleted || row.isReversal || row.paymentMethod === 'TREASURY_REVERSAL') return false;
+      const status = String(row.status || TransactionStatus.APPROVED).toUpperCase();
+      return status === TransactionStatus.APPROVED || status === 'COMPLETED' || !row.status;
+    };
+    const passesBuilding = (row: any) => {
+      if (buildingFilter === 'all') return true;
+      const bid = String(
+        row.buildingId ||
+        (row.fromType === 'BUILDING' ? row.fromId : '') ||
+        (row.toType === 'BUILDING' ? row.toId : ''),
+      );
+      const bf = String(buildingFilter);
+      return bid === bf || rawIdSegment(bid) === rawIdSegment(bf) || bid === rawIdSegment(bf);
+    };
+    const buildingNameFor = (row: any) =>
+      row.buildingName ||
+      buildings.find(b => String(b.id) === String(row.buildingId || '') || rawIdSegment(String(b.id)) === rawIdSegment(String(row.buildingId || '')))?.name ||
+      '';
+    const rawOfBuilding = (value: any): string => rawIdSegment(String(value || ''));
+    const isOpeningBalance = (row: any) =>
+      row.borrowingType === 'OPENING_BALANCE' ||
+      row.isOwnerOpeningBalance === true ||
+      row.expenseCategory === 'Owner Opening Balance';
+
+    const existingTreasuryTxIds = new Set(
+      transactions
+        .filter((t: any) => (t as any).transferId)
+        .map((t: any) => String((t as any).transferId)),
+    );
+    const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
+      ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING')) &&
+      !tr.deleted &&
+      !existingTreasuryTxIds.has(String(tr.id || '')),
+    ).map((tr: any) => ({
+      id: `pseudo_${tr.id}`,
+      date: tr.date || '',
+      type: tr.fromType === 'BUILDING' ? TransactionType.EXPENSE : TransactionType.INCOME,
+      amount: Number(tr.amount) || 0,
+      paymentMethod: 'TREASURY',
+      originalPaymentMethod: tr.paymentMethod,
+      fromBankName: tr.fromBankName,
+      toBankName: tr.toBankName,
+      bankName: tr.fromBankName || tr.bankName,
+      fromType: tr.fromType,
+      toType: tr.toType,
+      fromId: tr.fromId,
+      toId: tr.toId,
+      purpose: tr.purpose || tr.notes || 'Treasury Transfer',
+      details: tr.notes || '',
+      status: tr.status || TransactionStatus.APPROVED,
+      transferId: tr.id,
+      createdBy: tr.createdBy,
+      createdAt: tr.createdAt,
+      source: 'treasury',
+      buildingId: tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : undefined),
+      expenseCategory: '',
+    } as any));
+
+    const interBuildingPseudo: any[] = [];
+    const bookOf = (value: any): string => {
+      const s = String(value || '');
+      return s.includes(':') ? s.slice(0, s.indexOf(':')) : '';
+    };
+    (transfers || []).forEach((tr: any) => {
+      if (tr.deleted) return;
+      if (!(tr.fromType === 'BUILDING' && tr.toType === 'BUILDING' && tr.fromId && tr.toId && tr.fromId !== tr.toId)) return;
+      const isCrossBook = (tr.sourceBookId && tr.destBookId && tr.sourceBookId !== tr.destBookId)
+        || (!!bookOf(tr.fromId) && !!bookOf(tr.toId) && bookOf(tr.fromId) !== bookOf(tr.toId));
+      if (isCrossBook) return;
+      const fromRaw = rawOfBuilding(tr.fromId);
+      const toRaw = rawOfBuilding(tr.toId);
+      const linked = transactions.filter(tx => String((tx as any).transferId || '') === String(tr.id || '') && (tx as any).buildingId);
+      const hasSource = linked.some(tx => rawOfBuilding((tx as any).buildingId) === fromRaw);
+      const hasDest = linked.some(tx => rawOfBuilding((tx as any).buildingId) === toRaw);
+      const base = {
+        date: tr.date || '',
+        amount: Number(tr.amount) || 0,
+        paymentMethod: 'TREASURY',
+        originalPaymentMethod: tr.paymentMethod,
+        fromBankName: tr.fromBankName,
+        toBankName: tr.toBankName,
+        bankName: tr.fromBankName || tr.bankName,
+        fromType: tr.fromType,
+        toType: tr.toType,
+        fromId: tr.fromId,
+        toId: tr.toId,
+        purpose: tr.purpose || tr.notes || 'Inter-Building Transfer',
+        details: tr.notes || '',
+        status: tr.status || TransactionStatus.APPROVED,
+        transferId: tr.id,
+        createdBy: tr.createdBy,
+        createdAt: tr.createdAt,
+        source: 'treasury',
+        expenseCategory: '',
+      };
+      if (!hasSource) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_src`, type: TransactionType.EXPENSE, buildingId: fromRaw, interBuildingRole: 'SOURCE' });
+      if (!hasDest) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_dst`, type: TransactionType.INCOME, buildingId: toRaw, interBuildingRole: 'DEST' });
+    });
+
+    let ledgerRows = [...transactions, ...buildingOwnerPseudo, ...interBuildingPseudo].filter((row: any) => {
+      if (!isApprovedBankRow(row)) return false;
+      if (!passesBuilding(row)) return false;
+      if (isOpeningBalance(row)) return false;
+      if (row.source === 'treasury') {
+        const ft = row.fromType;
+        const tt = row.toType;
+        if ((ft === 'OWNER' && tt === 'HEAD_OFFICE') || (ft === 'HEAD_OFFICE' && tt === 'OWNER')) return false;
+      }
+      return true;
+    });
+    const byLeg = new Map<string, any[]>();
+    ledgerRows.forEach(row => {
+      const tid = String(row?.transferId || '').trim();
+      if (!tid) return;
+      const key = `${tid}::${rawOfBuilding(row.buildingId)}::${String(row?.type || '').toUpperCase()}`;
+      const list = byLeg.get(key) || [];
+      list.push(row);
+      byLeg.set(key, list);
+    });
+    const dropIds = new Set<string>();
+    byLeg.forEach(list => {
+      if (list.length <= 1) return;
+      list.sort((a, b) => {
+        const ap = String(a.id || '').startsWith('pseudo_') ? 1 : 0;
+        const bp = String(b.id || '').startsWith('pseudo_') ? 1 : 0;
+        if (ap !== bp) return ap - bp;
+        return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
+      });
+      list.slice(1).forEach(row => dropIds.add(String(row.id)));
+    });
+    ledgerRows = ledgerRows.filter(row => !dropIds.has(String(row.id)));
+
+    const recordMovement = (row: any, bankName: string, signedAmount: number, movementType?: string) => {
+      const clean = String(bankName || '').trim();
+      if (!clean || !signedAmount) return;
+      const summary = ensure(clean);
+      const date = String(row.date || '');
+      const movement: BankMovement = {
+        id: String(row.id || `${clean}-${date}-${summary.movements.length}`),
+        date,
+        bankName: summary.name,
+        type: movementType || String(row.type || ''),
+        direction: signedAmount >= 0 ? 'in' : 'out',
+        amount: Math.abs(signedAmount),
+        signedAmount,
+        details: String(row.details || row.purpose || row.expenseCategory || row.incomeCategory || ''),
+        building: buildingNameFor(row),
+        method: String(row.originalPaymentMethod || row.paymentMethod || ''),
+        status: String(row.status || TransactionStatus.APPROVED),
+      };
+      if (date && date < periodStart) {
+        summary.opening += signedAmount;
+        return;
+      }
+      if (!date || date > periodEnd) return;
+      if (bankMovementFilter !== 'all' && movement.direction !== bankMovementFilter) return;
+      if (search) {
+        const haystack = [
+          movement.date,
+          movement.bankName,
+          movement.type,
+          movement.details,
+          movement.building,
+          movement.method,
+          movement.status,
+          String(movement.amount),
+          String(movement.signedAmount),
+        ].join(' ').toLowerCase();
+        if (!haystack.includes(search)) return;
+      }
+      if (signedAmount >= 0) summary.income += signedAmount;
+      else summary.expense += Math.abs(signedAmount);
+      summary.transactionCount += 1;
+      summary.movements.push(movement);
+    };
+
+    ledgerRows.forEach((t: any) => {
+      if (!transactionCountsAsBankForSplit(t)) return;
+      const amount = reportMoneyAmount(t as Transaction);
+      if (!amount) return;
+      const source = String(t.source || '');
+      const pm = String(t.paymentMethod || '');
+      if (source === 'treasury' || pm === 'TREASURY') {
+        if (t.fromBankName) recordMovement(t, t.fromBankName, -Math.abs(amount), 'Transfer Out');
+        if (t.toBankName) recordMovement(t, t.toBankName, Math.abs(amount), 'Transfer In');
+        if (!t.fromBankName && !t.toBankName && t.bankName) {
+          const sign = normalizeTransactionType(t.type) === TransactionType.INCOME ? 1 : -1;
+          recordMovement(t, t.bankName, sign * Math.abs(amount), String(t.type || 'Treasury'));
+        }
+        return;
+      }
+      const sign = normalizeTransactionType(t.type) === TransactionType.INCOME ? 1 : -1;
+      recordMovement(t, t.bankName || t.fromBankName || t.toBankName || unassignedBankName, sign * Math.abs(amount), String(t.type || 'Transaction'));
+    });
+
+    const rows = Array.from(summaries.values()).map(row => ({
+      ...row,
+      closing: row.opening + row.income - row.expense,
+      movements: row.movements.sort((a, b) => String(b.date).localeCompare(String(a.date))),
+    })).sort((a, b) => Math.abs(b.closing) - Math.abs(a.closing));
+    const visible = bankReportFilter === 'all'
+      ? rows
+      : rows.filter(row => row.key === bankKey(bankReportFilter));
+    const movements = visible.flatMap(row => row.movements.map(m => ({ ...m, bankName: row.name })))
+      .sort((a, b) => String(b.date).localeCompare(String(a.date)));
+    return {
+      rows,
+      visible,
+      movements,
+      totals: {
+        opening: visible.reduce((s, row) => s + row.opening, 0),
+        income: visible.reduce((s, row) => s + row.income, 0),
+        expense: visible.reduce((s, row) => s + row.expense, 0),
+        closing: visible.reduce((s, row) => s + row.closing, 0),
+        transactionCount: visible.reduce((s, row) => s + row.transactionCount, 0),
+      },
+    };
+  }, [banks, buildings, transactions, transfers, reportSettings, buildingFilter, bankReportFilter, bankMonthFilter, bankMovementFilter, bankReportSearch]);
 
   // ── Owner Expenses & Opening Balances ──
   const ownerExpensesData = useMemo(() => {
@@ -1743,6 +2062,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     const ownerLabel = ownerFilter === 'all'
       ? t('reports.allOwners')
       : employees.find((employee: any) => String(employee.id) === String(ownerFilter))?.name || ownerFilter;
+    const bankLabel = bankReportFilter === 'all' ? t('reports.allBanks') : bankReportFilter;
 
     const buildingOccupancyRows = buildings.map((b) => {
       const totalUnits = b.units?.length || 0;
@@ -1830,6 +2150,18 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
           ],
         };
       }
+      if (activeTab === 'bank') {
+        return {
+          columns: ['Bank', 'Opening', 'Income', 'Expense', 'Closing', 'Transactions'],
+          rows: bankReportData.visible.map(row => [row.name, sar(row.opening), sar(row.income), sar(row.expense), sar(row.closing), String(row.transactionCount)]),
+          summary: [
+            ['Opening balance', sar(bankReportData.totals.opening)],
+            ['Bank income', sar(bankReportData.totals.income)],
+            ['Bank expense', sar(bankReportData.totals.expense)],
+            ['Closing balance', sar(bankReportData.totals.closing)],
+          ],
+        };
+      }
       if (activeTab === 'ownerExpense') {
         const rows = ownerCombinedData.flatMap(owner => [
           ...owner.openingBalanceTxs.map(tx => [
@@ -1865,10 +2197,21 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     })();
 
     const filterItems = [
-      ['From', rangeStart],
-      ['Till', rangeEnd],
+      ...(activeTab === 'bank'
+        ? [['Period', bankMonthFilter === 'all' ? t('reports.allTime') : bankMonthFilter]]
+        : [
+            ['From', rangeStart],
+            ['Till', rangeEnd],
+          ]),
       ['Building', buildingLabel],
       ...(activeTab === 'ownerExpense' ? [['Owner', ownerLabel]] : []),
+      ...(activeTab === 'bank'
+        ? [
+            ['Bank', bankLabel],
+            ['Movement', bankMovementFilter === 'all' ? t('reports.allMovements') : bankMovementFilter === 'in' ? t('reports.moneyIn') : t('reports.moneyOut')],
+            ...(bankReportSearch ? [['Search', bankReportSearch]] : []),
+          ]
+        : []),
       ...(activeTab === 'collection' && collectionSearch ? [['Search', collectionSearch]] : []),
     ];
 
@@ -1946,7 +2289,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     </section>
     <section class="footer">
       <span>This is a computer-generated report.</span>
-      <span>Period: ${esc(rangeStart)} to ${esc(rangeEnd)}</span>
+      <span>Period: ${esc(activeTab === 'bank' ? (bankMonthFilter === 'all' ? t('reports.allTime') : bankMonthFilter) : `${rangeStart} to ${rangeEnd}`)}</span>
     </section>
   </main>
 </body>
@@ -1969,6 +2312,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     { key: 'salary', label: t('reports.tab.salary'), icon: <CreditCard size={16} /> },
     { key: 'building', label: t('reports.tab.building'), icon: <Building2 size={16} /> },
     { key: 'collection', label: t('reports.tab.collection'), icon: <Landmark size={16} /> },
+    { key: 'bank', label: t('reports.tab.bank'), icon: <CreditCard size={16} /> },
     // Owner Expenses visible to Admin & Manager (treasury staff)
     ...(canViewOwnerExpenses ? [{ key: 'ownerExpense' as ReportTab, label: t('reports.tab.ownerExpense'), icon: <FileText size={16} /> }] : []),
   ], [canViewOwnerExpenses, t]);
@@ -1980,6 +2324,15 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
     { key: 'lastYear', label: t('reports.preset.lastYear') },
     { key: 'custom', label: t('reports.preset.custom') },
   ];
+
+  const bankMonthOptions = useMemo(() => {
+    const months = new Set<string>();
+    [...transactions, ...transfers].forEach((row: any) => {
+      const date = String(row?.date || '');
+      if (/^\d{4}-\d{2}/.test(date)) months.add(date.slice(0, 7));
+    });
+    return Array.from(months).sort().reverse();
+  }, [transactions, transfers]);
 
   // ── KPI Cards ──
   const overviewKPIs: KPICard[] = [
@@ -2264,6 +2617,65 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
                     </option>
                   ))}
               </select>
+            </div>
+          )}
+
+          {activeTab === 'bank' && (
+            <div className="flex flex-wrap items-center gap-2">
+              <CreditCard size={16} className="text-cyan-600" />
+              <select
+                value={bankReportFilter}
+                onChange={e => setBankReportFilter(e.target.value)}
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white min-w-[160px]"
+              >
+                <option value="all">{t('reports.allBanks')}</option>
+                {bankReportData.rows.map(bank => (
+                  <option key={bank.key} value={bank.name}>{bank.name}</option>
+                ))}
+              </select>
+              <select
+                value={bankMonthFilter}
+                onChange={e => setBankMonthFilter(e.target.value)}
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white min-w-[130px]"
+              >
+                <option value="all">{t('reports.allMonths')}</option>
+                {bankMonthOptions.map(month => (
+                  <option key={month} value={month}>{month}</option>
+                ))}
+              </select>
+              <select
+                value={bankMovementFilter}
+                onChange={e => setBankMovementFilter(e.target.value as 'all' | 'in' | 'out')}
+                className="border border-gray-200 rounded-lg px-3 py-1.5 text-xs font-medium bg-white min-w-[130px]"
+              >
+                <option value="all">{t('reports.allMovements')}</option>
+                <option value="in">{t('reports.moneyIn')}</option>
+                <option value="out">{t('reports.moneyOut')}</option>
+              </select>
+              <div className="relative">
+                <Search size={13} className="absolute left-2 top-1/2 -translate-y-1/2 text-gray-400" />
+                <input
+                  type="text"
+                  value={bankReportSearch}
+                  onChange={e => setBankReportSearch(e.target.value)}
+                  placeholder={t('reports.searchBankMovements')}
+                  className="border border-gray-200 rounded-lg pl-7 pr-3 py-1.5 text-xs font-medium bg-white w-[190px]"
+                />
+              </div>
+              {(bankReportFilter !== 'all' || bankMonthFilter !== 'all' || bankMovementFilter !== 'all' || bankReportSearch) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setBankReportFilter('all');
+                    setBankMonthFilter('all');
+                    setBankMovementFilter('all');
+                    setBankReportSearch('');
+                  }}
+                  className="px-3 py-1.5 rounded-lg text-xs font-bold bg-gray-100 text-gray-600 hover:bg-gray-200"
+                >
+                  {t('common.reset')}
+                </button>
+              )}
             </div>
           )}
         </div>
@@ -3021,6 +3433,114 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
         </div>
       )}
 
+      {/* ══ BANKS TAB ══ */}
+      {activeTab === 'bank' && (
+        <div className="space-y-5">
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-4">
+            {[
+              { label: t('reports.bankOpeningBalance'), value: bankReportData.totals.opening, color: 'bg-slate-50 text-slate-700 border-slate-200', icon: <Wallet size={20} className="text-slate-500" /> },
+              { label: t('reports.bankIncome'), value: bankReportData.totals.income, color: 'bg-emerald-50 text-emerald-700 border-emerald-100', icon: <ArrowUpRight size={20} className="text-emerald-500" /> },
+              { label: t('reports.bankExpense'), value: bankReportData.totals.expense, color: 'bg-red-50 text-red-700 border-red-100', icon: <ArrowDownRight size={20} className="text-red-500" /> },
+              { label: t('reports.bankClosingBalance'), value: bankReportData.totals.closing, color: 'bg-cyan-50 text-cyan-700 border-cyan-100', icon: <Landmark size={20} className="text-cyan-500" /> },
+            ].map((item, i) => (
+              <div key={i} className={`${item.color} border rounded-2xl p-5`}>
+                <div className="flex items-center justify-between mb-2">
+                  <p className="text-xs font-bold uppercase tracking-wider opacity-75">{item.label}</p>
+                  {item.icon}
+                </div>
+                <p className="text-2xl font-black">SAR {fmt(item.value)}</p>
+              </div>
+            ))}
+          </div>
+
+          <Section
+            title={t('reports.section.bankBalances')}
+            icon={<Landmark size={18} />}
+            actions={<button onClick={() => exportCSV(bankReportData.visible.map(bank => ({ Bank: bank.name, IBAN: bank.iban, Opening: bank.opening, Income: bank.income, Expense: bank.expense, Closing: bank.closing, Transactions: bank.transactionCount })), 'bank-balances-report')} className="text-xs text-emerald-600 hover:text-emerald-800 font-semibold flex items-center gap-1"><Download size={14} /> CSV</button>}
+          >
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b-2 border-cyan-100">
+                    <th className="text-start py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.bank')}</th>
+                    <th className="text-start py-3 px-3 text-cyan-800 font-bold text-xs uppercase">IBAN</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.openingBalance')}</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.income')}</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.expense')}</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.closingBalance')}</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.transactions')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bankReportData.visible.map(bank => (
+                    <tr key={bank.key} className="border-b border-gray-50 hover:bg-cyan-50/50 transition-colors">
+                      <td className="py-2.5 px-3 font-bold text-gray-800">{bank.name}</td>
+                      <td className="py-2.5 px-3 text-gray-500 text-xs">{bank.iban || '-'}</td>
+                      <td className="py-2.5 px-3 text-end text-slate-700 font-semibold">{fmt(bank.opening)}</td>
+                      <td className="py-2.5 px-3 text-end text-emerald-600 font-semibold">{fmt(bank.income)}</td>
+                      <td className="py-2.5 px-3 text-end text-red-500 font-semibold">{fmt(bank.expense)}</td>
+                      <td className={`py-2.5 px-3 text-end font-black ${bank.closing >= 0 ? 'text-cyan-700' : 'text-red-600'}`}>{fmt(bank.closing)}</td>
+                      <td className="py-2.5 px-3 text-end text-gray-500">{bank.transactionCount}</td>
+                    </tr>
+                  ))}
+                  {bankReportData.visible.length > 0 && (
+                    <tr className="border-t-2 border-cyan-200 bg-cyan-50 font-bold">
+                      <td colSpan={2} className="py-3 px-3 text-cyan-900">{t('common.total')}</td>
+                      <td className="py-3 px-3 text-end text-slate-700">{fmt(bankReportData.totals.opening)}</td>
+                      <td className="py-3 px-3 text-end text-emerald-700">{fmt(bankReportData.totals.income)}</td>
+                      <td className="py-3 px-3 text-end text-red-600">{fmt(bankReportData.totals.expense)}</td>
+                      <td className={`py-3 px-3 text-end ${bankReportData.totals.closing >= 0 ? 'text-cyan-800' : 'text-red-700'}`}>{fmt(bankReportData.totals.closing)}</td>
+                      <td className="py-3 px-3 text-end text-gray-600">{bankReportData.totals.transactionCount}</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+              {bankReportData.visible.length === 0 && <p className="text-center text-gray-400 py-8">{t('reports.noBankData')}</p>}
+            </div>
+          </Section>
+
+          <Section
+            title={t('reports.section.bankMovements')}
+            icon={<FileSpreadsheet size={18} />}
+            actions={<button onClick={() => exportCSV(bankReportData.movements.map(row => ({ Date: row.date, Bank: row.bankName, Type: row.type, In: row.direction === 'in' ? row.amount : '', Out: row.direction === 'out' ? row.amount : '', Net: row.signedAmount, Building: row.building, Details: row.details, Method: row.method, Status: row.status })), 'bank-movements-report')} className="text-xs text-emerald-600 hover:text-emerald-800 font-semibold flex items-center gap-1"><Download size={14} /> CSV</button>}
+          >
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b-2 border-cyan-100">
+                    <th className="text-start py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('common.date')}</th>
+                    <th className="text-start py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.bank')}</th>
+                    <th className="text-start py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.type')}</th>
+                    <th className="text-start py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('common.details')}</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.income')}</th>
+                    <th className="text-end py-3 px-3 text-cyan-800 font-bold text-xs uppercase">{t('reports.expense')}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {bankReportData.movements.slice(0, 250).map((row, idx) => (
+                    <tr key={`${row.id}-${idx}-${row.bankName}`} className="border-b border-gray-50 hover:bg-cyan-50/50 transition-colors">
+                      <td className="py-2.5 px-3 text-gray-600 whitespace-nowrap">{row.date}</td>
+                      <td className="py-2.5 px-3 font-semibold text-gray-800">{row.bankName}</td>
+                      <td className="py-2.5 px-3 text-gray-500">{row.type}</td>
+                      <td className="py-2.5 px-3 text-gray-600 min-w-[220px]">
+                        <div className="font-medium">{row.details || '-'}</div>
+                        {row.building && <div className="text-xs text-gray-400 mt-0.5">{row.building}</div>}
+                      </td>
+                      <td className="py-2.5 px-3 text-end text-emerald-600 font-semibold">{row.direction === 'in' ? fmt(row.amount) : '-'}</td>
+                      <td className="py-2.5 px-3 text-end text-red-500 font-semibold">{row.direction === 'out' ? fmt(row.amount) : '-'}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {bankReportData.movements.length === 0 && <p className="text-center text-gray-400 py-8">{t('reports.noBankData')}</p>}
+              {bankReportData.movements.length > 250 && (
+                <p className="text-center text-xs text-gray-400 pt-3">{t('reports.showingOf').replace('{n}', '250').replace('{m}', String(bankReportData.movements.length))}</p>
+              )}
+            </div>
+          </Section>
+        </div>
+      )}
+
       {/* ══ OWNER EXPENSE TAB ══ */}
       {activeTab === 'ownerExpense' && canViewOwnerExpenses && (
         <div className="space-y-6">
@@ -3473,7 +3993,7 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
 
       {/* ══ Footer ══ */}
       <div className="text-center text-xs text-gray-400 py-2">
-        {t('reports.reportFooter')} {new Date().toLocaleDateString('en-SA', { year: 'numeric', month: 'long', day: 'numeric' })} • {t('reports.period')}: {rangeStart} {t('vat.to')} {rangeEnd}
+        {t('reports.reportFooter')} {new Date().toLocaleDateString('en-SA', { year: 'numeric', month: 'long', day: 'numeric' })} • {t('reports.period')}: {activeTab === 'bank' ? (bankMonthFilter === 'all' ? t('reports.allTime') : bankMonthFilter) : `${rangeStart} ${t('vat.to')} ${rangeEnd}`}
       </div>
 
       {/* ══ Tenant History Modal ══ */}

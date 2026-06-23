@@ -165,6 +165,9 @@ export interface Transaction {
   extraAmount?: number;
   status?: TransactionStatus;
   isAutoPayment?: boolean; // True if auto-generated from contract auto-payment
+  source?: string; // Origin marker such as amlak_sheets, treasury, opening_balance
+  sourceLabel?: string;
+  postedFromAmlakSheets?: boolean;
 
   // VAT Report only — transactions imported from PDF that should ONLY appear in the VAT Report tab
   vatReportOnly?: boolean;
@@ -184,7 +187,7 @@ export interface Transaction {
 export type AmlakCellValue = string | number | boolean | null;
 
 export type AmlakCellType = 'text' | 'number' | 'date' | 'boolean' | 'formula' | 'empty' | 'error';
-export type AmlakSheetKind = 'rentalIncome' | 'otherIncome' | 'expense' | 'ownerExpense' | 'vatIncome' | 'vatExpense' | 'fees' | 'income';
+export type AmlakSheetKind = 'rentalIncome' | 'otherIncome' | 'expense' | 'ownerExpense' | 'vatIncome' | 'vatExpense' | 'fees' | 'treasury' | 'income';
 export type AmlakSheetRowStatus = 'draft' | 'ready' | 'posted' | 'error';
 
 export interface AmlakCellPostingMeta {
@@ -224,7 +227,7 @@ export interface AmlakSheetRowMeta {
   postedBy?: string;
   postedByName?: string;
   error?: string;
-  generatedDueSource?: 'monitoring';
+  generatedDueSource?: 'monitoring' | 'fees-monitoring' | 'vat-monitoring';
   generatedDueKey?: string;
   generatedAt?: number;
   generatedDueSuppressedKey?: string;
@@ -234,9 +237,10 @@ export interface AmlakSheetRowMeta {
   splitParentDueDate?: string;
   splitParentUnit?: string;
   splitParentOriginalDue?: number;
+  paymentClearedAt?: number;
 }
 
-export type AmlakSheetPostType = 'RENT' | 'EXPENSE' | 'SALARY' | 'BORROWING' | 'OWNER_EXPENSE' | 'OTHER_INCOME';
+export type AmlakSheetPostType = 'RENT' | 'EXPENSE' | 'SALARY' | 'BORROWING' | 'OWNER_EXPENSE' | 'OTHER_INCOME' | 'TREASURY';
 
 export interface AmlakSheetColumnMapping {
   date?: string;
@@ -260,6 +264,14 @@ export interface AmlakSheetColumnMapping {
   employee?: string;
   owner?: string;
   related?: string;
+  fromType?: string;
+  fromAccount?: string;
+  toType?: string;
+  toAccount?: string;
+  fromBank?: string;
+  toBank?: string;
+  purpose?: string;
+  notes?: string;
 }
 
 export interface AmlakSheetPostingConfig {
@@ -425,6 +437,7 @@ export interface Building {
 }
 
 export interface Bank {
+    id?: string;
     name: string;
     iban: string;
 }

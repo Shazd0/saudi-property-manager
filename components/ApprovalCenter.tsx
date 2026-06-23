@@ -415,6 +415,8 @@ const ApprovalCenter: React.FC<ApprovalCenterProps> = ({ currentUser }) => {
     try {
       const svc = await import('../services/firestoreService');
       await svc.approveRequest(approvalId, currentUser?.id || currentUser?.uid || 'admin', approve);
+      setApprovals(prev => prev.filter(a => a.id !== approvalId));
+      if (expandedId === approvalId) setExpandedId(null);
       setActionMessage({ id: approvalId, type: 'success', text: approve ? t('approval.approvedSuccessfully') : t('approval.rejectedMsg') });
       setTimeout(() => setActionMessage(null), 3000);
     } catch (e: any) {
@@ -423,7 +425,7 @@ const ApprovalCenter: React.FC<ApprovalCenterProps> = ({ currentUser }) => {
     } finally {
       setProcessing(null);
     }
-  }, [processing, currentUser]);
+  }, [processing, currentUser, expandedId]);
 
   // Keep a ref to the latest handleApproval so event listeners always call the current version
   const handleApprovalRef = useRef(handleApproval);
@@ -605,8 +607,8 @@ const ApprovalCenter: React.FC<ApprovalCenterProps> = ({ currentUser }) => {
               {/* Accent bar */}
               {isPending && (
                 <div className={`h-1 ${
-                  approval.type.includes('delete') ? 'bg-gradient-to-r from-rose-400 to-rose-500' :
-                  approval.type.includes('edit') ? 'bg-gradient-to-r from-amber-400 to-orange-400' :
+                  String(approval.type || '').includes('delete') ? 'bg-gradient-to-r from-rose-400 to-rose-500' :
+                  String(approval.type || '').includes('edit') ? 'bg-gradient-to-r from-amber-400 to-orange-400' :
                   'bg-gradient-to-r from-blue-400 to-indigo-500'
                 }`} />
               )}

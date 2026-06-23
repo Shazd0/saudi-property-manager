@@ -1,13 +1,18 @@
 import React, { useEffect, useState, useMemo } from 'react';
-import { db, auth } from '../firebase';
-import { collection, doc, setDoc, getDoc, onSnapshot, addDoc, updateDoc, deleteDoc, query, serverTimestamp, runTransaction } from 'firebase/firestore';
-import { onAuthStateChanged } from 'firebase/auth';
+import {
+  addStockEntry,
+  consumeStockItem,
+  deleteStockItem,
+  getBuildings,
+  getCustomers,
+  getStockEntries,
+  getStocks,
+  saveStockItem,
+} from '../services/firestoreService';
 import {
   Package, Plus, Trash2, RefreshCw, ShoppingCart, 
   List, ChevronUp, Check, X, Search, Filter, ArrowRight
 } from 'lucide-react';
-
-const appId = typeof __app_id !== 'undefined' ? __app_id : 'stock-manager-v1';
 
 // --- STYLES & CONSTANTS ---
 const EMPTY_FORM = { name: '', qty: 1, buyingPrice: 0, sellingPrice: 0, unit: 'pcs' };
@@ -38,56 +43,44 @@ const App = ({ currentUser: propUser }) => {
 
   // --- AUTHENTICATION ---
   useEffect(() => {
-    // Use the currentUser prop passed from App.tsx instead of anonymous auth
     if (propUser) {
       setUser(propUser);
     }
-    const unsubscribe = onAuthStateChanged(auth, (u) => {
-      if (u) setUser(u);
-    });
-    return () => unsubscribe();
   }, [propUser]);
 
-  // --- DATA FETCHING (FIRESTORE) ---
-  useEffect(() => {
+  const entryTime = (entry: any) => {
+    const value = entry?.date || entry?.createdAt || 0;
+    if (typeof value === 'number') return value;
+    if (typeof value === 'string') return Date.parse(value) || 0;
+    if (typeof value?.seconds === 'number') return value.seconds * 1000;
+    return 0;
+  };
+
+  const refreshData = async () => {
     if (!user) return;
-    if (!db) {
-      console.error('Firestore db is undefined! Check firebase initialization.');
-      return;
+    setLoading(true);
+    try {
+      const [stockRows, entryRows, buildingRows, customerRows] = await Promise.all([
+        getStocks(),
+        getStockEntries(),
+        getBuildings(),
+        getCustomers(),
+      ]);
+      setStocks(stockRows || []);
+      setEntries([...(entryRows || [])].sort((a: any, b: any) => entryTime(b) - entryTime(a)));
+      setBuildings(buildingRows || []);
+      setCustomers(customerRows || []);
+    } catch (err) {
+      console.error('Stock data fetch error:', err);
+      showToast('Failed to load stock data', 'error');
+    } finally {
+      setLoading(false);
     }
+  };
 
-    const stocksRef = collection(db, 'artifacts', appId, 'public', 'data', 'stocks');
-    const entriesRef = collection(db, 'artifacts', appId, 'public', 'data', 'stockEntries');
-    const buildingsRef = collection(db, 'artifacts', appId, 'public', 'data', 'buildings');
-    const customersRef = collection(db, 'artifacts', appId, 'public', 'data', 'customers');
-
-    const unsubStocks = onSnapshot(stocksRef, 
-      (snap) => setStocks(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
-      (err) => console.error("Stocks fetch error:", err)
-    );
-
-    const unsubEntries = onSnapshot(entriesRef, 
-      (snap) => {
-        const data = snap.docs.map(d => ({ id: d.id, ...d.data() }));
-        setEntries(data.sort((a, b) => (b.date?.seconds || 0) - (a.date?.seconds || 0)));
-      },
-      (err) => console.error("Entries fetch error:", err)
-    );
-
-    const unsubBuildings = onSnapshot(buildingsRef, 
-      (snap) => setBuildings(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    );
-
-    const unsubCustomers = onSnapshot(customersRef, 
-      (snap) => setCustomers(snap.docs.map(d => ({ id: d.id, ...d.data() })))
-    );
-
-    return () => {
-      unsubStocks();
-      unsubEntries();
-      unsubBuildings();
-      unsubCustomers();
-    };
+  // --- DATA FETCHING ---
+  useEffect(() => {
+    refreshData();
   }, [user]);
 
   // --- UTILS ---
@@ -97,16 +90,7 @@ const App = ({ currentUser: propUser }) => {
   };
 
   const logEntry = async (stockId, stockName, qty, type, details) => {
-    const entriesRef = collection(db, 'artifacts', appId, 'public', 'data', 'stockEntries');
-    await addDoc(entriesRef, {
-      stockId,
-      stockName,
-      qty,
-      type,
-      details,
-      date: serverTimestamp(),
-      userId: user?.uid
-    });
+    await addStockEntry(stockId, qty, user?.id || user?.uid || user?.name || 'system', `${type}: ${details}`);
   };
 
   // --- ACTIONS ---
@@ -114,18 +98,18 @@ const App = ({ currentUser: propUser }) => {
     if (!addForm.name.trim()) return showToast("Name is required", "error");
     setLoading(true);
     try {
-      const stocksRef = collection(db, 'artifacts', appId, 'public', 'data', 'stocks');
-      const docRef = await addDoc(stocksRef, {
+      const saved = await saveStockItem({
         name: addForm.name.trim(),
         quantity: addForm.qty,
         buyingPrice: addForm.buyingPrice,
         sellingPrice: addForm.sellingPrice,
         unit: addForm.unit,
-        createdAt: serverTimestamp()
+        createdAt: Date.now()
       });
-      await logEntry(docRef.id, addForm.name, addForm.qty, 'INITIAL', 'Initial stock entry');
+      await logEntry(saved?.id, addForm.name, addForm.qty, 'INITIAL', 'Initial stock entry');
       setAddForm(EMPTY_FORM);
       setShowAddForm(false);
+      await refreshData();
       showToast("Item added successfully");
     } catch (err) {
       showToast("Failed to add item", "error");
@@ -139,12 +123,13 @@ const App = ({ currentUser: propUser }) => {
     if (!row || row.qty < 1) return;
     setLoading(true);
     try {
-      const stockRef = doc(db, 'artifacts', appId, 'public', 'data', 'stocks', stock.id);
-      await updateDoc(stockRef, {
+      await saveStockItem({
+        ...stock,
         quantity: (stock.quantity || 0) + row.qty
       });
       await logEntry(stock.id, stock.name, row.qty, 'RESTOCK', `Added ${row.qty} ${stock.unit}`);
       setRestockRows(prev => { const c = { ...prev }; delete c[stock.id]; return c; });
+      await refreshData();
       showToast(`Restocked ${stock.name}`);
     } catch (err) {
       showToast("Restock failed", "error");
@@ -157,7 +142,8 @@ const App = ({ currentUser: propUser }) => {
     if (!confirm(`Delete "${name}"?`)) return;
     setLoading(true);
     try {
-      await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'stocks', id));
+      await deleteStockItem(id);
+      await refreshData();
       showToast("Item deleted");
     } catch (err) {
       showToast("Delete failed", "error");
@@ -172,37 +158,22 @@ const App = ({ currentUser: propUser }) => {
     setLoading(true);
 
     try {
-      await runTransaction(db, async (transaction) => {
-        for (const id of selectedKeys) {
-          const item = selectedItems[id];
-          const stockRef = doc(db, 'artifacts', appId, 'public', 'data', 'stocks', id);
-          const stockSnap = await transaction.get(stockRef);
-          
-          if (!stockSnap.exists()) throw new Error("Item not found");
-          const currentQty = stockSnap.data().quantity || 0;
-          if (currentQty < item.qty) throw new Error(`Insufficient stock for ${stockSnap.data().name}`);
+      for (const id of selectedKeys) {
+        const item = selectedItems[id];
+        const stock = stocks.find(s => s.id === id);
+        if (!stock) throw new Error("Item not found");
+        const currentQty = stock.quantity || 0;
+        if (currentQty < item.qty) throw new Error(`Insufficient stock for ${stock.name}`);
 
-          transaction.update(stockRef, { quantity: currentQty - item.qty });
-          
-          const details = issueMode === 'consume' 
-            ? `Consumed for building/unit: ${buildingId || 'N/A'} ${unitNumber || ''}`
-            : `Sold to customer ${selectedCustomer || 'Walking'}`;
+        const details = issueMode === 'consume'
+          ? `Consumed for building/unit: ${buildingId || 'N/A'} ${unitNumber || ''}`
+          : `Sold to customer ${selectedCustomer || 'Walking'}`;
 
-          const entriesRef = collection(db, 'artifacts', appId, 'public', 'data', 'stockEntries');
-          const newEntryRef = doc(entriesRef);
-          transaction.set(newEntryRef, {
-            stockId: id,
-            stockName: stockSnap.data().name,
-            qty: -item.qty,
-            type: issueMode.toUpperCase(),
-            details,
-            date: serverTimestamp(),
-            userId: user?.uid
-          });
-        }
-      });
+        await consumeStockItem(id, item.qty, user?.id || user?.uid || user?.name || 'system', details, stock.name);
+      }
       
       setSelectedItems({});
+      await refreshData();
       showToast("Transaction completed");
     } catch (err) {
       showToast(err.message, "error");

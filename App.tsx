@@ -91,6 +91,7 @@ const AccountingModule = React.lazy(() => import('./components/AccountingModule'
 SoundService.init();
 
 const TAB_UI_STATE_PREFIX = 'tab-ui-state:';
+const isMacDataBackend = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
 
 const getRouteFromHash = (hash: string): string => {
   const normalized = hash || '#/';
@@ -364,6 +365,7 @@ const AppContent: React.FC = () => {
   // users who open the chat page.
   useEffect(() => {
     if (!user) return;
+    if (isMacDataBackend()) return;
     const userId = user.id || user.uid || 'unknown';
     const userName = (user as any).name || (user as any).displayName || (user as any).email || 'User';
 
@@ -391,6 +393,7 @@ const AppContent: React.FC = () => {
   }, [user]);
 
   useEffect(() => {
+    if (isMacDataBackend()) return;
     if (!user || isAdminLikeUser(user) || String((user as any).role || '').toUpperCase() === 'OWNER') return;
     return startStaffLocationReporting(user as any);
   }, [user?.id, user?.role]);
@@ -465,6 +468,7 @@ const AppContent: React.FC = () => {
   // Initialize push notifications for ALL users (so admin tokens are registered from all devices)
   useEffect(() => {
     if (!user) return;
+    if (isMacDataBackend()) return;
     let refreshInterval: any = null;
 
     const setupPush = async () => {
@@ -519,6 +523,7 @@ const AppContent: React.FC = () => {
 
   // Initialize cloud backup (auto-restore on first load)
   useEffect(() => {
+    if (isMacDataBackend()) return;
     if (user) {
       const accessToken = localStorage.getItem('gdrive_access_token');
       if (accessToken) {

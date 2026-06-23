@@ -92,54 +92,57 @@ const Invoice: React.FC = () => {
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=Tajawal:wght@400;700;800&display=swap" rel="stylesheet"/>
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
-    body{font-family:'Inter',sans-serif;background:#fff;color:#1e293b;-webkit-print-color-adjust:exact;print-color-adjust:exact}
-    .page{max-width:210mm;margin:0 auto;padding:14mm 16mm;position:relative;min-height:297mm}
-    .cb{position:absolute;width:56px;height:56px;border-style:solid;border-color:#d1fae5}
+    body{font-family:'Inter',sans-serif;background:#f8fafc;color:#1e293b;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+    .page{max-width:210mm;margin:0 auto;padding:14mm 16mm;position:relative;min-height:297mm;background:#ffffff;border:1px solid #99f6e4;box-shadow:0 16px 36px rgba(15,118,110,.14)}
+    .cb{position:absolute;width:56px;height:56px;border-style:solid;border-color:#5eead4}
     .cb-tl{top:6mm;left:6mm;border-width:2px 0 0 2px;border-radius:8px 0 0 0}
     .cb-tr{top:6mm;right:6mm;border-width:2px 2px 0 0;border-radius:0 8px 0 0}
     .cb-bl{bottom:6mm;left:6mm;border-width:0 0 2px 2px;border-radius:0 0 0 8px}
     .cb-br{bottom:6mm;right:6mm;border-width:0 2px 2px 0;border-radius:0 0 8px 0}
-    .hdr{display:flex;justify-content:space-between;align-items:start;margin-bottom:28px;padding-top:6px}
+    .hdr{display:flex;justify-content:space-between;align-items:start;margin-bottom:24px;padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f766e 0%,#059669 58%,#0d9488 100%);box-shadow:0 12px 26px rgba(15,118,110,.24)}
     .hdr-co{display:flex;align-items:center;gap:18px}
-    .hdr-logo{width:70px;height:70px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:14px;display:flex;align-items:center;justify-content:center;padding:10px}
+    .hdr-logo{width:70px;height:70px;background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.35);border-radius:14px;display:flex;align-items:center;justify-content:center;padding:10px;backdrop-filter:blur(3px)}
     .hdr-logo img{max-width:100%;max-height:100%;object-fit:contain}
-    .co-ar{font-family:'Tajawal',sans-serif;font-size:18px;font-weight:900;color:#064e3b;direction:rtl}
-    .co-en{font-size:11px;font-weight:700;color:#047857;letter-spacing:.5px;margin-top:2px}
-    .co-tag{font-size:10px;color:#6b7280;margin-top:3px}
+    .co-ar{font-family:'Tajawal',sans-serif;font-size:18px;font-weight:900;color:#ffffff;direction:rtl;text-shadow:0 1px 3px rgba(0,0,0,.18)}
+    .co-en{font-size:11px;font-weight:700;color:#ccfbf1;letter-spacing:.5px;margin-top:2px}
+    .co-tag{font-size:10px;color:#f8fafc;margin-top:3px;opacity:.92}
     .badge{text-align:right}
-    .badge-type{font-size:22px;font-weight:900;color:${isCredit ? '#dc2626' : '#064e3b'};letter-spacing:1.5px;text-transform:uppercase}
-    .badge-cn{font-size:9px;color:#6b7280;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
+    .badge-type{font-size:22px;font-weight:900;color:${isCredit ? '#fecaca' : '#ffffff'};letter-spacing:1.5px;text-transform:uppercase;text-shadow:0 1px 3px rgba(0,0,0,.16)}
+    .badge-cn{font-size:9px;color:#ccfbf1;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
     .pills{display:flex;gap:10px;margin-bottom:20px}
-    .pill{flex:1;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:10px 12px;text-align:center}
-    .pill.green{background:#f0fdf4;border-color:#bbf7d0}
+    .pill{flex:1;background:#ffffff;border:1px solid #d8dee8;border-radius:12px;padding:10px 12px;text-align:center;box-shadow:0 6px 12px rgba(15,23,42,.05)}
+    .pill.green{background:#ffffff;border-color:#0f766e;border-width:1.5px}
     .pill-lbl{font-size:8px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
     .pill-val{font-size:13px;font-weight:800;color:#0f172a}
     .party-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
-    .party-card{border-radius:10px;padding:14px;background:#fafffe;border:1px solid #d1fae5}
-    .party-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px;color:#047857;margin-bottom:8px;padding-bottom:6px;border-bottom:1.5px solid #d1fae5}
+    .party-card{border-radius:12px;padding:14px;background:#ffffff;border:1px solid #d8dee8;border-top:3px solid #0f766e;box-shadow:0 8px 16px rgba(15,23,42,.05)}
+    .party-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px;color:#0f766e;margin-bottom:8px;padding-bottom:6px;border-bottom:1.5px solid #e2e8f0}
     .party-name{font-size:14px;font-weight:700;color:#0f172a;margin-bottom:2px}
-    .party-ar{font-family:'Tajawal',sans-serif;font-size:13px;font-weight:700;color:#065f46;margin-bottom:4px;direction:rtl}
+    .party-ar{font-family:'Tajawal',sans-serif;font-size:13px;font-weight:700;color:#0f766e;margin-bottom:4px;direction:rtl}
     .party-sub{font-size:11px;color:#64748b;margin-top:2px}
-    .tbl{width:100%;border-collapse:collapse;margin-bottom:18px}
-    .tbl thead tr{background:#f0fdf4}
-    .tbl th{padding:11px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#047857;text-align:left;border-bottom:2px solid #bbf7d0}
+    .tbl{width:100%;border-collapse:collapse;margin-bottom:18px;border-radius:12px;overflow:hidden}
+    .tbl thead tr{background:linear-gradient(135deg,#0f766e 0%,#0d9488 100%)}
+    .tbl th{padding:11px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#ffffff;text-align:left;border-bottom:2px solid #0f766e}
     .tbl th:last-child{text-align:right}
     .tbl td{padding:16px 14px;font-size:13px;border-bottom:1px solid #f1f5f9;vertical-align:top}
     .tbl td:last-child{text-align:right;font-weight:700;color:#0f172a}
-    .tbl-num{font-weight:700;color:#10b981;font-size:14px}
+    .tbl-num{font-weight:700;color:#0f766e;font-size:14px}
     .tbl-sub{font-size:10px;color:#94a3b8;margin-top:3px}
     .tots{display:flex;justify-content:flex-end;margin-top:6px}
-    .tot-card{width:260px;background:#fafffe;border:2px solid #d1fae5;border-radius:12px;padding:16px}
+    .tot-card{width:260px;background:#ffffff;border:2px solid #0f766e;border-radius:14px;padding:16px;box-shadow:0 10px 20px rgba(15,118,110,.12)}
     .tot-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;color:#64748b}
     .tot-row span:last-child{font-weight:700;color:#0f172a}
-    .tot-total{display:flex;justify-content:space-between;border-top:1.5px solid #d1fae5;padding-top:10px;margin-top:10px;font-size:16px;font-weight:900;color:#064e3b}
+    .tot-total{display:flex;justify-content:space-between;border-top:1.5px solid #99f6e4;padding-top:10px;margin-top:10px;font-size:16px;font-weight:900;color:#0f766e}
     .tot-sar{font-size:10px;font-weight:600;opacity:.6;margin-left:2px}
     .ftr{display:flex;justify-content:space-between;align-items:flex-end;margin-top:20px;padding-top:18px;border-top:1px dashed #e2e8f0}
     .ftr-notes{font-size:10px;color:#94a3b8;line-height:1.7;max-width:55%}
     .ftr-notes b{color:#64748b}
+    .brand-strip{margin-top:16px;border:1px solid #d8dee8;border-radius:12px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#ffffff}
+    .brand-mark{font-size:10px;font-weight:900;letter-spacing:1.4px;color:#0f766e;text-transform:uppercase}
+    .brand-copy{font-size:8px;font-weight:700;color:#94a3b8;text-align:right}
     .qr-box{text-align:center}
-    .qr-img{width:180px;height:180px;border:1.5px solid #d1fae5;padding:5px;border-radius:10px;background:#fff}
-    .qr-lbl{font-size:8px;color:#047857;margin-top:5px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
+    .qr-img{width:180px;height:180px;border:1.5px solid #0f766e;padding:5px;border-radius:14px;background:#fff;box-shadow:0 10px 22px rgba(15,118,110,.14)}
+    .qr-lbl{font-size:8px;color:#0f766e;margin-top:5px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
     @page{margin:0;size:A4}
   </style>
 </head>
@@ -224,6 +227,13 @@ const Invoice: React.FC = () => {
         <div class="qr-lbl">ZATCA QR Code</div>
       </div>` : ''}
     </div>
+    <div class="brand-strip">
+      <div>
+        <div class="brand-mark">Powered by AMLAK Property Manager</div>
+        <div style="font-size:8px;color:#64748b;margin-top:2px">Professional property management software</div>
+      </div>
+      <div class="brand-copy">© ${new Date().getFullYear()} AMLAK Software. All rights reserved.</div>
+    </div>
   </div>
   <script>window.onload=function(){window.print()}</script>
 </body>
@@ -254,30 +264,31 @@ const Invoice: React.FC = () => {
     <div className="min-h-screen bg-slate-50 p-4 sm:p-8">
       <div className="max-w-3xl mx-auto">
 
-        <div className="bg-white rounded-2xl shadow-lg border border-slate-200 overflow-hidden relative">
-          <div className="relative z-10 bg-gradient-to-r from-emerald-600 to-teal-500 p-6 flex justify-between items-start">
+        <div className="bg-white rounded-[2rem] shadow-2xl shadow-teal-900/10 border border-teal-100 overflow-hidden relative">
+          <div className="absolute -top-24 -right-24 w-64 h-64 bg-teal-200/20 rounded-full blur-3xl" />
+          <div className="relative z-10 bg-gradient-to-br from-teal-700 via-emerald-600 to-teal-500 p-6 flex justify-between items-start">
             <div className="flex items-center gap-4">
-              <div className="w-14 h-14 bg-white/20 rounded-xl border border-white/30 flex items-center justify-center">
+              <div className="w-14 h-14 bg-white/20 rounded-xl border border-white/30 flex items-center justify-center shadow-xl shadow-emerald-950/20">
                 <img src="/images/cologo.png" alt="Company Logo" className="w-11 h-11 object-contain" onError={e => (e.currentTarget.style.display='none')} />
               </div>
               <div>
                 <div className="text-white font-black text-lg" dir="rtl" lang="ar" style={{fontFamily:"'Tajawal',sans-serif"}}>{coNameAr2}</div>
-                <div className="text-emerald-100 text-xs font-semibold">{coNameEn2}</div>
-                <div className="text-emerald-200/70 text-[10px] mt-1">{invoiceSettings?.address || companyAddress}{coVAT2 ? ' | VAT ' + coVAT2 : ''}</div>
+                <div className="text-teal-50 text-xs font-semibold">{coNameEn2}</div>
+                <div className="text-teal-50/80 text-[10px] mt-1">{invoiceSettings?.address || companyAddress}{coVAT2 ? ' | VAT ' + coVAT2 : ''}</div>
               </div>
             </div>
             <div className="text-right">
               <div className={`text-2xl font-black ${isCredit ? 'text-red-200' : 'text-white'}`}>
                 {isCredit ? 'CREDIT NOTE' : isExpense ? 'PURCHASE INV.' : 'TAX INVOICE'}
               </div>
-              <div className="text-[10px] text-emerald-100 tracking-widest mt-1">ZATCA COMPLIANT</div>
+              <div className="text-[10px] text-teal-50 tracking-widest mt-1">ZATCA COMPLIANT</div>
             </div>
           </div>
 
-          <div className="relative z-10 grid grid-cols-2 sm:grid-cols-4 gap-2 p-4 bg-slate-50 border-b border-slate-100 font-inter">
-            <div className="rounded-xl p-3 text-center bg-emerald-50 border border-emerald-200">
-               <div className="text-[8px] font-bold uppercase tracking-wider text-slate-400">Invoice No.</div>
-               <div className="text-sm font-black mt-1 text-emerald-800">{transaction.vatInvoiceNumber || '-'}</div>
+          <div className="relative z-10 grid grid-cols-2 sm:grid-cols-4 gap-2 p-4 bg-white border-b border-slate-100 font-inter">
+            <div className="rounded-xl p-3 text-center bg-white border-2 border-teal-700 shadow-sm">
+               <div className="text-[8px] font-bold uppercase tracking-wider text-teal-700">Invoice No.</div>
+               <div className="text-lg leading-none font-black mt-1 text-teal-800">{transaction.vatInvoiceNumber || '-'}</div>
             </div>
             <div className="rounded-xl p-3 text-center bg-white border border-slate-200">
                <div className="text-[8px] font-bold uppercase tracking-wider text-slate-400">Date</div>
@@ -297,8 +308,8 @@ const Invoice: React.FC = () => {
 
           <div className="relative z-10 p-5 sm:p-6 space-y-5">
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-              <div className={`rounded-xl p-4 border ${isExpense ? 'bg-amber-50 border-amber-200' : 'bg-emerald-50 border-emerald-200'}`}>
-                <div className={`text-[9px] font-bold uppercase tracking-wider mb-3 pb-2 border-b ${isExpense ? 'text-amber-700 border-amber-200' : 'text-emerald-700 border-emerald-200'}`}>
+              <div className={`rounded-xl p-4 border border-t-4 bg-white ${isExpense ? 'border-amber-200 border-t-amber-600' : 'border-slate-200 border-t-teal-700'}`}>
+                <div className={`text-[9px] font-bold uppercase tracking-wider mb-3 pb-2 border-b ${isExpense ? 'text-amber-700 border-slate-200' : 'text-teal-700 border-slate-200'}`}>
                   Supplier / Seller
                 </div>
                 <div className="font-bold text-slate-800">{sellerName}</div>
@@ -306,23 +317,23 @@ const Invoice: React.FC = () => {
                 <div className="text-xs text-slate-500 mt-1">VAT: {sellerVAT}</div>
                 {!isExpense && <div className="text-xs text-slate-500">{invoiceSettings?.address || companyAddress}</div>}
               </div>
-              <div className="rounded-xl p-4 border bg-sky-50 border-sky-200">
-                <div className="text-[9px] font-bold uppercase tracking-wider text-sky-700 mb-3 pb-2 border-b border-sky-200">
+              <div className="rounded-xl p-4 border border-t-4 bg-white border-slate-200 border-t-cyan-700">
+                <div className="text-[9px] font-bold uppercase tracking-wider text-cyan-700 mb-3 pb-2 border-b border-slate-200">
                   Customer / Buyer
                 </div>
                 <div className="font-bold text-slate-800">{buyerName}</div>
                 {isExpense && <div className="text-sm text-slate-600 mt-0.5" dir="rtl" lang="ar" style={{fontFamily:"'Tajawal',sans-serif"}}>{coNameAr2}</div>}
                 <div className="text-xs text-slate-500 mt-1">VAT: {buyerVAT}</div>
-                {transaction.electricityMeter && <div className="text-[10px] text-emerald-600 font-bold mt-2 pt-2 border-t border-emerald-100 flex items-center gap-1">⚡ Meter: {transaction.electricityMeter}</div>}
+                {transaction.electricityMeter && <div className="text-[10px] text-teal-700 font-bold mt-2 pt-2 border-t border-slate-100 flex items-center gap-1">⚡ Meter: {transaction.electricityMeter}</div>}
               </div>
             </div>
 
-            <div className="rounded-xl overflow-hidden border border-slate-200">
-              <div className="grid grid-cols-[auto_1fr_auto] text-[10px] font-bold uppercase tracking-wider text-slate-500 bg-slate-50 border-b border-slate-200 py-3 px-4 gap-4">
+            <div className="rounded-xl overflow-hidden border border-slate-200 shadow-sm">
+              <div className="grid grid-cols-[auto_1fr_auto] text-[10px] font-bold uppercase tracking-wider text-white bg-gradient-to-r from-teal-700 to-emerald-600 border-b border-teal-700 py-3 px-4 gap-4">
                 <span>#</span><span>Description</span><span className="text-right">Amount</span>
               </div>
-              <div className="grid grid-cols-[auto_1fr_auto] gap-4 py-4 px-4">
-                <span className="text-emerald-500 font-bold text-lg">01</span>
+              <div className="grid grid-cols-[auto_1fr_auto] gap-4 py-4 px-4 bg-white hover:bg-slate-50 transition-colors">
+                <span className="text-teal-700 font-bold text-lg">01</span>
                 <div>
                   <div className="font-semibold text-slate-700">{transaction.details || (isExpense ? 'Purchase / Expense' : 'Property Rental Services')}</div>
                 </div>
@@ -331,7 +342,7 @@ const Invoice: React.FC = () => {
             </div>
 
             <div className="flex justify-end">
-              <div className="w-full max-w-xs border border-slate-200 rounded-xl overflow-hidden">
+              <div className="w-full max-w-xs border border-slate-200 rounded-xl overflow-hidden shadow-sm">
                 <div className="flex justify-between px-4 py-3 text-sm text-slate-500 bg-white border-b border-slate-100">
                   <span>Subtotal (Excl. VAT)</span>
                   <span className="font-semibold text-slate-700">{(transaction.amountExcludingVAT || transaction.amount || 0).toLocaleString()}</span>
@@ -340,7 +351,7 @@ const Invoice: React.FC = () => {
                   <span>VAT ({transaction.vatRate || 15}%)</span>
                   <span className="font-semibold text-slate-700">{(transaction.vatAmount || 0).toLocaleString()}</span>
                 </div>
-                <div className="flex justify-between px-4 py-4 bg-emerald-600 text-white font-black text-lg font-inter">
+                <div className="flex justify-between px-4 py-4 bg-gradient-to-br from-teal-700 to-emerald-600 text-white font-black text-lg font-inter">
                   <span>Total</span>
                   <span>{(transaction.amountIncludingVAT || transaction.totalWithVat || 0).toLocaleString()} <span className="text-sm font-normal opacity-70">SAR</span></span>
                 </div>
@@ -358,9 +369,12 @@ const Invoice: React.FC = () => {
             )}
             <div className="flex items-center justify-between pt-4 border-t border-slate-100">
               <div className="text-xs text-slate-400">Computer-generated document. No signature required.</div>
-              <div className="flex items-center gap-2 opacity-40">
-                <img src="/images/cologo.png" className="h-4" alt="Amlak" onError={e => (e.currentTarget.style.display='none')} />
-                <span className="text-[9px] text-slate-400 uppercase tracking-wider">Powered by Amlak</span>
+              <div className="flex items-center gap-3 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
+                <img src="/images/cologo.png" className="h-5" alt="Amlak" onError={e => (e.currentTarget.style.display='none')} />
+                <div className="text-right leading-tight">
+                  <div className="text-[9px] font-black text-teal-700 uppercase tracking-wider">Powered by AMLAK</div>
+                  <div className="text-[8px] text-slate-400">© {new Date().getFullYear()} AMLAK Software</div>
+                </div>
               </div>
             </div>
           </div>

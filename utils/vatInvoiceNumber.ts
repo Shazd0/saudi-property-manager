@@ -32,3 +32,29 @@ export const getNextVatInvoiceNumber = (
   const nextSequence = String(maxSequence + 1).padStart(2, '0');
   return `${prefix}${year}-${nextSequence}`;
 };
+
+export const getNextVatSalesInvoiceNumber = (
+  transactions: Array<Pick<Transaction, 'date' | 'vatInvoiceNumber'>> | undefined,
+  invoiceDate?: string,
+): string => {
+  const year = resolveInvoiceYear(invoiceDate);
+  const legacyExpression = new RegExp(`^${year}-(\\d+)$`);
+  const salesExpression = /^SV-(\d+)$/i;
+  let maxSequence = 0;
+
+  (transactions || []).forEach((tx) => {
+    if (resolveInvoiceYear(tx?.date) !== year) return;
+    const raw = String(tx?.vatInvoiceNumber || '').trim();
+    if (!raw) return;
+
+    const salesMatch = raw.match(salesExpression);
+    const plainMatch = raw.match(/^(\d+)$/);
+    const legacyMatch = raw.match(legacyExpression);
+    const seq = Number((salesMatch || plainMatch || legacyMatch)?.[1]);
+    if (Number.isFinite(seq) && seq > maxSequence) {
+      maxSequence = seq;
+    }
+  });
+
+  return `SV-${maxSequence + 1}`;
+};

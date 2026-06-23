@@ -10,7 +10,7 @@ import SoundService from '../services/soundService';
 import { fmtDate, isDateInCurrentMonth, contractDateToYmd } from '../utils/dateFormat';
 import { getInstallmentRange } from '../utils/installmentSchedule';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
-import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import LoadingOverlay from './LoadingOverlay';
 import ConfirmDialog from './ConfirmDialog';
 import VATQuickEntryModal, { VATQuickEntryType } from './VATQuickEntryModal';
@@ -1385,8 +1385,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
     const autoInvoiceNumber =
       vatApplicableEffective && !vatInvoiceNumber
         ? (type === TransactionType.INCOME
-            ? getNextVatInvoiceNumber(
-                allTransactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+            ? getNextVatSalesInvoiceNumber(
+                allTransactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && (t.zatcaQRCode || (t as any).zatcaReportedAt)),
                 date,
               )
             : getNextVatInvoiceNumber(allTransactions, date))
@@ -1535,7 +1535,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
             // Editing: save directly for all users
             if (id) {
                 await saveTransaction(newTx);
-                setSuccessMsg(t('entry.updatedSuccessfully'));
+                setSuccessMsg(`${t('entry.updatedSuccessfully')} Added to Amlak Sheets as posted.`);
                 setTimeout(() => navigate(buildingId === 'HEAD_OFFICE' ? '/transfers' : '/history'), 500);
                 setLoading(false);
                 return;
@@ -1620,6 +1620,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
             
             // Send email receipt notification for income transactions
             if (type === TransactionType.INCOME && activeContract && status === TransactionStatus.APPROVED) {
+              void (async () => {
               try {
                 const customer = customers.find(c => c.id === activeContract.customerId);
                 if (customer?.email && customer.emailNotifications) {
@@ -1640,9 +1641,10 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                 console.error('Failed to send email notification:', emailError);
                 // Don't block transaction saving if email fails
               }
+              })();
             }
             
-            setSuccessMsg(t('entry.savedSuccessfully'));
+            setSuccessMsg(`${t('entry.savedSuccessfully')} Added to Amlak Sheets as posted.`);
             if (id) {
                 setTimeout(() => navigate(buildingId === 'HEAD_OFFICE' ? '/transfers' : '/history'), 500);
             } else if (buildingId === 'HEAD_OFFICE') {

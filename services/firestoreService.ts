@@ -8,6 +8,8 @@ function assertDb(): Firestore {
 import { ref as sRef, uploadBytes, getDownloadURL } from "firebase/storage";
 import { getNextVatInvoiceNumber } from "../utils/vatInvoiceNumber";
 import { compactAmlakWorkbook } from "../utils/amlakSheetPosting";
+import { syncTransactionIntoAmlakWorkbooks } from "../utils/amlakWorkbookTransactionSync";
+import { bankAccountKey, bankReferencePatch, countRecordsByBank, type BankReferenceField } from "../utils/bankAccounts";
 import { getCached, setCached, invalidateFirestoreCache } from "./firestoreCache";
 import { macDeleteDocument, macGetDocument, macListCollection, macSaveDocument } from "./macApiClient";
 
@@ -61,6 +63,11 @@ const sanitize = (obj: any): any => {
     }
   });
   return out;
+};
+
+const runInBackground = (task: Promise<any> | (() => Promise<any>), label: string) => {
+  const promise = typeof task === 'function' ? task() : task;
+  promise.catch((e) => console.warn(`${label} failed`, e));
 };
 
 // ---- Book (Partition) Support ----
@@ -123,7 +130,41 @@ const ALL_AMLAK_MAC_COLLECTIONS = new Set([
   'backups',
 ]);
 
-const useMacBackend = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
+const FIRESTORE_STORAGE_ESTIMATE_COLLECTIONS = Array.from(new Set([
+  ...Array.from(BOOK_SCOPED_COLLECTIONS),
+  ...Array.from(ALL_AMLAK_MAC_COLLECTIONS),
+]));
+
+const isBrowserLocalHost = () => {
+  if (typeof window === 'undefined') return true;
+  return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname);
+};
+
+const isPrivateOrLocalBackendUrl = (value: unknown): boolean => {
+  const raw = String(value || '').trim();
+  if (!raw) return false;
+  try {
+    const hostname = new URL(raw).hostname.toLowerCase();
+    if (['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname)) return true;
+    if (hostname.endsWith('.local')) return true;
+    if (/^10\./.test(hostname)) return true;
+    if (/^192\.168\./.test(hostname)) return true;
+    const private172 = hostname.match(/^172\.(\d+)\./);
+    return !!private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31;
+  } catch {
+    return false;
+  }
+};
+
+const useMacBackend = () => {
+  if ((import.meta as any).env?.VITE_DATA_BACKEND !== 'mac') return false;
+  const apiUrl = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
+  if (!isBrowserLocalHost() && isPrivateOrLocalBackendUrl(apiUrl)) {
+    console.warn('[Amlak] Ignoring local Mac backend URL on hosted site. Falling back to Firestore.', apiUrl);
+    return false;
+  }
+  return true;
+};
 const useMacCollection = (name: string) => useMacBackend() && ALL_AMLAK_MAC_COLLECTIONS.has(name);
 
 const macSave = async (name: string, data: any, bookId = currentBookId, merge = false) => {
@@ -401,12 +442,22 @@ export const getTransactions = async (opts?: { userId?: string; role?: string; b
   if (effectiveBuildings.length > 0) return all.filter((t: any) => matchesAnyBuilding(t, effectiveBuildings));
   return [];
 };
-export const saveTransaction = async (t: any) => {
+type SaveTransactionOptions = {
+  skipAmlakSheetSync?: boolean;
+};
+
+export const saveTransaction = async (t: any, options?: SaveTransactionOptions) => {
   const data = sanitize(t);
   invalidateFirestoreCache('col:');
-  if (useMacCollection('transactions')) return macSave('transactions', data);
-  if (!t.id) return addDoc(fsCollection( "transactions"), data);
-  return setDoc(fsDoc( "transactions", t.id), data);
+  let result: any;
+  if (useMacCollection('transactions')) result = await macSave('transactions', data);
+  else if (!t.id) result = await addDoc(fsCollection( "transactions"), data);
+  else result = await setDoc(fsDoc( "transactions", t.id), data);
+
+  if (!options?.skipAmlakSheetSync) {
+    runInBackground(() => syncSavedTransactionToAmlakSheets(data), 'Amlak Sheets transaction sync');
+  }
+  return result;
 };
 
 export const getAmlakWorkbooks = async () => {
@@ -451,6 +502,22 @@ export const saveAmlakWorkbook = async (workbook: any) => {
   if (useMacCollection('amlakSheets')) return macSave('amlakSheets', data);
   if (!workbook.id) return addDoc(fsCollection("amlakSheets"), data);
   return setDoc(fsDoc("amlakSheets", workbook.id), data);
+};
+
+const syncSavedTransactionToAmlakSheets = async (tx: any) => {
+  if (!tx?.id) return;
+  const [workbooks, buildings] = await Promise.all([
+    getAmlakWorkbooks().catch(() => []),
+    getBuildingsAllBooks({ includeDeleted: true }).catch(() => getBuildings({ includeDeleted: true })).catch(() => []),
+  ]);
+  const result = syncTransactionIntoAmlakWorkbooks(workbooks as any, tx, buildings as any);
+  if (!result.changed) return;
+  const changedIds = new Set(result.syncedWorkbookIds);
+  await Promise.all(
+    result.workbooks
+      .filter((workbook: any) => changedIds.has(workbook.id))
+      .map((workbook: any) => saveAmlakWorkbook(workbook))
+  );
 };
 
 export const deleteAmlakWorkbook = async (id: string) => {
@@ -559,17 +626,17 @@ export const requestTransactionDeletion = async (requestorId: string, txId: stri
   const req = sanitize({ type: 'transaction_delete', targetCollection: 'transactions', targetId: txId, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
   if (useMacCollection('approvals')) {
     const r = await macSave('approvals', req);
-    await macSave('audit', { action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    runInBackground(macSave('audit', { action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
     return { id: (r as any).id } as any;
   }
   const r = await addDoc(fsCollection( 'approvals'), req);
-  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
   // Notify admins via push notification
-  try {
+  runInBackground(async () => {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
     const userName = await getUserName(requestorId);
     notifyAdminsOfRequest({ approvalId: r.id, type: 'transaction_delete', requestedBy: userName, targetId: txId }).catch(() => {});
-  } catch (e) { /* push service not available */ }
+  }, 'approval notification');
   return r;
 };
 
@@ -1142,6 +1209,358 @@ export const deleteBank = async (id: string) => {
   return deleteDoc(fsDoc( "banks", id));
 };
 
+type ScannedBookDoc = {
+  bookId: string;
+  id: string;
+  data: any;
+};
+
+export type BankMergeResult = {
+  transactionsUpdated: number;
+  transfersUpdated: number;
+  buildingsUpdated: number;
+  bankStatementsUpdated: number;
+  banksRemoved: string[];
+  booksScanned: number;
+};
+
+const getBookScanList = async (): Promise<{ id: string; name: string }[]> => {
+  const books = await getBooks().catch(() => []);
+  const bookList = (books || []).map((book: any) => ({
+    id: String(book.id || '').trim(),
+    name: String(book.name || book.id || '').trim(),
+  })).filter(book => book.id);
+  if (!bookList.some(book => book.id === 'default')) {
+    bookList.unshift({ id: 'default', name: 'Main Book' });
+  }
+  return bookList;
+};
+
+const scanCollectionAcrossBooks = async (
+  collectionName: string,
+  opts?: { includeDeleted?: boolean },
+): Promise<{ booksScanned: number; docs: ScannedBookDoc[] }> => {
+  const includeDeleted = opts?.includeDeleted ?? true;
+  const books = await getBookScanList();
+  const perBook = await Promise.all(books.map(async book => {
+    try {
+      if (useMacCollection(collectionName)) {
+        const rows = await macListCollection<any>(collectionName, {
+          bookId: book.id,
+          includeDeleted,
+        });
+        return (rows || [])
+          .filter(row => includeDeleted || !row?.deleted)
+          .map(row => ({ bookId: book.id, id: String(row?.id || ''), data: row }))
+          .filter(row => row.id);
+      }
+      const path = rawBookPath(book.id, collectionName);
+      const snap = await getDocs(_colRef(assertDb(), path) as any);
+      return (snap.docs || [])
+        .map((d: any) => ({ bookId: book.id, id: d.id, data: { id: d.id, ...(d.data() as any) } }))
+        .filter((row: ScannedBookDoc) => includeDeleted || !row.data?.deleted);
+    } catch (_) {
+      return [];
+    }
+  }));
+  return { booksScanned: books.length, docs: perBook.flat() };
+};
+
+export type FirestoreCollectionStorageEstimate = {
+  name: string;
+  documents: number;
+  bytes: number;
+  sizeLabel: string;
+};
+
+export type FirestoreStorageEstimate = {
+  totalBytes: number;
+  totalSizeLabel: string;
+  totalSizeMB: number;
+  totalSizeGB: number;
+  documentCount: number;
+  collectionCount: number;
+  booksScanned: number;
+  collections: FirestoreCollectionStorageEstimate[];
+  estimatedAt: string;
+  note: string;
+};
+
+const formatStorageSize = (bytes: number): string => {
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+};
+
+const estimateDocumentBytes = (collectionName: string, docId: string, data: any): number => {
+  const payload = JSON.stringify({ path: `${collectionName}/${docId}`, data: sanitize(data) });
+  return new Blob([payload]).size;
+};
+
+export const getFirestoreStorageEstimate = async (): Promise<FirestoreStorageEstimate> => {
+  const books = await getBookScanList().catch(() => [{ id: 'default', name: 'Main Book' }]);
+  const collectionRows = await Promise.all(FIRESTORE_STORAGE_ESTIMATE_COLLECTIONS.map(async (collectionName) => {
+    try {
+      const isBookScoped = BOOK_SCOPED_COLLECTIONS.has(collectionName);
+      const docs = isBookScoped
+        ? (await scanCollectionAcrossBooks(collectionName, { includeDeleted: true })).docs
+        : await (async () => {
+            if (useMacCollection(collectionName)) {
+              const rows = await macListCollection<any>(collectionName, { bookId: 'default', includeDeleted: true });
+              return (rows || []).map(row => ({ bookId: 'default', id: String(row?.id || ''), data: row })).filter(row => row.id);
+            }
+            const snap = await getDocs(_colRef(assertDb(), collectionName) as any);
+            return (snap.docs || []).map((d: any) => ({ bookId: 'default', id: d.id, data: { id: d.id, ...(d.data() as any) } }));
+          })();
+
+      const bytes = docs.reduce((sum, docRow) => {
+        const pathName = isBookScoped ? rawBookPath(docRow.bookId, collectionName) : collectionName;
+        return sum + estimateDocumentBytes(pathName, docRow.id, docRow.data);
+      }, 0);
+
+      return {
+        name: collectionName,
+        documents: docs.length,
+        bytes,
+        sizeLabel: formatStorageSize(bytes),
+      };
+    } catch (_) {
+      return {
+        name: collectionName,
+        documents: 0,
+        bytes: 0,
+        sizeLabel: formatStorageSize(0),
+      };
+    }
+  }));
+
+  const nonEmptyCollections = collectionRows
+    .filter(row => row.documents > 0 || row.bytes > 0)
+    .sort((a, b) => b.bytes - a.bytes);
+  const totalBytes = nonEmptyCollections.reduce((sum, row) => sum + row.bytes, 0);
+
+  return {
+    totalBytes,
+    totalSizeLabel: formatStorageSize(totalBytes),
+    totalSizeMB: Number((totalBytes / (1024 * 1024)).toFixed(2)),
+    totalSizeGB: Number((totalBytes / (1024 * 1024 * 1024)).toFixed(3)),
+    documentCount: nonEmptyCollections.reduce((sum, row) => sum + row.documents, 0),
+    collectionCount: nonEmptyCollections.length,
+    booksScanned: books.length,
+    collections: nonEmptyCollections,
+    estimatedAt: new Date().toISOString(),
+    note: 'Estimated from readable app documents. Firebase billed storage can be higher because Firestore adds document, field, path, and index overhead that the browser SDK cannot read exactly.',
+  };
+};
+
+const applyBankReferenceMergeToCollection = async (
+  collectionName: string,
+  sourceBankNames: readonly string[],
+  targetBankName: string,
+  fields: readonly BankReferenceField[],
+  opts?: { includeVatReportSnapshot?: boolean },
+): Promise<number> => {
+  const scanned = await scanCollectionAcrossBooks(collectionName, { includeDeleted: true });
+  let updated = 0;
+
+  if (useMacCollection(collectionName)) {
+    for (const row of scanned.docs) {
+      const patch = bankReferencePatch(row.data, sourceBankNames, targetBankName, {
+        fields,
+        includeVatReportSnapshot: !!opts?.includeVatReportSnapshot,
+      });
+      if (!patch) continue;
+      await macSave(collectionName, { ...patch, id: row.id }, row.bookId, true);
+      updated++;
+    }
+    return updated;
+  }
+
+  let batch = writeBatch(assertDb());
+  let ops = 0;
+  const commit = async () => {
+    if (ops === 0) return;
+    await batch.commit();
+    batch = writeBatch(assertDb());
+    ops = 0;
+  };
+
+  for (const row of scanned.docs) {
+    const patch = bankReferencePatch(row.data, sourceBankNames, targetBankName, {
+      fields,
+      includeVatReportSnapshot: !!opts?.includeVatReportSnapshot,
+    });
+    if (!patch) continue;
+    batch.set(bookDoc(row.bookId, collectionName, row.id), sanitize(patch), { merge: true } as any);
+    ops++;
+    updated++;
+    if (ops >= 450) await commit();
+  }
+  await commit();
+  return updated;
+};
+
+export const getBankTransactionCounts = async (): Promise<Record<string, number>> => {
+  const scanned = await scanCollectionAcrossBooks('transactions', { includeDeleted: false });
+  return countRecordsByBank(scanned.docs.map(row => row.data));
+};
+
+export const mergeBankAccounts = async (options: {
+  sourceBankNames: string[];
+  targetBankName: string;
+  updatedBy?: string;
+  removeMergedBanks?: boolean;
+}): Promise<BankMergeResult> => {
+  const sourceBankNames = Array.from(new Map(
+    (options.sourceBankNames || [])
+      .map(name => String(name || '').trim())
+      .filter(Boolean)
+      .map(name => [bankAccountKey(name), name])
+  ).values());
+  const targetBankName = String(options.targetBankName || '').trim();
+  if (sourceBankNames.length < 2) throw new Error('Select two bank accounts to merge.');
+  if (!targetBankName) throw new Error('Select the merged bank account.');
+  const sourceKeys = sourceBankNames.map(bankAccountKey);
+  if (new Set(sourceKeys).size !== sourceBankNames.length) throw new Error('Select two different source bank accounts.');
+
+  const targetKey = bankAccountKey(targetBankName);
+  const bankNamesToRewrite = sourceBankNames.filter(name => bankAccountKey(name) !== targetKey);
+  const transactionFields = ['bankName', 'fromBankName', 'toBankName'] as const;
+  const bankNameOnly = ['bankName'] as const;
+
+  const [transactionsUpdated, transfersUpdated, buildingsUpdated, bankStatementsUpdated, scannedTransactions] = await Promise.all([
+    applyBankReferenceMergeToCollection('transactions', bankNamesToRewrite, targetBankName, transactionFields, { includeVatReportSnapshot: true }),
+    applyBankReferenceMergeToCollection('transfers', bankNamesToRewrite, targetBankName, transactionFields),
+    applyBankReferenceMergeToCollection('buildings', bankNamesToRewrite, targetBankName, bankNameOnly),
+    applyBankReferenceMergeToCollection('bank_statements', bankNamesToRewrite, targetBankName, bankNameOnly),
+    scanCollectionAcrossBooks('transactions', { includeDeleted: false }),
+  ]);
+
+  const banksRemoved: string[] = [];
+  if (options.removeMergedBanks !== false) {
+    for (const sourceName of sourceBankNames) {
+      if (bankAccountKey(sourceName) === targetKey) continue;
+      await deleteBank(sourceName).catch(() => {});
+      banksRemoved.push(sourceName);
+    }
+  }
+
+  invalidateFirestoreCache('col:');
+  await (useMacCollection('audit')
+    ? macSave('audit', sanitize({
+      action: 'MERGE_BANK_ACCOUNTS',
+      details: `Merged ${sourceBankNames.join(' + ')} into ${targetBankName}`,
+      userId: options.updatedBy || 'system',
+      timestamp: Date.now(),
+      transactionsUpdated,
+      transfersUpdated,
+      buildingsUpdated,
+      bankStatementsUpdated,
+      banksRemoved,
+    }), 'default')
+    : addDoc(_colRef(assertDb(), 'audit'), sanitize({
+      action: 'MERGE_BANK_ACCOUNTS',
+      details: `Merged ${sourceBankNames.join(' + ')} into ${targetBankName}`,
+      userId: options.updatedBy || 'system',
+      timestamp: Date.now(),
+      transactionsUpdated,
+      transfersUpdated,
+      buildingsUpdated,
+      bankStatementsUpdated,
+      banksRemoved,
+    })).catch(() => {})
+  );
+
+  return {
+    transactionsUpdated,
+    transfersUpdated,
+    buildingsUpdated,
+    bankStatementsUpdated,
+    banksRemoved,
+    booksScanned: scannedTransactions.booksScanned,
+  };
+};
+
+export const updateBankAccount = async (
+  originalBankName: string,
+  bank: { id?: string; name: string; iban?: string },
+  updatedBy?: string,
+): Promise<BankMergeResult & { renamed: boolean }> => {
+  const originalName = String(originalBankName || '').trim();
+  const nextName = String(bank?.name || '').trim();
+  const originalBankId = String(bank?.id || '').trim();
+  const bankDocId = originalBankId || nextName;
+  if (!originalName) throw new Error('Original bank name is missing.');
+  if (!nextName) throw new Error('Bank name is required.');
+
+  const bankData = sanitize({ ...bank, id: bankDocId, name: nextName, iban: bank?.iban || '' });
+  if (useMacCollection('banks')) await macSave('banks', bankData, currentBookId, !!originalBankId);
+  else await setDoc(fsDoc("banks", bankDocId), bankData);
+
+  const documentNameChanged = originalName !== nextName;
+  const referenceNameChanged = bankAccountKey(originalName) !== bankAccountKey(nextName);
+  const shouldDeleteOriginalNameDoc = !originalBankId && documentNameChanged;
+  if (!referenceNameChanged) {
+    if (shouldDeleteOriginalNameDoc) await deleteBank(originalName).catch(() => {});
+    invalidateFirestoreCache('col:');
+    return {
+      renamed: documentNameChanged,
+      transactionsUpdated: 0,
+      transfersUpdated: 0,
+      buildingsUpdated: 0,
+      bankStatementsUpdated: 0,
+      banksRemoved: shouldDeleteOriginalNameDoc ? [originalName] : [],
+      booksScanned: 0,
+    };
+  }
+
+  const transactionFields = ['bankName', 'fromBankName', 'toBankName'] as const;
+  const bankNameOnly = ['bankName'] as const;
+  const [transactionsUpdated, transfersUpdated, buildingsUpdated, bankStatementsUpdated, scannedTransactions] = await Promise.all([
+    applyBankReferenceMergeToCollection('transactions', [originalName], nextName, transactionFields, { includeVatReportSnapshot: true }),
+    applyBankReferenceMergeToCollection('transfers', [originalName], nextName, transactionFields),
+    applyBankReferenceMergeToCollection('buildings', [originalName], nextName, bankNameOnly),
+    applyBankReferenceMergeToCollection('bank_statements', [originalName], nextName, bankNameOnly),
+    scanCollectionAcrossBooks('transactions', { includeDeleted: false }),
+  ]);
+
+  if (shouldDeleteOriginalNameDoc) await deleteBank(originalName).catch(() => {});
+  invalidateFirestoreCache('col:');
+  await (useMacCollection('audit')
+    ? macSave('audit', sanitize({
+      action: 'UPDATE_BANK_ACCOUNT',
+      details: `Renamed bank ${originalName} to ${nextName}`,
+      userId: updatedBy || 'system',
+      timestamp: Date.now(),
+      transactionsUpdated,
+      transfersUpdated,
+      buildingsUpdated,
+      bankStatementsUpdated,
+    }), 'default')
+    : addDoc(_colRef(assertDb(), 'audit'), sanitize({
+      action: 'UPDATE_BANK_ACCOUNT',
+      details: `Renamed bank ${originalName} to ${nextName}`,
+      userId: updatedBy || 'system',
+      timestamp: Date.now(),
+      transactionsUpdated,
+      transfersUpdated,
+      buildingsUpdated,
+      bankStatementsUpdated,
+    })).catch(() => {})
+  );
+
+  return {
+    renamed: true,
+    transactionsUpdated,
+    transfersUpdated,
+    buildingsUpdated,
+    bankStatementsUpdated,
+    banksRemoved: shouldDeleteOriginalNameDoc ? [originalName] : [],
+    booksScanned: scannedTransactions.booksScanned,
+  };
+};
+
 export const getContracts = async (opts?: { includeDeleted?: boolean }) => {
   return getCollection("contracts", { includeDeleted: !!opts?.includeDeleted });
 };
@@ -1265,17 +1684,17 @@ export const requestTransactionEdit = async (requestorId: string, txId: string, 
   const req = sanitize({ type: 'transaction_edit', targetCollection: 'transactions', targetId: txId, payload: newData, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
   if (useMacCollection('approvals')) {
     const r = await macSave('approvals', req);
-    await macSave('audit', { action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    runInBackground(macSave('audit', { action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
     return { id: (r as any).id } as any;
   }
   const r = await addDoc(fsCollection( 'approvals'), req);
-  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
   // Notify admins via push notification
-  try {
+  runInBackground(async () => {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
     const userName = await getUserName(requestorId);
     notifyAdminsOfRequest({ approvalId: r.id, type: 'transaction_edit', requestedBy: userName, targetId: txId }).catch(() => {});
-  } catch (e) { /* push service not available */ }
+  }, 'approval notification');
   return r;
 };
 
@@ -1340,9 +1759,8 @@ export const approveRequest = async (approvalId: string, approverId: string, app
     if (!ap) throw new Error('Approval request not found');
 
     if (!approve) {
-      await macSave('approvals', { id: approvalId, handledBy: approverId, handledAt: Date.now(), status: 'REJECTED' }, currentBookId, true);
-      await macSave('audit', { action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() }).catch(() => {});
-      await macDelete('approvals', approvalId).catch(() => {});
+      await macDelete('approvals', approvalId);
+      runInBackground(macSave('audit', { action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
       return true;
     }
 
@@ -1354,9 +1772,8 @@ export const approveRequest = async (approvalId: string, approverId: string, app
       await macSave('users', { id: ap.targetId, password: ap.payload.newPassword }, currentBookId, true);
     }
 
-    await macSave('approvals', { id: approvalId, handledBy: approverId, handledAt: Date.now(), status: 'APPROVED' }, currentBookId, true);
-    await macSave('audit', { action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() }).catch(() => {});
-    await macDelete('approvals', approvalId).catch(() => {});
+    await macDelete('approvals', approvalId);
+    runInBackground(macSave('audit', { action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
     return true;
   }
   const docRef = fsDoc( 'approvals', approvalId);
@@ -1368,9 +1785,8 @@ export const approveRequest = async (approvalId: string, approverId: string, app
 
   // REJECT: just update status and clean up
   if (!approve) {
-    await setDoc(docRef, { handledBy: approverId, handledAt: Date.now(), status: 'REJECTED' }, { merge: true } as any);
-    await addDoc(fsCollection( 'audit'), sanitize({ action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {});
-    try { await deleteDoc(docRef); } catch (_) {}
+    await deleteDoc(docRef).catch(() => setDoc(docRef, { handledBy: approverId, handledAt: Date.now(), status: 'REJECTED' }, { merge: true } as any));
+    runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REJECT_REQUEST', details: `Approval rejected for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
     return true;
   }
 
@@ -1415,13 +1831,10 @@ export const approveRequest = async (approvalId: string, approverId: string, app
     throw new Error(`Approval action failed: ${(e as any)?.message || 'Unknown error'}`);
   }
 
-  // Action succeeded — NOW mark as APPROVED
-  await setDoc(docRef, { handledBy: approverId, handledAt: Date.now(), status: 'APPROVED' }, { merge: true } as any);
-  await addDoc(fsCollection( 'audit'), sanitize({ action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {});
-  // Remove the processed approval document so it disappears from the list
-  try {
-    await deleteDoc(docRef);
-  } catch (_) {}
+  // Action succeeded, so remove it from pending immediately. If deletion fails,
+  // fall back to marking it approved so pending queries still drop it.
+  await deleteDoc(docRef).catch(() => setDoc(docRef, { handledBy: approverId, handledAt: Date.now(), status: 'APPROVED' }, { merge: true } as any));
+  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'APPROVE_REQUEST', details: `Approval approved for ${approvalId}`, userId: approverId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
   return true;
 };
 
@@ -1490,17 +1903,17 @@ export const requestContractFinalize = async (requestorId: string, contractId: s
   const req = sanitize({ type: 'contract_finalize', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
   if (useMacCollection('approvals')) {
     const r = await macSave('approvals', req);
-    await macSave('audit', { action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    runInBackground(macSave('audit', { action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
     return { id: (r as any).id } as any;
   }
   const r = await addDoc(fsCollection( 'approvals'), req);
-  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
+  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
   // Notify admins via push notification
-  try {
+  runInBackground(async () => {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
     const userName = await getUserName(requestorId);
     notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_finalize', requestedBy: userName, targetId: contractId }).catch(() => {});
-  } catch (e) { /* push service not available */ }
+  }, 'approval notification');
   return r;
 };
 
@@ -1508,16 +1921,16 @@ export const requestContractDelete = async (requestorId: string, contractId: str
   const req = sanitize({ type: 'contract_delete', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
   if (useMacCollection('approvals')) {
     const r = await macSave('approvals', req);
-    await macSave('audit', { action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {});
+    runInBackground(macSave('audit', { action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
     return { id: (r as any).id } as any;
   }
   const r = await addDoc(fsCollection( 'approvals'), req);
-  await addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {});
-  try {
+  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+  runInBackground(async () => {
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
     const userName = await getUserName(requestorId);
     notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_delete', requestedBy: userName, targetId: contractId }).catch(() => {});
-  } catch (e) { /* push service not available */ }
+  }, 'approval notification');
   return r;
 };
 
@@ -2024,6 +2437,8 @@ export const saveTransfer = async (t: any) => {
     //   - EXPENSE recorded against the SOURCE building (in its own book)
     //   - INCOME  recorded against the DESTINATION building (in its own book)
     if (isInterBuilding) {
+      const transferPurpose = t.purpose || t.notes || 'Inter-Building Transfer';
+      const transferDetails = t.notes || transferPurpose;
       txRef = t.transactionId
         ? bookDoc(fromParsed.bookId, 'transactions', t.transactionId)
         : bookDoc(fromParsed.bookId, 'transactions');
@@ -2042,11 +2457,14 @@ export const saveTransfer = async (t: any) => {
         toType: t.toType,
         fromId: t.fromId,
         toId: t.toId,
-        purpose: t.purpose || t.notes || 'Inter-Building Transfer',
-        details: t.notes || '',
+        fromName: t.fromName || undefined,
+        toName: t.toName || undefined,
+        purpose: transferPurpose,
+        details: transferDetails,
         status: t.status || 'APPROVED',
         transferId: primaryTransferRef.id,
         createdBy: t.createdBy,
+        createdByName: t.createdByName,
         createdAt: t.createdAt || Date.now(),
         source: 'treasury',
       };
@@ -2054,6 +2472,8 @@ export const saveTransfer = async (t: any) => {
         ...commonBase,
         id: txRef.id,
         type: 'EXPENSE',
+        expenseCategory: 'Inter-Building Transfer',
+        expenseSubCategory: t.toName || t.toId || undefined,
         // RAW building id belonging to the source book
         buildingId: fromParsed.rawId,
         buildingBookId: fromParsed.bookId,
@@ -2065,6 +2485,9 @@ export const saveTransfer = async (t: any) => {
         ...commonBase,
         id: txRefDest.id,
         type: 'INCOME',
+        incomeSubType: 'OTHER',
+        expenseCategory: 'Inter-Building Transfer',
+        expenseSubCategory: t.fromName || t.fromId || undefined,
         // RAW building id belonging to the destination book
         buildingId: toParsed.rawId,
         buildingBookId: toParsed.bookId,
@@ -2092,6 +2515,9 @@ export const saveTransfer = async (t: any) => {
     if (txObj && txRef) batch.set(txRef, txObj as any);
     if (txObjDest && txRefDest) batch.set(txRefDest, txObjDest as any);
     await batch.commit();
+    [txObj, txObjDest].filter(Boolean).forEach((linkedTx: any) => {
+      runInBackground(() => syncSavedTransactionToAmlakSheets(linkedTx), 'Amlak Sheets treasury sync');
+    });
     return {
       id: primaryTransferRef.id,
       transactionId: txRef ? txRef.id : undefined,
@@ -2216,6 +2642,8 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
             buildingId: fromParsed.rawId,
             buildingBookId: fromParsed.bookId,
             type: 'EXPENSE',
+            expenseCategory: 'Inter-Building Transfer',
+            expenseSubCategory: tr.toName || tr.toId || undefined,
             interBuildingRole: 'SOURCE',
             source: 'treasury',
             transferId: tr.id,
@@ -2231,6 +2659,9 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
             buildingId: toParsed.rawId,
             buildingBookId: toParsed.bookId,
             type: 'INCOME',
+            incomeSubType: 'OTHER',
+            expenseCategory: 'Inter-Building Transfer',
+            expenseSubCategory: tr.fromName || tr.fromId || undefined,
             interBuildingRole: 'DEST',
             source: 'treasury',
             transferId: tr.id,
@@ -2264,11 +2695,14 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
         toType: tr.toType,
         fromId: tr.fromId,
         toId: tr.toId,
+        fromName: tr.fromName || undefined,
+        toName: tr.toName || undefined,
         purpose: tr.purpose || tr.notes || 'Inter-Building Transfer',
-        details: tr.notes || '',
+        details: tr.notes || tr.purpose || 'Inter-Building Transfer',
         status: tr.status || 'APPROVED',
         transferId: tr.id,
         createdBy: tr.createdBy,
+        createdByName: tr.createdByName,
         createdAt: tr.createdAt || Date.now(),
         source: 'treasury',
       };
@@ -2285,6 +2719,8 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
           ...commonBase,
           id: newTxId,
           type: 'EXPENSE',
+          expenseCategory: 'Inter-Building Transfer',
+          expenseSubCategory: tr.toName || tr.toId || undefined,
           buildingId: fromParsed.rawId,
           buildingBookId: fromParsed.bookId,
           interBuildingRole: 'SOURCE',
@@ -2302,6 +2738,9 @@ export const backfillInterBuildingTransactions = async (): Promise<number> => {
           ...commonBase,
           id: newDestTxId,
           type: 'INCOME',
+          incomeSubType: 'OTHER',
+          expenseCategory: 'Inter-Building Transfer',
+          expenseSubCategory: tr.fromName || tr.fromId || undefined,
           buildingId: toParsed.rawId,
           buildingBookId: toParsed.bookId,
           interBuildingRole: 'DEST',

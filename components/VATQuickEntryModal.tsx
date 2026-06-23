@@ -31,7 +31,7 @@ import {
 import { fmtDate, dateToLocalStr } from '../utils/dateFormat';
 import { formatNameWithRoom } from '../utils/customerDisplay';
 import { getInstallmentRange } from '../utils/installmentSchedule';
-import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { useLanguage } from '../i18n';
 import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
 import { computeInstallmentProgress } from '../utils/installmentPaymentProgress';
@@ -676,8 +676,8 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           totalWithVat: Math.round(amountIncl * 100) / 100,
           vatRate: 15,
           vatInvoiceNumber: qeType === 'SALES'
-            ? getNextVatInvoiceNumber(
-                transactions.filter((t) => t.type === TransactionType.INCOME && !t.isCreditNote),
+            ? getNextVatSalesInvoiceNumber(
+                transactions.filter((t) => t.type === TransactionType.INCOME && !t.isCreditNote && (t.zatcaQRCode || (t as any).zatcaReportedAt)),
                 qeDate,
               )
             : (qeVendorRefNo.trim() || getNextVatInvoiceNumber(transactions, qeDate)),

@@ -856,6 +856,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     await saveTransfer(transfer);
     
     await loadData();
+    showSuccess('Transfer saved. Added to Amlak Sheets as posted.');
     setView('LIST');
     resetForm();
   };
@@ -1162,7 +1163,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
         toBankName: needsBanks ? editTransferToBank : undefined,
       };
       await saveTransfer(updated);
-      showSuccess('Transfer updated successfully.');
+      showSuccess('Transfer updated successfully. Added to Amlak Sheets as posted.');
       setShowEditTransferModal(false);
       await loadData();
       closeConfirm();
@@ -1290,7 +1291,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     await saveTransfer(entry);
     await loadData();
     setEditingOpeningBal(false);
-    showSuccess('Opening balance updated');
+    showSuccess('Opening balance updated. Added to Amlak Sheets as posted.');
   };
 
   // Convert HEAD_OFFICE expenses to pseudo-transfer format for display

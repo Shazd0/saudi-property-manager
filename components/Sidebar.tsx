@@ -204,7 +204,8 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
   const [qaRoutes, setQaRoutes] = useState<string[]>(() => {
     try {
       const s = localStorage.getItem(`qa_${userId}`);
-      return s ? JSON.parse(s) : DEFAULT_QA_ROUTES;
+      const parsed = s ? JSON.parse(s) : DEFAULT_QA_ROUTES;
+      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : DEFAULT_QA_ROUTES;
     } catch {
       return DEFAULT_QA_ROUTES;
     }
@@ -218,20 +219,24 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    localStorage.setItem(`qa_${userId}`, JSON.stringify(qaRoutes));
+    localStorage.setItem(`qa_${userId}`, JSON.stringify(Array.isArray(qaRoutes) ? qaRoutes : DEFAULT_QA_ROUTES));
   }, [qaRoutes, userId]);
 
   useEffect(() => {
     localStorage.setItem(`qa_min_${userId}`, minimized ? '1' : '0');
   }, [minimized, userId]);
 
-  const activeItems = qaRoutes
+  const safeQaRoutes = Array.isArray(qaRoutes) ? qaRoutes : DEFAULT_QA_ROUTES;
+  const activeItems = safeQaRoutes
     .map(r => ALL_QA_DEFS.find(d => d.to === r))
     .filter((d): d is (typeof ALL_QA_DEFS)[0] => !!d);
 
   const removeRoute = (to: string) => setQaRoutes(prev => prev.filter(r => r !== to));
   const toggleRoute = (to: string) =>
-    setQaRoutes(prev => prev.includes(to) ? prev.filter(r => r !== to) : [...prev, to]);
+    setQaRoutes(prev => {
+      const safePrev = Array.isArray(prev) ? prev : DEFAULT_QA_ROUTES;
+      return safePrev.includes(to) ? safePrev.filter(r => r !== to) : [...safePrev, to];
+    });
 
   const onDragStart = (idx: number) => { dragIdx.current = idx; };
   const onDragOver = (e: React.DragEvent, idx: number) => {
@@ -417,7 +422,7 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
               </div>
               <div className="max-h-52 overflow-y-auto scrollbar-hide divide-y divide-slate-50">
                 {ALL_QA_DEFS.map(item => {
-                  const pinned = qaRoutes.includes(item.to);
+                  const pinned = safeQaRoutes.includes(item.to);
                   return (
                     <button
                       key={item.to}

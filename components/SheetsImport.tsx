@@ -12,7 +12,7 @@ import { isAmlakEasyWorkbook, parseAmlakEasyWorkbook } from '../utils/normalized
 import { buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import { getInstallmentRange } from '../utils/installmentSchedule';
 import { fmtDate } from '../utils/dateFormat';
-import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import {
   fuzzyNorm, fuzzyMatch, rowStableKey, matchUnitName, contractMatchesUnit,
   matchSheetRowsToAmlak, isIncomeSection, SheetRowMatchResult, SheetMatchContext,
@@ -659,8 +659,8 @@ const SheetsImport: React.FC<Props> = ({ currentUser }) => {
         base.amountExcludingVAT = amountExclVAT;
         base.vatAmount = vatAmount;
         base.vatRate = 15;
-        base.vatInvoiceNumber = getNextVatInvoiceNumber(
-          existingTxs.filter(tx => tx.type === TransactionType.INCOME && !(tx as any).isCreditNote),
+        base.vatInvoiceNumber = getNextVatSalesInvoiceNumber(
+          existingTxs.filter(tx => tx.type === TransactionType.INCOME && !(tx as any).isCreditNote && ((tx as any).zatcaQRCode || (tx as any).zatcaReportedAt)),
           row.parsedDate,
         );
         base.customerVATNumber = (customer as any)?.vatNumber || (customer as any)?.vatNo || undefined;

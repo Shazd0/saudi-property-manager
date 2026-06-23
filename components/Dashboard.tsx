@@ -4,7 +4,18 @@ import { useNavigate } from 'react-router-dom';
 /** Persist state to sessionStorage so filters survive tab switches */
 function useStickyState<T>(key: string, defaultValue: T): [T, React.Dispatch<React.SetStateAction<T>>] {
   const [value, setValue] = useState<T>(() => {
-    try { const v = sessionStorage.getItem(key); return v !== null ? JSON.parse(v) : defaultValue; } catch { return defaultValue; }
+    try {
+      const v = sessionStorage.getItem(key);
+      if (v === null) return defaultValue;
+      const parsed = JSON.parse(v);
+      if (Array.isArray(defaultValue)) return (Array.isArray(parsed) ? parsed : defaultValue) as T;
+      if (defaultValue && typeof defaultValue === 'object') {
+        return (parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : defaultValue) as T;
+      }
+      if (typeof defaultValue === 'boolean') return (typeof parsed === 'boolean' ? parsed : defaultValue) as T;
+      if (typeof defaultValue === 'string') return (typeof parsed === 'string' ? parsed : defaultValue) as T;
+      return parsed ?? defaultValue;
+    } catch { return defaultValue; }
   });
 
   const set: React.Dispatch<React.SetStateAction<T>> = useCallback((action: React.SetStateAction<T>) => {
@@ -287,14 +298,17 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const data = extraBooksRawData[bookId];
       if (!data) continue;
       const bookName = allBooks.find(b => b.id === bookId)?.name || bookId;
-      const filter = extraBookBuildingFilter[bookId];
+      const filter = Array.isArray(extraBookBuildingFilter?.[bookId]) ? extraBookBuildingFilter[bookId] : [];
+      const bookBuildings = Array.isArray(data.buildings) ? data.buildings : [];
+      const bookTransactions = Array.isArray(data.transactions) ? data.transactions : [];
+      const bookContracts = Array.isArray(data.contracts) ? data.contracts : [];
       const filteredBlds = filter && filter.length > 0
-        ? data.buildings.filter((b: any) => filter.includes(b.id))
-        : data.buildings;
+        ? bookBuildings.filter((b: any) => filter.includes(b.id))
+        : bookBuildings;
       const allowedBldIds = new Set(filteredBlds.map((b: any) => b.id));
       blds.push(...filteredBlds.map((b: any) => ({ ...b, _fromBook: bookName, _bookId: bookId })));
-      txns.push(...data.transactions.filter((t: any) => !t.buildingId || allowedBldIds.has(t.buildingId)));
-      cons.push(...data.contracts.filter((c: any) => !c.buildingId || allowedBldIds.has(c.buildingId)));
+      txns.push(...bookTransactions.filter((t: any) => !t.buildingId || allowedBldIds.has(t.buildingId)));
+      cons.push(...bookContracts.filter((c: any) => !c.buildingId || allowedBldIds.has(c.buildingId)));
     }
     return { buildings: blds, transactions: txns, contracts: cons };
   }, [crossBookEnabled, selectedExtraBookIds, extraBooksRawData, extraBookBuildingFilter, allBooks]);
@@ -1251,8 +1265,8 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
                       {allBooks.filter(b => b.id !== activeBookId).map(book => {
                         const isSelected = selectedExtraBookIds.includes(book.id);
                         const bookData = extraBooksRawData[book.id];
-                        const bookBuildings = bookData?.buildings || [];
-                        const filter = extraBookBuildingFilter[book.id] || [];
+                        const bookBuildings = Array.isArray(bookData?.buildings) ? bookData.buildings : [];
+                        const filter = Array.isArray(extraBookBuildingFilter?.[book.id]) ? extraBookBuildingFilter[book.id] : [];
 
                         return (
                           <div key={book.id} className={`rounded-xl border p-3 transition-colors ${isSelected ? 'border-indigo-200 bg-indigo-50' : 'border-slate-200 bg-slate-50'}`}>
@@ -1297,8 +1311,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
                                           checked={bChecked}
                                           onChange={() => {
                                             setExtraBookBuildingFilter(prev => {
-                                              const current = prev[book.id] && prev[book.id].length > 0
-                                                ? prev[book.id]
+                                              const previous = Array.isArray(prev?.[book.id]) ? prev[book.id] : [];
+                                              const current = previous.length > 0
+                                                ? previous
                                                 : bookBuildings.map((x: any) => x.id);
                                               const next = bChecked
                                                 ? current.filter((id: string) => id !== b.id)

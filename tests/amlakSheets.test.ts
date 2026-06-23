@@ -10,6 +10,11 @@ import {
   setWorksheetRowMeta,
   validateWorksheetPostingRows,
 } from '../utils/amlakSheetPosting';
+import {
+  INTER_BUILDING_TRANSFER_CATEGORY,
+  transactionSheetKindsForAmlak,
+  transactionSheetPaymentMethod,
+} from '../utils/amlakSheetRouting';
 import { ExpenseCategory } from '../types';
 import { buildMonitoringDueRoomRows } from '../utils/monitoringDueRooms';
 
@@ -63,7 +68,7 @@ describe('Amlak Sheets posting validation', () => {
     const building = { id: 'b1', name: 'Amlak Tower', units: [{ name: '101', defaultRent: 2500 }] } as any;
     const workbook = createBuildingAmlakSheetsWorkbook({ id: 'u1', name: 'Admin', role: UserRole.ADMIN }, building);
 
-    expect(workbook.sheets.map(sheet => sheet.name)).toEqual(['Rental Income', 'Other Income', 'Expenses', 'Owner Expenses', 'VAT Sales', 'VAT Purchase', 'Fees']);
+    expect(workbook.sheets.map(sheet => sheet.name)).toEqual(['Rental Income', 'Other Income', 'Expenses', 'Owner Expenses', 'VAT Sales', 'VAT Purchase', 'Fees', 'Treasury']);
     expect(workbook.buildingId).toBe('b1');
     expect(workbook.sheets.every(sheet => sheet.buildingId === 'b1')).toBe(true);
     expect(workbook.sheets[0].postingConfig?.defaultPostType).toBe('RENT');
@@ -73,6 +78,7 @@ describe('Amlak Sheets posting validation', () => {
     expect(workbook.sheets[4].postingConfig?.defaultPostType).toBe('RENT');
     expect(workbook.sheets[5].postingConfig?.defaultPostType).toBe('EXPENSE');
     expect(workbook.sheets[6].postingConfig?.defaultPostType).toBe('OTHER_INCOME');
+    expect(workbook.sheets[7].postingConfig?.defaultPostType).toBe('TREASURY');
   });
 
   it('normalizes older workbooks to the fixed building tabs', () => {
@@ -81,8 +87,8 @@ describe('Amlak Sheets posting validation', () => {
     const building = { id: 'b9', name: 'Building 9', units: [] } as any;
     const normalized = ensureBuildingWorkbookSheets({ ...old, sheets: [old.sheets[0]] }, building);
 
-    expect(normalized.sheets.map(sheet => sheet.sheetKind)).toEqual(['rentalIncome', 'otherIncome', 'expense', 'ownerExpense', 'vatIncome', 'vatExpense', 'fees']);
-    expect(normalized.sheets.map(sheet => sheet.buildingName)).toEqual(['Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9']);
+    expect(normalized.sheets.map(sheet => sheet.sheetKind)).toEqual(['rentalIncome', 'otherIncome', 'expense', 'ownerExpense', 'vatIncome', 'vatExpense', 'fees', 'treasury']);
+    expect(normalized.sheets.map(sheet => sheet.buildingName)).toEqual(['Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9', 'Building 9']);
   });
 
   it('turns a mapped rent row into an Amlak transaction', () => {
@@ -169,6 +175,204 @@ describe('Amlak Sheets posting validation', () => {
     expect(result[0].transaction?.expenseCategory).toBe(ExpenseCategory.OWNER_EXPENSE);
     expect(result[0].transaction?.ownerId).toBe('owner1');
   });
+
+  it('posts property rent expense without requiring the salary month column or a hidden bank field', () => {
+    const payingBuilding = { id: 'b1', name: 'Amlak Tower', units: [] } as any;
+    const leasedBuilding = {
+      id: 'lease1',
+      name: 'Warehouse Lease',
+      units: [],
+      lease: { isLeased: true, landlordName: 'Landlord One' },
+    } as any;
+    let sheet = createAmlakPostingTemplateSheet(1, 'expense', payingBuilding);
+    sheet = setWorksheetCell(sheet, 'A2', '2026-06-08');
+    sheet = setWorksheetCell(sheet, 'B2', ExpenseCategory.PROPERTY_RENT);
+    sheet = setWorksheetCell(sheet, 'C2', 'Warehouse Lease - Landlord One');
+    sheet = setWorksheetCell(sheet, 'D2', '');
+    sheet = setWorksheetCell(sheet, 'F2', 'BANK');
+    sheet = setWorksheetCell(sheet, 'G2', '7500');
+
+    const result = validateWorksheetPostingRows(sheet, {
+      currentUser: { id: 'u1', name: 'Admin', role: UserRole.ADMIN },
+      buildings: [payingBuilding, leasedBuilding],
+      contracts: [],
+      users: [],
+      existingTransactions: [],
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].ok).toBe(true);
+    expect(result[0].transaction?.type).toBe(TransactionType.EXPENSE);
+    expect(result[0].transaction?.expenseCategory).toBe(ExpenseCategory.PROPERTY_RENT);
+    expect(result[0].transaction?.buildingId).toBe('lease1');
+    expect(result[0].transaction?.salaryPeriod).toBeUndefined();
+  });
+
+  it('requires the month column only for salary expense rows', () => {
+    const building = { id: 'b1', name: 'Amlak Tower', units: [] } as any;
+    let sheet = createAmlakPostingTemplateSheet(1, 'expense', building);
+    sheet = setWorksheetCell(sheet, 'A2', '2026-06-08');
+    sheet = setWorksheetCell(sheet, 'B2', ExpenseCategory.SALARY);
+    sheet = setWorksheetCell(sheet, 'C2', 'Staff One');
+    sheet = setWorksheetCell(sheet, 'D2', '');
+    sheet = setWorksheetCell(sheet, 'F2', 'CASH');
+    sheet = setWorksheetCell(sheet, 'G2', '3000');
+
+    const result = validateWorksheetPostingRows(sheet, {
+      currentUser: { id: 'u1', name: 'Admin', role: UserRole.ADMIN },
+      buildings: [building],
+      contracts: [],
+      users: [{ id: 'staff1', name: 'Staff One', role: UserRole.EMPLOYEE }],
+      existingTransactions: [],
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].ok).toBe(false);
+    expect(result[0].errors).toContain('Month is required for salary rows');
+  });
+
+  it('turns a treasury sheet row into a transfer payload', () => {
+    const building = { id: 'b1', name: 'Amlak Tower', units: [] } as any;
+    let sheet = createAmlakPostingTemplateSheet(1, 'treasury', building);
+    sheet = setWorksheetCell(sheet, 'A2', '2026-06-12');
+    sheet = setWorksheetCell(sheet, 'B2', 'HEAD_OFFICE');
+    sheet = setWorksheetCell(sheet, 'D2', 'BUILDING');
+    sheet = setWorksheetCell(sheet, 'E2', 'Amlak Tower');
+    sheet = setWorksheetCell(sheet, 'F2', 'CASH');
+    sheet = setWorksheetCell(sheet, 'I2', '1200');
+    sheet = setWorksheetCell(sheet, 'J2', 'Building Operations');
+    sheet = setWorksheetCell(sheet, 'K2', 'Cash transfer');
+
+    const result = validateWorksheetPostingRows(sheet, {
+      currentUser: { id: 'u1', name: 'Admin', role: UserRole.ADMIN },
+      buildings: [building],
+      contracts: [],
+      users: [],
+      existingTransactions: [],
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].ok).toBe(true);
+    expect(result[0].transfer?.date).toBe('2026-06-12');
+    expect(result[0].transfer?.fromType).toBe('HEAD_OFFICE');
+    expect(result[0].transfer?.toType).toBe('BUILDING');
+    expect(result[0].transfer?.fromName).toBe('Head Office');
+    expect(result[0].transfer?.toName).toBe('Amlak Tower');
+    expect(result[0].transfer?.toId).toBe('b1');
+    expect(result[0].transfer?.amount).toBe(1200);
+    expect(result[0].transfer?.createdByName).toBe('Admin');
+  });
+
+  it('matches treasury building accounts from another book by display label', () => {
+    const currentBuilding = { id: 'b1', name: 'Amlak Tower', units: [] } as any;
+    const otherBookBuilding = {
+      id: 'book-2:b2',
+      name: 'Remote Tower',
+      _rawBuildingId: 'b2',
+      _sourceBookId: 'book-2',
+      _bookDisplayName: 'Second Book',
+      units: [],
+    } as any;
+    let sheet = createAmlakPostingTemplateSheet(1, 'treasury', currentBuilding);
+    sheet = setWorksheetCell(sheet, 'A2', '2026-06-12');
+    sheet = setWorksheetCell(sheet, 'B2', 'BUILDING');
+    sheet = setWorksheetCell(sheet, 'C2', 'Amlak Tower');
+    sheet = setWorksheetCell(sheet, 'D2', 'BUILDING');
+    sheet = setWorksheetCell(sheet, 'E2', 'Remote Tower - Second Book');
+    sheet = setWorksheetCell(sheet, 'F2', 'CASH');
+    sheet = setWorksheetCell(sheet, 'I2', '700');
+    sheet = setWorksheetCell(sheet, 'J2', 'Inter-Building Transfer');
+
+    const result = validateWorksheetPostingRows(sheet, {
+      currentUser: { id: 'u1', name: 'Admin', role: UserRole.ADMIN },
+      buildings: [currentBuilding, otherBookBuilding],
+      contracts: [],
+      users: [],
+      existingTransactions: [],
+    });
+
+    expect(result).toHaveLength(1);
+    expect(result[0].ok).toBe(true);
+    expect(result[0].transfer?.fromId).toBe('b1');
+    expect(result[0].transfer?.toId).toBe('book-2:b2');
+    expect(result[0].transfer?.toName).toBe('Remote Tower - Second Book');
+  });
+
+  it('routes inter-building treasury legs to expense and other income sheets', () => {
+    const building = { id: 'b1', name: 'Source Building', units: [] } as any;
+    const sourceLeg = {
+      id: 'tx-source',
+      date: '2026-06-12',
+      type: TransactionType.EXPENSE,
+      amount: 800,
+      paymentMethod: 'TREASURY',
+      originalPaymentMethod: 'BANK',
+      source: 'treasury',
+      fromType: 'BUILDING',
+      fromId: 'b1',
+      toType: 'BUILDING',
+      toId: 'b2',
+      interBuildingRole: 'SOURCE',
+      expenseCategory: INTER_BUILDING_TRANSFER_CATEGORY,
+      details: 'Inter-building cash movement',
+      createdAt: 1,
+      createdBy: 'u1',
+      createdByName: 'Admin',
+    } as any;
+    const destLeg = {
+      ...sourceLeg,
+      id: 'tx-dest',
+      type: TransactionType.INCOME,
+      buildingId: 'b2',
+      interBuildingRole: 'DEST',
+    } as any;
+
+    expect(transactionSheetKindsForAmlak(sourceLeg, building)).toEqual(['expense']);
+    expect(transactionSheetKindsForAmlak(destLeg, building)).toEqual(['otherIncome']);
+    expect(transactionSheetPaymentMethod(destLeg)).toBe('BANK');
+  });
+
+  it('routes non-residential no-VAT fees to the fees sheet only', () => {
+    const nonResidentialBuilding = { id: 'b1', name: 'Shop Tower', propertyType: 'NON_RESIDENTIAL', units: [] } as any;
+    const feeTx = {
+      id: 'fee-1',
+      date: '2026-06-12',
+      type: TransactionType.INCOME,
+      amount: 500,
+      paymentMethod: PaymentMethod.BANK,
+      buildingId: 'b1',
+      unitNumber: 'Shop 1',
+      incomeSubType: 'OTHER',
+      feesEntry: true,
+      details: 'Non-VAT Fees - Shop 1',
+      createdAt: 1,
+      createdBy: 'u1',
+      createdByName: 'Admin',
+    } as any;
+
+    expect(transactionSheetKindsForAmlak(feeTx, nonResidentialBuilding)).toEqual(['fees']);
+  });
+
+  it('keeps residential no-VAT fees on the fees sheet', () => {
+    const residentialBuilding = { id: 'b1', name: 'Family Tower', propertyType: 'RESIDENTIAL', units: [] } as any;
+    const feeTx = {
+      id: 'fee-1',
+      date: '2026-06-12',
+      type: TransactionType.INCOME,
+      amount: 500,
+      paymentMethod: PaymentMethod.BANK,
+      buildingId: 'b1',
+      unitNumber: '101',
+      incomeSubType: 'OTHER',
+      feesEntry: true,
+      details: 'Non-VAT Fees - 101',
+      createdAt: 1,
+      createdBy: 'u1',
+      createdByName: 'Admin',
+    } as any;
+
+    expect(transactionSheetKindsForAmlak(feeTx, residentialBuilding)).toEqual(['fees']);
+  });
 });
 
 describe('Amlak Sheets monitoring due rows', () => {
@@ -220,5 +424,75 @@ describe('Amlak Sheets monitoring due rows', () => {
 
     expect(rows.some(row => row.nextDueDate === '2026-01-01' && row.totalDue === 15000)).toBe(true);
     expect(rows.some(row => row.nextDueDate === '2026-07-01')).toBe(false);
+  });
+
+  it('keeps carried prior-lease balances as a separate row from renewed contract dues', () => {
+    const building = {
+      id: 'b1',
+      name: 'Amlak Tower',
+      propertyType: 'RESIDENTIAL',
+      units: [{ name: '101' }],
+    } as any;
+    const oldContract = {
+      id: 'old-c1',
+      contractNo: 'C-7',
+      status: 'Old 1',
+      buildingId: 'b1',
+      buildingName: 'Amlak Tower',
+      unitName: '101',
+      customerId: 'cust1',
+      customerName: 'Tenant One',
+      rentValue: 120000,
+      totalValue: 120000,
+      installmentCount: 12,
+      firstInstallment: 10000,
+      otherInstallment: 10000,
+      periodMonths: 12,
+      fromDate: '2025-01-01',
+      toDate: '2025-12-31',
+    } as any;
+    const renewal = {
+      ...oldContract,
+      id: 'new-c1',
+      status: 'Active',
+      renewedFromId: oldContract.id,
+      priorLeaseOutstandingAtRenewal: 20000,
+      priorLeaseContractNoAtRenewal: 'C-7',
+      priorLeasePaidAtRenewal: 100000,
+      priorLeaseEffectiveTotalAtRenewal: 120000,
+      fromDate: '2026-01-01',
+      toDate: '2026-12-31',
+    } as any;
+    const oldPayments = Array.from({ length: 10 }, (_, index) => ({
+      id: `old-pay-${index + 1}`,
+      type: TransactionType.INCOME,
+      status: 'APPROVED',
+      buildingId: 'b1',
+      unitNumber: '101',
+      contractId: oldContract.id,
+      customerId: 'cust1',
+      date: `2025-${String(index + 1).padStart(2, '0')}-01`,
+      amount: 10000,
+      amountIncludingVAT: 10000,
+    } as any));
+
+    const withPrior = buildMonitoringDueRoomRows({
+      building,
+      contracts: [oldContract, renewal],
+      transactions: oldPayments,
+      reportUpTo: '2026-01-31',
+      payThrough: '2026-01-01',
+    });
+    const sheetsRows = buildMonitoringDueRoomRows({
+      building,
+      contracts: [oldContract, renewal],
+      transactions: oldPayments,
+      reportUpTo: '2026-01-31',
+      payThrough: '2026-01-01',
+    });
+
+    expect(withPrior.some(row => row.isPriorLeaseRow && row.totalDue === 20000)).toBe(true);
+    expect(sheetsRows.some(row => row.isPriorLeaseRow && row.nextDueDate === '2025-11-01' && row.totalDue === 20000)).toBe(true);
+    expect(sheetsRows.some(row => row.contract.id === 'new-c1' && row.nextDueDate === '2026-01-01' && row.totalDue === 10000)).toBe(true);
   });
 });

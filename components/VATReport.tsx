@@ -11,7 +11,7 @@ import { fmtDate, dateToLocalStr } from '../utils/dateFormat';
 import { buildTransactionSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import { getInstallmentRange } from '../utils/installmentSchedule';
-import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { applyVatReportSnapshot, createVatReportSnapshot } from '../utils/vatSnapshot';
 import { auth } from '../firebase';
 import { useLanguage } from '../i18n';
@@ -20,6 +20,7 @@ import { computeInstallmentProgress } from '../utils/installmentPaymentProgress'
 import { getNonResFeePeriodContext, getNonResFeeBreakdownLines } from '../utils/nonResidentialFeeSchedule';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
+import html2canvas from 'html2canvas';
 
 const ZATCA_SERVICE_URL = (import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022';
 
@@ -36,8 +37,13 @@ const escapeHtml = (value: string | number | null | undefined): string =>
     .replace(/'/g, '&#39;');
 const formatAmount = (value: number): string =>
   Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const hasZatcaReport = (tx: Transaction): boolean => Boolean(tx.zatcaQRCode || (tx as any).zatcaReportedAt);
 
 const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
+const compareVatSequence = (a: Transaction, b: Transaction): number =>
+  (a.date || '').localeCompare(b.date || '') ||
+  ((a.createdAt || 0) - (b.createdAt || 0)) ||
+  (a.vatInvoiceNumber || '').localeCompare(b.vatInvoiceNumber || '', undefined, { numeric: true });
 
 /** Calendar quarters (Jan–Mar, Apr–Jun, Jul–Sep, Oct–Dec). */
 const getQuarterDateRange = (year: number, quarter: 1 | 2 | 3 | 4): { from: string; to: string } => {
@@ -224,7 +230,7 @@ const VATReport: React.FC = () => {
     if (vatRows.length === 0) return;
 
     const invoiceRows = vatRows
-      .filter(t => t.type === TransactionType.INCOME && !t.isCreditNote)
+      .filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && hasZatcaReport(t))
       .slice()
       .sort((a, b) => (a.date || '').localeCompare(b.date || '') || ((a.createdAt || 0) - (b.createdAt || 0)));
     const creditRows = vatRows
@@ -241,7 +247,7 @@ const VATReport: React.FC = () => {
     for (const tx of invoiceRows) {
       const year = String(new Date(tx.date || Date.now()).getFullYear());
       yearlyInvoiceCounters[year] = (yearlyInvoiceCounters[year] || 0) + 1;
-      const nextNo = `${year}-${String(yearlyInvoiceCounters[year]).padStart(2, '0')}`;
+      const nextNo = `SV-${yearlyInvoiceCounters[year]}`;
       const oldNo = String(tx.vatInvoiceNumber || '');
       invoiceNumberMap.set(oldNo, nextNo);
       if (oldNo !== nextNo || (tx as any).vatReportSnapshot?.vatInvoiceNumber !== nextNo) {
@@ -660,8 +666,8 @@ const VATReport: React.FC = () => {
           totalWithVat: Math.round(amountIncl * 100) / 100,
           vatRate: 15,
           vatInvoiceNumber: qeType === 'SALES'
-            ? getNextVatInvoiceNumber(
-                transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+            ? getNextVatSalesInvoiceNumber(
+                transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && hasZatcaReport(t)),
                 qeDate,
               )
             : qeVendorRefNo.trim(),
@@ -836,7 +842,7 @@ const VATReport: React.FC = () => {
     }
   };
 
-  const isReportedToZatca = (tx: Transaction) => Boolean(tx.zatcaQRCode || (tx as any).zatcaReportedAt);
+  const isReportedToZatca = hasZatcaReport;
 
   const vatReportTransactions = useMemo(() => {
     return transactions.map(tx => (isReportedToZatca(tx) ? applyVatReportSnapshot(tx) : tx));
@@ -966,7 +972,7 @@ const VATReport: React.FC = () => {
       });
     }
     
-    setFilteredVATTransactions(filtered);
+    setFilteredVATTransactions([...filtered].sort(compareVatSequence));
   }, [vatReportTransactions, filterFromDate, filterToDate, reportView, searchTerm, filterBuildingId, filterUnit, resolveSalesCustomerName]);
 
   const allFilteredSelected = filteredVATTransactions.length > 0 && filteredVATTransactions.every(t => selectedIds.has(t.id));
@@ -1540,12 +1546,18 @@ const VATReport: React.FC = () => {
             <div class="ftr-notes">
               <div><b>Payment:</b> ${escapeHtml(tx.paymentMethod || 'Cash')}</div>
               <div style="margin-top:6px">Computer-generated document. No signature required.</div>
-              <div class="ftr-powered">Powered by AMLAK Property Manager</div>
             </div>
             <div class="qr-box">
               <img src="${qrSrc}" class="qr-img" alt="ZATCA QR Code"/>
               <div class="qr-lbl">ZATCA QR Code</div>
             </div>
+          </div>
+          <div class="brand-strip">
+            <div>
+              <div class="brand-mark">Powered by AMLAK Property Manager</div>
+              <div class="brand-sub">Professional property management software</div>
+            </div>
+            <div class="brand-copy">© ${new Date().getFullYear()} AMLAK Software. All rights reserved.</div>
           </div>
         </section>
       `;
@@ -1558,67 +1570,70 @@ const VATReport: React.FC = () => {
           <title>Bulk Invoice Print - ${scopeLabel}</title>
           <style>
             *{box-sizing:border-box;margin:0;padding:0}
-            body{font-family:'Inter',Arial,sans-serif;background:radial-gradient(circle at top,#dcfce7 0%,#f0fdf4 45%,#ffffff 100%);color:#1e293b;-webkit-print-color-adjust:exact;print-color-adjust:exact}
+            body{font-family:'Inter',Arial,sans-serif;background:#f8fafc;color:#1e293b;-webkit-print-color-adjust:exact;print-color-adjust:exact}
             .wrap{max-width:210mm;margin:0 auto;padding:6mm}
             .toolbar{display:flex;gap:8px;margin-bottom:8px}
-            .btn{border:1px solid #86efac;border-radius:10px;padding:6px 11px;font-size:11px;font-weight:800;cursor:pointer;background:#ffffff;color:#065f46;box-shadow:0 4px 10px rgba(16,185,129,.12)}
-            .btn.primary{background:linear-gradient(135deg,#047857 0%,#10b981 100%);color:#fff;border-color:#059669}
-            .summary{background:linear-gradient(135deg,#ecfdf5 0%,#f0fdf4 100%);border:1px solid #86efac;border-radius:14px;padding:8px 10px;margin-bottom:8px;font-size:12px;font-weight:800;color:#065f46;box-shadow:0 8px 18px rgba(16,185,129,.14)}
-            .invoice-page{max-width:210mm;margin:0 auto;padding:14mm 16mm;position:relative;min-height:297mm;border:1px solid #a7f3d0;background:linear-gradient(180deg,#ffffff 0%,#f8fffb 100%);page-break-after:always;box-shadow:0 16px 36px rgba(16,185,129,.16);border-radius:16px}
+            .btn{border:1px solid #0f766e;border-radius:10px;padding:6px 11px;font-size:11px;font-weight:800;cursor:pointer;background:#ffffff;color:#0f766e;box-shadow:0 4px 10px rgba(15,118,110,.10)}
+            .btn.primary{background:linear-gradient(135deg,#0f766e 0%,#059669 100%);color:#fff;border-color:#0f766e}
+            .summary{background:#ffffff;border:1px solid #0f766e;border-radius:14px;padding:8px 10px;margin-bottom:8px;font-size:12px;font-weight:800;color:#0f766e;box-shadow:0 8px 18px rgba(15,118,110,.10)}
+            .invoice-page{max-width:210mm;margin:0 auto;padding:14mm 16mm;position:relative;min-height:297mm;border:1px solid #99f6e4;background:#ffffff;page-break-after:always;box-shadow:0 16px 36px rgba(15,118,110,.14);border-radius:16px}
             .invoice-page:last-child{page-break-after:auto}
-            .cb{position:absolute;width:56px;height:56px;border-style:solid;border-color:#d1fae5}
+            .cb{position:absolute;width:56px;height:56px;border-style:solid;border-color:#5eead4}
             .cb-tl{top:6mm;left:6mm;border-width:2px 0 0 2px;border-radius:8px 0 0 0}
             .cb-tr{top:6mm;right:6mm;border-width:2px 2px 0 0;border-radius:0 8px 0 0}
             .cb-bl{bottom:6mm;left:6mm;border-width:0 0 2px 2px;border-radius:0 0 0 8px}
             .cb-br{bottom:6mm;right:6mm;border-width:0 2px 2px 0;border-radius:0 0 8px 0}
-            .hdr{display:flex;justify-content:space-between;align-items:start;margin-bottom:22px;padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#065f46 0%,#10b981 75%);box-shadow:0 12px 26px rgba(5,150,105,.28)}
+            .hdr{display:flex;justify-content:space-between;align-items:start;margin-bottom:22px;padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f766e 0%,#059669 58%,#0d9488 100%);box-shadow:0 12px 26px rgba(15,118,110,.24)}
             .hdr-co{display:flex;align-items:center;gap:18px}
             .hdr-logo{width:70px;height:70px;background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.35);border-radius:14px;display:flex;align-items:center;justify-content:center;padding:10px;backdrop-filter:blur(3px)}
             .hdr-logo img{max-width:100%;max-height:100%;object-fit:contain}
             .co-ar{font-size:18px;font-weight:900;color:#ffffff;direction:rtl;text-shadow:0 1px 3px rgba(0,0,0,.18)}
-            .co-en{font-size:11px;font-weight:700;color:#d1fae5;letter-spacing:.5px;margin-top:2px}
-            .co-tag{font-size:10px;color:#ecfdf5;margin-top:3px;opacity:.95}
+            .co-en{font-size:11px;font-weight:700;color:#ccfbf1;letter-spacing:.5px;margin-top:2px}
+            .co-tag{font-size:10px;color:#f8fafc;margin-top:3px;opacity:.92}
             .badge-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
             .am-badge{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.35);border-radius:12px;padding:6px 8px;backdrop-filter:blur(3px)}
             .am-badge img{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid rgba(255,255,255,.4)}
             .am-meta{text-align:right;line-height:1.1}
-            .am-title{font-size:10px;font-weight:800;color:#ecfdf5;letter-spacing:.2px}
-            .am-powered{font-size:9px;color:#bbf7d0;font-weight:700}
+            .am-title{font-size:10px;font-weight:800;color:#f8fafc;letter-spacing:.2px}
+            .am-powered{font-size:9px;color:#ccfbf1;font-weight:700}
             .badge{text-align:right}
             .badge-type{font-size:22px;font-weight:900;color:#ffffff;letter-spacing:1.5px;text-transform:uppercase;text-shadow:0 1px 3px rgba(0,0,0,.16)}
-            .badge-cn{font-size:9px;color:#dcfce7;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
+            .badge-cn{font-size:9px;color:#ccfbf1;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
             .pills{display:flex;gap:10px;margin-bottom:20px}
-            .pill{flex:1;background:#ffffff;border:1px solid #bbf7d0;border-radius:12px;padding:10px 12px;text-align:center;box-shadow:0 6px 12px rgba(16,185,129,.09)}
-            .pill.green{background:linear-gradient(180deg,#ecfdf5 0%,#d1fae5 100%);border-color:#86efac}
+            .pill{flex:1;background:#ffffff;border:1px solid #d8dee8;border-radius:12px;padding:10px 12px;text-align:center;box-shadow:0 6px 12px rgba(15,23,42,.05)}
+            .pill.green{background:#ffffff;border-color:#0f766e;border-width:1.5px}
             .pill-lbl{font-size:8px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
-            .pill-val{font-size:13px;font-weight:900;color:#065f46}
+            .pill-val{font-size:13px;font-weight:900;color:#0f766e}
             .party-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
-            .party-card{border-radius:12px;padding:14px;background:linear-gradient(180deg,#f0fdf4 0%,#ffffff 100%);border:1px solid #bbf7d0;box-shadow:0 8px 16px rgba(16,185,129,.08)}
-            .party-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px;color:#047857;margin-bottom:8px;padding-bottom:6px;border-bottom:1.5px solid #d1fae5}
+            .party-card{border-radius:12px;padding:14px;background:#ffffff;border:1px solid #d8dee8;border-top:3px solid #0f766e;box-shadow:0 8px 16px rgba(15,23,42,.05)}
+            .party-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px;color:#0f766e;margin-bottom:8px;padding-bottom:6px;border-bottom:1.5px solid #e2e8f0}
             .party-name{font-size:14px;font-weight:700;color:#0f172a;margin-bottom:2px}
-            .party-ar{font-size:13px;font-weight:700;color:#065f46;margin-bottom:4px;direction:rtl}
+            .party-ar{font-size:13px;font-weight:700;color:#0f766e;margin-bottom:4px;direction:rtl}
             .party-sub{font-size:11px;color:#64748b;margin-top:2px}
             .tbl{width:100%;border-collapse:collapse;margin-bottom:18px;border-radius:12px;overflow:hidden}
-            .tbl thead tr{background:linear-gradient(135deg,#d1fae5 0%,#bbf7d0 100%)}
-            .tbl th{padding:11px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#047857;text-align:left;border-bottom:2px solid #bbf7d0}
+            .tbl thead tr{background:linear-gradient(135deg,#0f766e 0%,#0d9488 100%)}
+            .tbl th{padding:11px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#ffffff;text-align:left;border-bottom:2px solid #0f766e}
             .tbl th:last-child{text-align:right}
             .tbl td{padding:16px 14px;font-size:13px;border-bottom:1px solid #f1f5f9;vertical-align:top}
             .tbl td:last-child{text-align:right;font-weight:700;color:#0f172a}
-            .tbl-num{font-weight:700;color:#10b981;font-size:14px}
+            .tbl-num{font-weight:700;color:#0f766e;font-size:14px}
             .tbl-sub{font-size:10px;color:#94a3b8;margin-top:3px}
             .tots{display:flex;justify-content:flex-end;margin-top:6px}
-            .tot-card{width:260px;background:linear-gradient(180deg,#ecfdf5 0%,#f8fffb 100%);border:2px solid #86efac;border-radius:14px;padding:16px;box-shadow:0 10px 20px rgba(16,185,129,.14)}
+            .tot-card{width:260px;background:#ffffff;border:2px solid #0f766e;border-radius:14px;padding:16px;box-shadow:0 10px 20px rgba(15,118,110,.12)}
             .tot-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;color:#64748b}
             .tot-row span:last-child{font-weight:700;color:#0f172a}
-            .tot-total{display:flex;justify-content:space-between;border-top:1.5px solid #d1fae5;padding-top:10px;margin-top:10px;font-size:16px;font-weight:900;color:#064e3b}
+            .tot-total{display:flex;justify-content:space-between;border-top:1.5px solid #99f6e4;padding-top:10px;margin-top:10px;font-size:16px;font-weight:900;color:#0f766e}
             .tot-sar{font-size:10px;font-weight:600;opacity:.6;margin-left:2px}
             .ftr{display:flex;justify-content:space-between;align-items:flex-end;margin-top:20px;padding-top:18px;border-top:1px dashed #e2e8f0}
             .ftr-notes{font-size:10px;color:#94a3b8;line-height:1.7;max-width:55%}
             .ftr-notes b{color:#64748b}
-            .ftr-powered{margin-top:7px;font-size:10px;font-weight:800;color:#047857}
+            .brand-strip{margin-top:16px;border:1px solid #d8dee8;border-radius:12px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#ffffff}
+            .brand-mark{font-size:10px;font-weight:900;letter-spacing:1.4px;color:#0f766e;text-transform:uppercase}
+            .brand-sub{font-size:8px;color:#64748b;margin-top:2px}
+            .brand-copy{font-size:8px;font-weight:700;color:#94a3b8;text-align:right}
             .qr-box{text-align:center}
-            .qr-img{width:180px;height:180px;border:1.5px solid #86efac;padding:5px;border-radius:14px;background:#fff;box-shadow:0 10px 22px rgba(16,185,129,.18)}
-            .qr-lbl{font-size:8px;color:#047857;margin-top:5px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
+            .qr-img{width:180px;height:180px;border:1.5px solid #0f766e;padding:5px;border-radius:14px;background:#fff;box-shadow:0 10px 22px rgba(15,118,110,.14)}
+            .qr-lbl{font-size:8px;color:#0f766e;margin-top:5px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
             @media print {
               .wrap{max-width:none;margin:0;padding:0}
               .toolbar{display:none}
@@ -1646,7 +1661,7 @@ const VATReport: React.FC = () => {
     w.focus();
   };
 
-  const handleBulkInvoiceDownloadSeparate = async () => {
+  const handleBulkInvoiceDownloadSeparate = async (mode: 'prompt' | 'all' = 'prompt') => {
     // Use the same filtered dataset shown in the table (view mode + date + building + unit + search).
     // This ensures Bulk Download matches Sales/Purchase/Credit Note tabs and current filters.
     let rows = [...filteredVATTransactions];
@@ -1657,14 +1672,17 @@ const VATReport: React.FC = () => {
       return;
     }
 
-    const countInput = window.prompt(`Found ${rows.length} invoices. How many do you want to download?`, String(rows.length));
-    if (countInput === null) return;
-    const requested = Number.parseInt(countInput, 10);
-    if (!Number.isFinite(requested) || requested <= 0) {
-      window.alert('Please enter a valid number.');
-      return;
+    let maxCount = rows.length;
+    if (mode === 'prompt') {
+      const countInput = window.prompt(`Found ${rows.length} invoices in the current filter. How many do you want to download?`, String(rows.length));
+      if (countInput === null) return;
+      const requested = Number.parseInt(countInput, 10);
+      if (!Number.isFinite(requested) || requested <= 0) {
+        window.alert('Please enter a valid number.');
+        return;
+      }
+      maxCount = Math.min(rows.length, requested);
     }
-    const maxCount = Math.min(rows.length, requested);
     const selectedRows = rows.slice(0, maxCount);
 
     const desktopFS = (window as any).desktopFS;
@@ -1677,7 +1695,7 @@ const VATReport: React.FC = () => {
       // Web fallback: trigger browser downloads (one PDF per invoice).
       // Note: some browsers may block multiple automatic downloads; user may need to allow them.
       const ok = window.confirm(
-        `You are not in the desktop app, so invoices will be downloaded by the browser.\n\nThis will download ${selectedRows.length} PDF file(s). Continue?`
+        `You are not in the desktop app, so invoices will be downloaded by the browser.\n\nThis will download ${selectedRows.length} PDF file(s) from the current filter. Continue?`
       );
       if (!ok) return;
     }
@@ -1720,8 +1738,68 @@ const VATReport: React.FC = () => {
       setTimeout(() => URL.revokeObjectURL(url), 30_000);
     };
 
-    for (let idx = 0; idx < selectedRows.length; idx++) {
-      const tx = selectedRows[idx];
+    const invoiceDownloadStyles = `
+      *{box-sizing:border-box;margin:0;padding:0}
+      .invoice-page{width:210mm;min-height:297mm;padding:14mm 16mm;position:relative;background:#ffffff;border:1px solid #99f6e4;color:#1e293b;font-family:Inter,Arial,sans-serif}
+      .cb{position:absolute;width:56px;height:56px;border-style:solid;border-color:#5eead4}
+      .cb-tl{top:6mm;left:6mm;border-width:2px 0 0 2px;border-radius:8px 0 0 0}
+      .cb-tr{top:6mm;right:6mm;border-width:2px 2px 0 0;border-radius:0 8px 0 0}
+      .cb-bl{bottom:6mm;left:6mm;border-width:0 0 2px 2px;border-radius:0 0 0 8px}
+      .cb-br{bottom:6mm;right:6mm;border-width:0 2px 2px 0;border-radius:0 0 8px 0}
+      .hdr{display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:22px;padding:14px 16px;border-radius:16px;background:linear-gradient(135deg,#0f766e 0%,#059669 58%,#0d9488 100%);box-shadow:0 12px 26px rgba(15,118,110,.24)}
+      .hdr-co{display:flex;align-items:center;gap:18px}
+      .hdr-logo{width:70px;height:70px;background:rgba(255,255,255,.2);border:1px solid rgba(255,255,255,.35);border-radius:14px;display:flex;align-items:center;justify-content:center;padding:10px}
+      .hdr-logo img{max-width:100%;max-height:100%;object-fit:contain}
+      .co-ar{font-size:18px;font-weight:900;color:#ffffff;direction:rtl;text-shadow:0 1px 3px rgba(0,0,0,.18)}
+      .co-en{font-size:11px;font-weight:700;color:#ccfbf1;letter-spacing:.5px;margin-top:2px}
+      .co-tag{font-size:10px;color:#f8fafc;margin-top:3px;opacity:.92}
+      .badge-wrap{display:flex;flex-direction:column;align-items:flex-end;gap:10px}
+      .am-badge{display:flex;align-items:center;gap:8px;background:rgba(255,255,255,.14);border:1px solid rgba(255,255,255,.35);border-radius:12px;padding:6px 8px}
+      .am-badge img{width:28px;height:28px;border-radius:50%;object-fit:cover;border:1px solid rgba(255,255,255,.4)}
+      .am-meta{text-align:right;line-height:1.1}
+      .am-title{font-size:10px;font-weight:800;color:#f8fafc;letter-spacing:.2px}
+      .am-powered{font-size:9px;color:#ccfbf1;font-weight:700}
+      .badge{text-align:right}
+      .badge-type{font-size:22px;font-weight:900;color:#ffffff;letter-spacing:1.5px;text-transform:uppercase;text-shadow:0 1px 3px rgba(0,0,0,.16)}
+      .badge-cn{font-size:9px;color:#ccfbf1;margin-top:4px;letter-spacing:1.5px;text-transform:uppercase}
+      .pills{display:flex;gap:10px;margin-bottom:20px}
+      .pill{flex:1;background:#ffffff;border:1px solid #d8dee8;border-radius:12px;padding:10px 12px;text-align:center;box-shadow:0 6px 12px rgba(15,23,42,.05)}
+      .pill.green{background:#ffffff;border-color:#0f766e;border-width:1.5px}
+      .pill-lbl{font-size:8px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:1px;margin-bottom:3px}
+      .pill-val{font-size:13px;font-weight:900;color:#0f766e}
+      .party-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:20px}
+      .party-card{border-radius:12px;padding:14px;background:#ffffff;border:1px solid #d8dee8;border-top:3px solid #0f766e;box-shadow:0 8px 16px rgba(15,23,42,.05)}
+      .party-title{font-size:9px;font-weight:800;text-transform:uppercase;letter-spacing:1.2px;color:#0f766e;margin-bottom:8px;padding-bottom:6px;border-bottom:1.5px solid #e2e8f0}
+      .party-name{font-size:14px;font-weight:700;color:#0f172a;margin-bottom:2px}
+      .party-ar{font-size:13px;font-weight:700;color:#0f766e;margin-bottom:4px;direction:rtl}
+      .party-sub{font-size:11px;color:#64748b;margin-top:2px}
+      .tbl{width:100%;border-collapse:collapse;margin-bottom:18px;border-radius:12px;overflow:hidden}
+      .tbl thead tr{background:linear-gradient(135deg,#0f766e 0%,#0d9488 100%)}
+      .tbl th{padding:11px 14px;font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.8px;color:#ffffff;text-align:left;border-bottom:2px solid #0f766e}
+      .tbl th:last-child{text-align:right}
+      .tbl td{padding:16px 14px;font-size:13px;border-bottom:1px solid #f1f5f9;vertical-align:top}
+      .tbl td:last-child{text-align:right;font-weight:700;color:#0f172a}
+      .tbl-num{font-weight:700;color:#0f766e;font-size:14px}
+      .tbl-sub{font-size:10px;color:#94a3b8;margin-top:3px}
+      .tots{display:flex;justify-content:flex-end;margin-top:6px}
+      .tot-card{width:260px;background:#ffffff;border:2px solid #0f766e;border-radius:14px;padding:16px;box-shadow:0 10px 20px rgba(15,118,110,.12)}
+      .tot-row{display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;color:#64748b}
+      .tot-row span:last-child{font-weight:700;color:#0f172a}
+      .tot-total{display:flex;justify-content:space-between;border-top:1.5px solid #99f6e4;padding-top:10px;margin-top:10px;font-size:16px;font-weight:900;color:#0f766e}
+      .tot-sar{font-size:10px;font-weight:600;opacity:.6;margin-left:2px}
+      .ftr{display:flex;justify-content:space-between;align-items:flex-end;margin-top:20px;padding-top:18px;border-top:1px dashed #e2e8f0}
+      .ftr-notes{font-size:10px;color:#94a3b8;line-height:1.7;max-width:55%}
+      .ftr-notes b{color:#64748b}
+      .brand-strip{margin-top:16px;border:1px solid #d8dee8;border-radius:12px;padding:8px 10px;display:flex;align-items:center;justify-content:space-between;gap:10px;background:#ffffff}
+      .brand-mark{font-size:10px;font-weight:900;letter-spacing:1.4px;color:#0f766e;text-transform:uppercase}
+      .brand-sub{font-size:8px;color:#64748b;margin-top:2px}
+      .brand-copy{font-size:8px;font-weight:700;color:#94a3b8;text-align:right}
+      .qr-box{text-align:center}
+      .qr-img{width:180px;height:180px;border:1.5px solid #0f766e;padding:5px;border-radius:14px;background:#fff;box-shadow:0 10px 22px rgba(15,118,110,.14)}
+      .qr-lbl{font-size:8px;color:#0f766e;margin-top:5px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
+    `;
+
+    const buildDownloadInvoiceHtml = (tx: Transaction, idx: number, qrSrc: string) => {
       const isExpense = tx.type === TransactionType.EXPENSE;
       const isCredit = !!tx.isCreditNote;
       const taxable = Math.abs(Number(tx.amountExcludingVAT ?? tx.amount ?? 0));
@@ -1729,99 +1807,143 @@ const VATReport: React.FC = () => {
       const total = Math.abs(Number(tx.amountIncludingVAT ?? tx.totalWithVat ?? tx.amount ?? 0));
       const invNo = tx.vatInvoiceNumber || `INV-${idx + 1}`;
       const sellerName = isExpense ? ((tx as any).vendorName || 'Supplier') : companyNameEn;
+      const sellerNameAr = isExpense ? '' : companyName;
       const sellerVAT = isExpense ? ((tx as any).vendorVATNumber || '-') : companyVAT;
+      const sellerAddr = isExpense ? '-' : companyAddress;
       const buyerName = isExpense ? companyNameEn : (resolveSalesCustomerName(tx) || tx.unitNumber || 'Tenant');
       const buyerVAT = isExpense ? companyVAT : (tx.customerVATNumber || '-');
+      const buyerAddr = isExpense ? companyAddress : '-';
+
+      return `
+        <section class="invoice-page">
+          <div class="cb cb-tl"></div><div class="cb cb-tr"></div><div class="cb cb-bl"></div><div class="cb cb-br"></div>
+          <div class="hdr">
+            <div class="hdr-co">
+              <div class="hdr-logo"><img src="${logoDataUrl || logoSrc}" alt="Logo"/></div>
+              <div>
+                <div class="co-ar">${escapeHtml(sellerNameAr || companyName)}</div>
+                <div class="co-en">${escapeHtml(companyNameEn)}</div>
+                <div class="co-tag">${escapeHtml(companyAddress)}${companyVAT ? ` &nbsp;|&nbsp; VAT ${escapeHtml(companyVAT)}` : ''}</div>
+              </div>
+            </div>
+            <div class="badge-wrap">
+              <div class="am-badge">
+                <img src="${amlakDataUrl || amlakLogoSrc}" alt="AMLAK Property Manager"/>
+                <div class="am-meta">
+                  <div class="am-title">AMLAK Property Manager</div>
+                  <div class="am-powered">Powered by AMLAK</div>
+                </div>
+              </div>
+              <div class="badge">
+                <div class="badge-type">${isCredit ? 'Credit Note' : isExpense ? 'Purchase Invoice' : 'Tax Invoice'}</div>
+                <div class="badge-cn">ZATCA Compliant</div>
+              </div>
+            </div>
+          </div>
+          <div class="pills">
+            <div class="pill green"><div class="pill-lbl">Invoice No.</div><div class="pill-val">${escapeHtml(invNo)}</div></div>
+            <div class="pill"><div class="pill-lbl">Issue Date</div><div class="pill-val">${escapeHtml(fmtDate(tx.date))}</div></div>
+            <div class="pill"><div class="pill-lbl">Payment</div><div class="pill-val">${escapeHtml(tx.paymentMethod || '-')}</div></div>
+          </div>
+          <div class="party-grid">
+            <div class="party-card">
+              <div class="party-title">Supplier / Seller</div>
+              ${sellerNameAr ? `<div class="party-ar">${escapeHtml(sellerNameAr)}</div>` : ''}
+              <div class="party-name">${escapeHtml(sellerName)}</div>
+              <div class="party-sub">VAT: ${escapeHtml(sellerVAT)}</div>
+              <div class="party-sub">${escapeHtml(sellerAddr)}</div>
+            </div>
+            <div class="party-card">
+              <div class="party-title">Customer / Buyer</div>
+              <div class="party-name">${escapeHtml(buyerName)}</div>
+              <div class="party-sub">VAT: ${escapeHtml(buyerVAT)}</div>
+              <div class="party-sub">${escapeHtml(buyerAddr)}</div>
+            </div>
+          </div>
+          <table class="tbl">
+            <thead><tr><th>#</th><th>Description</th><th>Amount</th></tr></thead>
+            <tbody>
+              <tr>
+                <td><span class="tbl-num">01</span></td>
+                <td>
+                  <div style="font-weight:600">${escapeHtml(tx.details || (isExpense ? 'Purchase / Expense' : 'Property Rental Services'))}</div>
+                  <div class="tbl-sub">${isExpense ? 'Expense' : 'Rental Income'}</div>
+                </td>
+                <td>${formatAmount(taxable)} SAR</td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="tots">
+            <div class="tot-card">
+              <div class="tot-row"><span>Subtotal (Excl. VAT)</span><span>${formatAmount(taxable)}</span></div>
+              <div class="tot-row"><span>VAT (${tx.vatRate || 15}%)</span><span>${formatAmount(vat)}</span></div>
+              <div class="tot-total"><span>Total (Incl. VAT)</span><span>${formatAmount(total)} <span class="tot-sar">SAR</span></span></div>
+            </div>
+          </div>
+          <div class="ftr">
+            <div class="ftr-notes">
+              <div><b>Payment:</b> ${escapeHtml(tx.paymentMethod || 'Cash')}</div>
+              <div style="margin-top:6px">Computer-generated document. No signature required.</div>
+            </div>
+            <div class="qr-box">
+              <img src="${qrSrc}" class="qr-img" alt="ZATCA QR Code"/>
+              <div class="qr-lbl">ZATCA QR Code</div>
+            </div>
+          </div>
+          <div class="brand-strip">
+            <div>
+              <div class="brand-mark">Powered by AMLAK Property Manager</div>
+              <div class="brand-sub">Professional property management software</div>
+            </div>
+            <div class="brand-copy">© ${new Date().getFullYear()} AMLAK Software. All rights reserved.</div>
+          </div>
+        </section>
+      `;
+    };
+
+    const renderInvoicePdfBlob = async (html: string): Promise<Blob> => {
+      const host = document.createElement('div');
+      host.style.position = 'fixed';
+      host.style.left = '-10000px';
+      host.style.top = '0';
+      host.style.width = '210mm';
+      host.style.background = '#ffffff';
+      host.innerHTML = `<style>${invoiceDownloadStyles}</style>${html}`;
+      document.body.appendChild(host);
+      const page = host.querySelector('.invoice-page') as HTMLElement | null;
+      if (!page) {
+        host.remove();
+        throw new Error('Invoice render failed.');
+      }
+      await Promise.all(Array.from(host.querySelectorAll('img')).map((img) => {
+        if ((img as HTMLImageElement).complete) return Promise.resolve();
+        return new Promise<void>((resolve) => {
+          img.addEventListener('load', () => resolve(), { once: true });
+          img.addEventListener('error', () => resolve(), { once: true });
+        });
+      }));
+      const canvas = await html2canvas(page, {
+        backgroundColor: '#ffffff',
+        scale: 2,
+        useCORS: true,
+      });
+      host.remove();
+      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
+      doc.addImage(canvas.toDataURL('image/png'), 'PNG', 0, 0, 210, 297);
+      return doc.output('blob');
+    };
+
+    for (let idx = 0; idx < selectedRows.length; idx++) {
+      const tx = selectedRows[idx];
+      const isExpense = tx.type === TransactionType.EXPENSE;
+      const vat = Math.abs(Number(tx.vatAmount || 0));
+      const total = Math.abs(Number(tx.amountIncludingVAT ?? tx.totalWithVat ?? tx.amount ?? 0));
+      const invNo = tx.vatInvoiceNumber || `INV-${idx + 1}`;
       const qrPayload = tx.zatcaQRCode || `INV:${invNo}|DATE:${tx.date || ''}|TOTAL:${total}|VAT:${vat}|VATNO:${companyVAT}`;
       const qrSrc = `https://api.qrserver.com/v1/create-qr-code/?size=600x600&ecc=H&data=${encodeURIComponent(qrPayload)}`;
       const qrDataUrl = await loadImageAsDataUrl(qrSrc);
-      const doc = new jsPDF({ orientation: 'portrait', unit: 'mm', format: 'a4' });
-
-      doc.setFillColor(6, 95, 70);
-      doc.rect(10, 10, 190, 28, 'F');
-      if (logoDataUrl) doc.addImage(logoDataUrl, 'PNG', 14, 14, 16, 16);
-      if (amlakDataUrl) doc.addImage(amlakDataUrl, 'PNG', 175, 14, 20, 20);
-      doc.setTextColor(255, 255, 255);
-      doc.setFontSize(14);
-      doc.text(companyNameEn, 34, 18);
-      doc.setFontSize(9);
-      doc.text(`VAT: ${companyVAT}`, 34, 24);
-      doc.text(companyAddress, 34, 29);
-      doc.setFontSize(11);
-      doc.text(isCredit ? 'CREDIT NOTE' : (isExpense ? 'PURCHASE INVOICE' : 'TAX INVOICE'), 150, 33, { align: 'right' });
-
-      doc.setTextColor(15, 23, 42);
-      doc.setDrawColor(167, 243, 208);
-      doc.setFillColor(236, 253, 245);
-      doc.roundedRect(10, 44, 60, 16, 2, 2, 'FD');
-      doc.roundedRect(75, 44, 60, 16, 2, 2, 'FD');
-      doc.roundedRect(140, 44, 60, 16, 2, 2, 'FD');
-      doc.setFontSize(8);
-      doc.text('INVOICE NO.', 14, 49);
-      doc.text('DATE', 79, 49);
-      doc.text('PAYMENT', 144, 49);
-      doc.setFontSize(10);
-      doc.text(invNo, 14, 56);
-      doc.text(fmtDate(tx.date), 79, 56);
-      doc.text(tx.paymentMethod || '-', 144, 56);
-
-      doc.setFillColor(240, 253, 244);
-      doc.roundedRect(10, 66, 92, 28, 2, 2, 'FD');
-      doc.roundedRect(108, 66, 92, 28, 2, 2, 'FD');
-      doc.setFontSize(9);
-      doc.setTextColor(4, 120, 87);
-      doc.text('SUPPLIER / SELLER', 14, 72);
-      doc.text('CUSTOMER / BUYER', 112, 72);
-      doc.setTextColor(15, 23, 42);
-      doc.setFontSize(11);
-      doc.text(sellerName, 14, 79);
-      doc.text(`VAT: ${sellerVAT}`, 14, 85);
-      doc.text(buyerName, 112, 79);
-      doc.text(`VAT: ${buyerVAT}`, 112, 85);
-
-      doc.setDrawColor(187, 247, 208);
-      doc.setFillColor(209, 250, 229);
-      doc.rect(10, 100, 190, 10, 'FD');
-      doc.setFontSize(9);
-      doc.setTextColor(4, 120, 87);
-      doc.text('#', 13, 106.5);
-      doc.text('DESCRIPTION', 24, 106.5);
-      doc.text('AMOUNT', 190, 106.5, { align: 'right' });
-      doc.setTextColor(15, 23, 42);
-      doc.rect(10, 110, 190, 20);
-      doc.text('01', 13, 118);
-      doc.text(String(tx.details || (isExpense ? 'Purchase / Expense' : 'Property Rental Services')).slice(0, 85), 24, 118);
-      doc.text(`${formatAmount(taxable)} SAR`, 190, 118, { align: 'right' });
-
-      doc.setFillColor(236, 253, 245);
-      doc.roundedRect(120, 136, 80, 32, 2, 2, 'FD');
-      doc.setTextColor(100, 116, 139);
-      doc.setFontSize(9);
-      doc.text('Subtotal (Excl. VAT)', 124, 144);
-      doc.text('VAT', 124, 151);
-      doc.text('Total (Incl. VAT)', 124, 160);
-      doc.setTextColor(15, 23, 42);
-      doc.text(formatAmount(taxable), 196, 144, { align: 'right' });
-      doc.text(formatAmount(vat), 196, 151, { align: 'right' });
-      doc.setTextColor(6, 95, 70);
-      doc.setFontSize(11);
-      doc.text(`${formatAmount(total)} SAR`, 196, 160, { align: 'right' });
-
-      doc.setTextColor(100, 116, 139);
-      doc.setFontSize(8.5);
-      doc.text(`Payment: ${tx.paymentMethod || 'Cash'}`, 10, 178);
-      doc.text('Powered by AMLAK Property Manager', 10, 183);
-
-      if (qrDataUrl) {
-        doc.addImage(qrDataUrl, 'PNG', 150, 175, 40, 40);
-        doc.setFontSize(8);
-        doc.setTextColor(4, 120, 87);
-        doc.text('ZATCA QR CODE', 170, 219, { align: 'center' });
-      } else {
-        doc.setFontSize(8);
-        doc.setTextColor(4, 120, 87);
-        doc.text('ZATCA QR CODE', 170, 198, { align: 'center' });
-      }
+      const invoiceHtml = buildDownloadInvoiceHtml(tx, idx, qrDataUrl || qrSrc);
+      const pdfBlob = await renderInvoicePdfBlob(invoiceHtml);
 
       const partyForName = isExpense ? ((tx as any).vendorName || 'Supplier') : (resolveSalesCustomerName(tx) || tx.customerName || 'Customer');
       let fileName = `${sanitizeFileName(partyForName)}_${sanitizeFileName(invNo)}.pdf`;
@@ -1831,13 +1953,15 @@ const VATReport: React.FC = () => {
       usedNames.add(fileName);
 
       if (canDesktopSave && dirPath) {
-        const dataUri = doc.output('datauristring');
-        const base64 = dataUri.includes(',') ? dataUri.split(',')[1] : '';
+        const buffer = await pdfBlob.arrayBuffer();
+        const bytes = new Uint8Array(buffer);
+        let binary = '';
+        bytes.forEach((byte) => { binary += String.fromCharCode(byte); });
+        const base64 = btoa(binary);
         const writeRes = await desktopFS.writeBase64File({ dirPath, fileName, base64 });
         if (writeRes?.ok) savedCount += 1;
       } else {
-        const blob = doc.output('blob');
-        downloadBlob(blob, fileName);
+        downloadBlob(pdfBlob, fileName);
         savedCount += 1;
         // Small delay reduces the chance of browsers dropping clicks.
         // eslint-disable-next-line no-await-in-loop
@@ -1870,7 +1994,8 @@ const VATReport: React.FC = () => {
             <button onClick={() => handleBulkInvoicePrint('SALES')} className="px-4 py-2.5 bg-white border border-blue-300 text-blue-700 rounded-xl font-bold hover:bg-blue-50 flex items-center gap-2 shadow-sm transition-all"><FileDown size={16} /> Print Sales Invoices</button>
             <button onClick={() => handleBulkInvoicePrint('PURCHASE')} className="px-4 py-2.5 bg-white border border-rose-300 text-rose-700 rounded-xl font-bold hover:bg-rose-50 flex items-center gap-2 shadow-sm transition-all"><FileDown size={16} /> Print Purchase Invoices</button>
             <button onClick={() => handleBulkInvoicePrint('ALL')} className="px-4 py-2.5 bg-white border border-violet-300 text-violet-700 rounded-xl font-bold hover:bg-violet-50 flex items-center gap-2 shadow-sm transition-all"><FileDown size={16} /> Print All Invoices</button>
-            <button onClick={handleBulkInvoiceDownloadSeparate} className="px-4 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 flex items-center gap-2 shadow-sm transition-all"><Download size={16} /> Bulk Download PDFs</button>
+            <button onClick={() => handleBulkInvoiceDownloadSeparate('prompt')} className="px-4 py-2.5 bg-white border border-emerald-300 text-emerald-700 rounded-xl font-bold hover:bg-emerald-50 flex items-center gap-2 shadow-sm transition-all"><Download size={16} /> Download Some PDFs</button>
+            <button onClick={() => handleBulkInvoiceDownloadSeparate('all')} className="px-4 py-2.5 bg-emerald-600 text-white rounded-xl font-bold hover:bg-emerald-700 flex items-center gap-2 shadow-sm transition-all"><Download size={16} /> Download Current Filter</button>
           </div>
         </div>
 
@@ -2392,12 +2517,13 @@ const VATReport: React.FC = () => {
       {/* Plain Invoice View Modal */}
       {invoiceModal && (
         <div className="fixed inset-0 bg-black/70 backdrop-blur-md flex items-start justify-center pt-[4vh] z-[60] overflow-y-auto px-4" onClick={() => setInvoiceModal(null)}>
-          <div className="bg-white rounded-[2rem] shadow-3xl max-w-2xl w-full mb-12 overflow-hidden border border-slate-100 animate-slide-up" onClick={e => e.stopPropagation()}>
-            <div className={`relative px-8 py-10 overflow-hidden ${invoiceModal.type === 'EXPENSE' ? 'bg-gradient-to-br from-amber-900 to-amber-700' : 'bg-gradient-to-br from-emerald-900 to-emerald-700'}`}>
+          <div className="bg-white rounded-[2rem] shadow-3xl max-w-2xl w-full mb-12 overflow-hidden border border-emerald-100 animate-slide-up" onClick={e => e.stopPropagation()}>
+            <div className={`relative px-8 py-10 overflow-hidden ${invoiceModal.type === 'EXPENSE' ? 'bg-gradient-to-br from-amber-800 via-amber-700 to-orange-500' : 'bg-gradient-to-br from-teal-700 via-emerald-600 to-teal-500'}`}>
               <div className="absolute top-0 right-0 w-64 h-64 bg-white/5 rounded-full -translate-y-1/2 translate-x-1/2 blur-2xl"></div>
+              <div className="absolute -bottom-20 -left-16 w-72 h-72 bg-cyan-300/10 rounded-full blur-3xl"></div>
               <div className="flex justify-between items-start relative z-10">
                 <div className="flex items-center gap-5">
-                   <div className="w-20 h-20 bg-white/10 rounded-3xl flex items-center justify-center p-3 border border-white/20 backdrop-blur-sm"><img src="/images/cologo.png" className="w-full object-contain filter brightness-0 invert" alt="Logic" /></div>
+                   <div className="w-20 h-20 bg-white/15 rounded-3xl flex items-center justify-center p-3 border border-white/30 backdrop-blur-sm shadow-2xl shadow-emerald-950/20"><img src="/images/cologo.png" className="w-full object-contain filter brightness-0 invert" alt="Logic" /></div>
                    <div>
                      {invoiceModal.type === 'INCOME' ? (
                        <>
@@ -2418,14 +2544,14 @@ const VATReport: React.FC = () => {
                    <div className="text-white/40 font-black text-[10px] uppercase tracking-[0.3em] mb-2">{invoiceModal.type === 'INCOME' ? 'Official Tax Invoice' : 'Purchase Record'}</div>
                    <div className="text-5xl font-black text-white/10 absolute -right-2 top-20 pointer-events-none select-none">INV</div>
                    <div className="text-3xl font-black text-white leading-none">{invoiceModal.isCreditNote ? 'Credit Note' : 'Invoice'}</div>
-                   <div className="mt-4 px-3 py-1 bg-white/10 rounded-full border border-white/20 text-[9px] font-bold text-white uppercase tracking-widest backdrop-blur-sm">ZATCA Compliant</div>
+                   <div className="mt-4 px-3 py-1 bg-white/15 rounded-full border border-white/25 text-[9px] font-bold text-white uppercase tracking-widest backdrop-blur-sm shadow-lg">ZATCA Compliant</div>
                 </div>
               </div>
             </div>
 
-            <div className="bg-slate-50/50 px-8 py-4 border-b border-slate-100 flex justify-between items-center text-xs">
+            <div className="bg-white px-8 py-4 border-b border-slate-100 flex justify-between items-center text-xs">
                <div className="flex gap-8">
-                 <div className="space-y-0.5"><div className="text-slate-400 font-bold uppercase text-[9px]">Reference</div><div className="font-black text-slate-800">{invoiceModal.vatInvoiceNumber}</div></div>
+                 <div className="space-y-0.5"><div className="text-emerald-600 font-bold uppercase text-[9px]">Invoice No.</div><div className="font-black text-emerald-900 text-lg leading-none">{invoiceModal.vatInvoiceNumber}</div></div>
                  <div className="space-y-0.5"><div className="text-slate-400 font-bold uppercase text-[9px]">Issue Date</div><div className="font-black text-slate-800">{fmtDate(invoiceModal.date)}</div></div>
                  <div className="space-y-0.5"><div className="text-slate-400 font-bold uppercase text-[9px]">Status</div><div className="font-black text-emerald-600 flex items-center gap-1"><div className="w-1.5 h-1.5 rounded-full bg-emerald-500"/> Final</div></div>
                </div>
@@ -2453,11 +2579,11 @@ const VATReport: React.FC = () => {
               </div>
 
               <div className="rounded-3xl border border-slate-200 overflow-hidden shadow-sm">
-                <div className="bg-slate-50 px-6 py-3 font-black text-slate-400 text-[10px] uppercase tracking-widest flex justify-between">
+                <div className="bg-gradient-to-r from-teal-700 to-emerald-600 px-6 py-3 font-black text-white text-[10px] uppercase tracking-widest flex justify-between">
                    <span>Service Description</span>
                    <span className="text-right">Line Total</span>
                 </div>
-                <div className="p-6 flex justify-between items-center group hover:bg-slate-50/50 transition-colors">
+                <div className="p-6 flex justify-between items-center group hover:bg-slate-50 transition-colors">
                    <div>
                      <div className="text-lg font-black text-slate-800">{invoiceModal.details || 'Property Services & Management'}</div>
                      <p className="text-[11px] text-slate-400 font-bold mt-1 uppercase tracking-tight">{invoiceModal.buildingName} · {invoiceModal.type === 'INCOME' ? 'Income Transaction' : 'Business Expense'}</p>
@@ -2472,7 +2598,7 @@ const VATReport: React.FC = () => {
                     <div className="flex justify-between text-xs font-bold text-slate-400 uppercase"><span>Subtotal</span><span className="text-slate-700">{formatAmount(invoiceModal.amountExcludingVAT || invoiceModal.amount || 0)}</span></div>
                     <div className="flex justify-between text-xs font-bold text-slate-400 uppercase"><span>VAT (15%)</span><span className="text-blue-600">{formatAmount(invoiceModal.vatAmount || 0)}</span></div>
                   </div>
-                  <div className="bg-emerald-600 rounded-[1.5rem] px-8 py-6 flex justify-between items-center text-white shadow-xl shadow-emerald-900/10 hover:scale-[1.02] transition-all cursor-default">
+                  <div className="bg-gradient-to-br from-teal-700 to-emerald-600 rounded-[1.5rem] px-8 py-6 flex justify-between items-center text-white shadow-xl shadow-teal-900/20 hover:scale-[1.02] transition-all cursor-default">
                     <span className="text-sm font-black uppercase tracking-[0.2em]">Total</span>
                     <span className="text-3xl font-black tracking-tight">{formatAmount(invoiceModal.amountIncludingVAT || invoiceModal.totalWithVat || 0)} <span className="text-xs font-normal opacity-70">SAR</span></span>
                   </div>
@@ -2482,6 +2608,10 @@ const VATReport: React.FC = () => {
               <div className="flex justify-between items-center pt-8 border-t border-slate-100">
                 <div className="text-[10px] text-slate-400 font-bold leading-relaxed">
                   COMPUTER GENERATED OFFICIAL DOCUMENT<br/>NO PHYSICAL SIGNATURE REQUIRED AS PER ZATCA GUIDELINES
+                  <div className="mt-3 inline-flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
+                    <span className="text-[9px] font-black text-teal-700 uppercase tracking-widest">Powered by AMLAK</span>
+                    <span className="text-[8px] text-slate-400">© {new Date().getFullYear()} AMLAK Software</span>
+                  </div>
                 </div>
                 {invoiceModal.zatcaQRCode && (
                    <div className="flex items-center gap-6 bg-slate-50 border border-slate-100 rounded-3xl p-3 pr-6 group cursor-pointer hover:bg-emerald-50 hover:border-emerald-100 transition-all" onClick={() => setSelectedQRCode(invoiceModal.zatcaQRCode!)}>
@@ -2497,7 +2627,7 @@ const VATReport: React.FC = () => {
             
             <div className="px-8 pb-10 flex gap-4">
               <button 
-                onClick={() => { window.location.hash = `/invoice/${invoiceModal.vatInvoiceNumber}`; setInvoiceModal(null); }}
+                onClick={() => { window.location.hash = `/invoice/${invoiceModal.id}`; setInvoiceModal(null); }}
                 className="flex-1 py-4 bg-slate-900 text-white rounded-2xl font-black text-sm hover:translate-y-[-2px] transition-all shadow-xl shadow-slate-900/20 flex items-center justify-center gap-2"
               >
                 <Eye size={18}/> View Full Invoice Page

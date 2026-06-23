@@ -32,6 +32,7 @@ zatca-cert/*secret*.txt
 # Build artifacts
 release/
 .vite/
+mac-cloud/backups/
 
 # Local Netlify folder
 .netlify

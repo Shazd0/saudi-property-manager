@@ -2,7 +2,7 @@
 // Handles: caching, offline support, background sync, AND Firebase Cloud Messaging
 
 // ─── Cache Configuration ───
-const CACHE_VERSION = 'v2';
+const CACHE_VERSION = 'v3';
 const STATIC_CACHE  = `amlak-static-${CACHE_VERSION}`;
 const DYNAMIC_CACHE = `amlak-dynamic-${CACHE_VERSION}`;
 const CDN_CACHE     = `amlak-cdn-${CACHE_VERSION}`;
@@ -20,7 +20,6 @@ const APP_SHELL = [
   '/owner.html',
   '/tenant.html',
   '/manifest.webmanifest',
-  '/index.css',
   '/images/logo.png',
   '/images/amlak-sheets-icon.svg',
   '/images/logo-192.png',
@@ -111,12 +110,17 @@ try {
 self.addEventListener('install', (event) => {
   console.log('[SW] Installing with cache', CACHE_VERSION);
   event.waitUntil(
-    caches.open(STATIC_CACHE).then(cache => {
-      return cache.addAll(APP_SHELL).catch(err => {
-        console.warn('[SW] Some app shell files could not be precached:', err);
-        // Still install even if some files fail
-      });
-    }).then(() => self.skipWaiting())
+    caches.open(STATIC_CACHE)
+      .then(cache =>
+        Promise.all(
+          APP_SHELL.map(path =>
+            cache.add(path).catch(err => {
+              console.warn('[SW] App shell file skipped:', path, err);
+            })
+          )
+        )
+      )
+      .then(() => self.skipWaiting())
   );
 });
 

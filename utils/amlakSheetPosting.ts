@@ -30,6 +30,7 @@ export interface AmlakSheetPostingRowResult {
   skipped?: boolean;
   errors: string[];
   transaction?: Transaction;
+  transfer?: Record<string, any>;
   alreadyPostedTransactionId?: string;
 }
 
@@ -39,6 +40,15 @@ const norm = (value: string) => String(value || '').toLowerCase().replace(/[^a-z
 
 function canonicalKind(kind?: AmlakSheetKind): Exclude<AmlakSheetKind, 'income'> {
   return kind === 'income' ? 'rentalIncome' : ((kind || 'rentalIncome') as Exclude<AmlakSheetKind, 'income'>);
+}
+
+function resolveAccountType(value: string): 'BUILDING' | 'HEAD_OFFICE' | 'OWNER' | '' {
+  const n = norm(value);
+  if (!n) return '';
+  if (n.includes('building') || n.includes('property') || n.includes('مبنى') || n.includes('عمارة')) return 'BUILDING';
+  if (n.includes('head') || n.includes('office') || n.includes('treasury') || n.includes('مكتب') || n.includes('خزين')) return 'HEAD_OFFICE';
+  if (n.includes('owner') || n.includes('مالك')) return 'OWNER';
+  return '';
 }
 
 function cellText(sheet: AmlakWorksheet, col: string | undefined, row: number): string {
@@ -67,6 +77,10 @@ function resolvePostType(value: string, fallback: AmlakSheetPostType): AmlakShee
   return fallback;
 }
 
+function categoryMatches(value: string, category: ExpenseCategory): boolean {
+  return norm(value) === norm(category);
+}
+
 function resolvePaymentMethod(value: string): PaymentMethod {
   const n = norm(value);
   if (n.includes('cash') || n.includes('نقد')) return PaymentMethod.CASH;
@@ -77,7 +91,20 @@ function resolvePaymentMethod(value: string): PaymentMethod {
 function resolveBuilding(buildings: Building[], value: string): Building | null {
   const n = norm(value);
   if (!n) return null;
-  return buildings.find(b => b.id === value || norm(b.name) === n || norm(b.name).includes(n) || n.includes(norm(b.name))) || null;
+  return buildings.find(b => {
+    const anyBuilding = b as any;
+    const rawId = anyBuilding._rawBuildingId || anyBuilding.rawId || '';
+    const bookName = anyBuilding._bookDisplayName || anyBuilding.bookName || '';
+    const sourceBookId = anyBuilding._sourceBookId || anyBuilding.bookId || '';
+    const candidates = [
+      b.id,
+      rawId,
+      b.name,
+      bookName ? `${b.name} ${bookName}` : '',
+      sourceBookId ? `${b.name} ${sourceBookId}` : '',
+    ].map(norm).filter(Boolean);
+    return candidates.some(candidate => candidate === n || candidate.includes(n) || n.includes(candidate));
+  }) || null;
 }
 
 function resolveUser(users: User[], value: string): User | null {
@@ -121,6 +148,7 @@ function isDuplicate(tx: Transaction, existing: Transaction[]): boolean {
 function defaultConfig(template: AmlakSheetTemplateKind = 'rentalIncome'): AmlakSheetPostingConfig {
   const kind = canonicalKind(template);
   const defaultPostType: AmlakSheetPostType =
+    kind === 'treasury' ? 'TREASURY' :
     kind === 'expense' || kind === 'vatExpense' ? 'EXPENSE' :
     kind === 'ownerExpense' ? 'OWNER_EXPENSE' :
     kind === 'otherIncome' || kind === 'fees' ? 'OTHER_INCOME' :
@@ -133,10 +161,18 @@ function defaultConfig(template: AmlakSheetTemplateKind = 'rentalIncome'): Amlak
     mapping: {
       date: 'A',
       unit: kind === 'rentalIncome' || kind === 'vatIncome' || kind === 'fees' ? 'B' : undefined,
-      dueAmount: kind === 'rentalIncome' ? 'D' : undefined,
+      dueAmount:
+        kind === 'rentalIncome' ? 'D' :
+        kind === 'vatIncome' ? 'E' :
+        kind === 'fees' ? 'D' :
+        undefined,
       category: kind === 'expense' || kind === 'otherIncome' || kind === 'vatExpense' ? 'B' : undefined,
       subCategory: kind === 'expense' || kind === 'vatExpense' ? 'C' : undefined,
       related: kind === 'expense' ? 'D' : undefined,
+      fromType: kind === 'treasury' ? 'B' : undefined,
+      fromAccount: kind === 'treasury' ? 'C' : undefined,
+      toType: kind === 'treasury' ? 'D' : undefined,
+      toAccount: kind === 'treasury' ? 'E' : undefined,
       owner: kind === 'ownerExpense' ? 'B' : undefined,
       customerVAT: kind === 'vatIncome' ? 'C' : undefined,
       vendor: kind === 'vatExpense' ? 'D' : undefined,
@@ -149,15 +185,22 @@ function defaultConfig(template: AmlakSheetTemplateKind = 'rentalIncome'): Amlak
         kind === 'ownerExpense' ? 'C' :
         kind === 'vatIncome' ? 'D' :
         kind === 'vatExpense' ? 'G' :
+        kind === 'treasury' ? 'K' :
         'C',
+      purpose: kind === 'treasury' ? 'J' : undefined,
+      notes: kind === 'treasury' ? 'K' : undefined,
       paymentMethod:
         kind === 'rentalIncome' ? 'F' :
         kind === 'otherIncome' ? 'D' :
         kind === 'expense' ? 'F' :
         kind === 'ownerExpense' ? 'D' :
-        kind === 'vatIncome' ? 'E' :
+        kind === 'vatIncome' ? 'H' :
         kind === 'vatExpense' ? 'H' :
+        kind === 'treasury' ? 'F' :
         'D',
+      bank: kind === 'treasury' ? 'G' : undefined,
+      fromBank: kind === 'treasury' ? 'G' : undefined,
+      toBank: kind === 'treasury' ? 'H' : undefined,
       amount:
         kind === 'rentalIncome' ? 'E' :
         kind === 'otherIncome' ? 'E' :
@@ -165,10 +208,11 @@ function defaultConfig(template: AmlakSheetTemplateKind = 'rentalIncome'): Amlak
         kind === 'ownerExpense' ? 'E' :
         kind === 'vatIncome' ? 'F' :
         kind === 'vatExpense' ? 'I' :
+        kind === 'treasury' ? 'I' :
         'E',
       extra: kind === 'expense' ? 'H' : undefined,
-      discount: kind === 'fees' ? 'F' : undefined,
-      ...(kind === 'rentalIncome' ? { date: 'G' } : {}),
+      discount: kind === 'fees' ? 'H' : undefined,
+      ...(kind === 'rentalIncome' || kind === 'vatIncome' || kind === 'fees' ? { date: 'G' } : {}),
     },
   };
 }
@@ -181,28 +225,32 @@ function templateName(template: AmlakSheetTemplateKind): string {
   if (kind === 'ownerExpense') return 'Owner Expenses';
   if (kind === 'vatIncome') return 'VAT Sales';
   if (kind === 'vatExpense') return 'VAT Purchase';
+  if (kind === 'treasury') return 'Treasury';
   return 'Fees';
 }
 
 function templateHeaders(template: AmlakSheetTemplateKind): string[] {
   const kind = canonicalKind(template);
   if (kind === 'expense') {
-    return ['Date', 'Category', 'Target', 'Month', 'Details', 'Payment Method', 'Amount', 'Extra', 'Entered By', 'Status'];
+    return ['Paid Date', 'Category', 'Target', 'Month', 'Details', 'Payment Method', 'Amount', 'Extra', 'Entered By', 'Status'];
   }
   if (kind === 'ownerExpense') {
-    return ['Date', 'Owner', 'Details', 'Payment Method', 'Amount', 'Entered By', 'Status'];
+    return ['Paid Date', 'Owner', 'Details', 'Payment Method', 'Amount', 'Entered By', 'Status'];
   }
   if (kind === 'otherIncome') {
-    return ['Date', 'Category', 'Details', 'Payment Method', 'Amount', 'Entered By', 'Status'];
+    return ['Paid Date', 'Category', 'Details', 'Payment Method', 'Amount', 'Entered By', 'Status'];
   }
   if (kind === 'vatIncome') {
-    return ['Date', 'Unit', 'Customer VAT', 'Details', 'Payment Method', 'Amount Incl. VAT', 'Entered By', 'Status'];
+    return ['Due Date', 'Unit', 'Customer VAT', 'Details', 'Due Incl. VAT', 'Paid Incl. VAT', 'Paid Date', 'Payment Method', 'Entered By', 'Status'];
   }
   if (kind === 'vatExpense') {
-    return ['Date', 'Category', 'Sub Category', 'Vendor', 'Vendor VAT', 'Vendor Ref No', 'Details', 'Payment Method', 'Amount Incl. VAT', 'Entered By', 'Status'];
+    return ['Paid Date', 'Category', '', 'Vendor', 'Vendor VAT', 'Invoice Number', 'Details', 'Payment Method', 'Amount Incl. VAT', 'Entered By', 'Status'];
+  }
+  if (kind === 'treasury') {
+    return ['Paid Date', 'From Type', 'From Account', 'To Type', 'To Account', 'Payment Method', 'From Bank', 'To Bank', 'Amount', 'Purpose', 'Notes', 'Entered By', 'Status'];
   }
   if (kind === 'fees') {
-    return ['Date', 'Unit', 'Details', 'Payment Method', 'Amount', 'Discount', 'Entered By', 'Status'];
+    return ['Due Date', 'Unit', 'Details', 'Due', 'Paid', 'Payment Method', 'Paid Date', 'Discount', 'Entered By', 'Status'];
   }
   return ['Due Date', 'Unit', 'Details', 'Due Amount', 'Given Amount', 'Payment Method', 'Paid Date', 'Entered By', 'Status'];
 }
@@ -268,6 +316,7 @@ export function createDefaultAmlakWorkbookSheets(now = Date.now()): AmlakWorkshe
     createAmlakPostingTemplateSheet(now, 'vatIncome'),
     createAmlakPostingTemplateSheet(now, 'vatExpense'),
     createAmlakPostingTemplateSheet(now, 'fees'),
+    createAmlakPostingTemplateSheet(now, 'treasury'),
   ];
 }
 
@@ -281,6 +330,7 @@ export function createBuildingAmlakSheetsWorkbook(currentUser: User, building: B
     createAmlakPostingTemplateSheet(now, 'vatIncome', building),
     createAmlakPostingTemplateSheet(now, 'vatExpense', building),
     createAmlakPostingTemplateSheet(now, 'fees', building),
+    createAmlakPostingTemplateSheet(now, 'treasury', building),
   ];
   const firstSheet = sheets[0];
   return {
@@ -316,11 +366,12 @@ export function ensureBuildingWorkbookSheets(workbook: AmlakWorkbook, building: 
     sheet.name.toLowerCase().includes('other') ? 'otherIncome' :
     sheet.name.toLowerCase().includes('sales') ? 'vatIncome' :
     sheet.name.toLowerCase().includes('purchase') ? 'vatExpense' :
+    sheet.name.toLowerCase().includes('treasury') ? 'treasury' :
     sheet.name.toLowerCase().includes('fee') ? 'fees' :
     sheet.name.toLowerCase().includes('expense') ? 'expense' :
     'income'
   )), sheet] as const));
-  const sheets: AmlakWorksheet[] = (['rentalIncome', 'otherIncome', 'expense', 'ownerExpense', 'vatIncome', 'vatExpense', 'fees'] as Array<Exclude<AmlakSheetKind, 'income'>>).map(kind => {
+  const sheets: AmlakWorksheet[] = (['rentalIncome', 'otherIncome', 'expense', 'ownerExpense', 'vatIncome', 'vatExpense', 'fees', 'treasury'] as Array<Exclude<AmlakSheetKind, 'income'>>).map(kind => {
     const existing = byKind.get(kind);
     if (!existing) return createAmlakPostingTemplateSheet(now, kind, building);
     return {
@@ -385,8 +436,9 @@ function shouldNormalizeTextCell(sheet: AmlakWorksheet, address: string): boolea
     vatIncome: ['B', 'D'],
     vatExpense: ['B', 'C', 'D', 'G'],
     fees: ['B', 'C'],
+    treasury: ['B', 'C', 'D', 'E', 'G', 'H', 'J', 'K'],
   };
-  return textColumns[kind].includes(col);
+  return (textColumns[kind] || []).includes(col);
 }
 
 export function normalizeAmlakTextValue(value: string): string {
@@ -490,21 +542,32 @@ export function validateWorksheetPostingRows(
     const category = cellText(sheet, config.mapping.category, row);
     const subCategory = cellText(sheet, config.mapping.subCategory, row);
     const related = cellText(sheet, config.mapping.related, row);
-    const target = subCategory || related;
     const customerVAT = cellText(sheet, config.mapping.customerVAT, row);
     const vendorName = cellText(sheet, config.mapping.vendor, row);
     const vendorVAT = cellText(sheet, config.mapping.vendorVAT, row);
     const vendorRefNo = cellText(sheet, config.mapping.vendorRefNo, row);
+    const fromType = resolveAccountType(cellText(sheet, config.mapping.fromType, row));
+    const fromAccount = cellText(sheet, config.mapping.fromAccount, row);
+    const toType = resolveAccountType(cellText(sheet, config.mapping.toType, row));
+    const toAccount = cellText(sheet, config.mapping.toAccount, row);
+    const purpose = cellText(sheet, config.mapping.purpose, row);
+    const notes = cellText(sheet, config.mapping.notes, row);
     const employeeOrOwner = cellText(sheet, config.mapping.employee || config.mapping.owner, row);
     const rawPostType = resolvePostType(cellText(sheet, config.mapping.postType, row), config.defaultPostType);
+    const isSalaryCategory = categoryMatches(category, ExpenseCategory.SALARY);
+    const isBorrowingCategory = categoryMatches(category, ExpenseCategory.BORROWING);
+    const isPropertyRentCategory = categoryMatches(category, ExpenseCategory.PROPERTY_RENT);
+    const target = subCategory;
     const postType: AmlakSheetPostType =
-      category === ExpenseCategory.SALARY || category === 'Salary' ? 'SALARY' :
-      category === ExpenseCategory.BORROWING || category === 'Borrowing' ? 'BORROWING' :
+      isSalaryCategory ? 'SALARY' :
+      isBorrowingCategory ? 'BORROWING' :
       rawPostType;
     const kind = canonicalKind(sheet.sheetKind);
-    const installmentDueDate = kind === 'rentalIncome' ? cellText(sheet, 'A', row) : date;
-    const hasAnyValue = [date, amount ? String(amount) : '', details, buildingText, unit, category, subCategory, employeeOrOwner, vendorName].some(Boolean);
+    const rowMeta = sheet.rowsMeta?.[String(row)] as any;
+    const installmentDueDate = (kind === 'rentalIncome' || kind === 'vatIncome' || kind === 'fees') ? cellText(sheet, 'A', row) : date;
+    const hasAnyValue = [date, amount ? String(amount) : '', details, buildingText, unit, category, subCategory, employeeOrOwner, vendorName, fromType, fromAccount, toType, toAccount, purpose, notes].some(Boolean);
     if (!hasAnyValue) continue;
+    if (rowMeta?.generatedDueSource && amount <= 0 && !date) continue;
 
     const alreadyPosted = sheet.rowsMeta?.[String(row)]?.postedTransactionId ||
       (sheet.rowsMeta?.[String(row)]?.status === 'posted' ? `row-${row}` : '');
@@ -516,26 +579,75 @@ export function validateWorksheetPostingRows(
     const errors: string[] = [];
     if (!date) errors.push('Date is required');
     if (!amount || amount <= 0) errors.push('Amount must be positive');
+
+    if (kind === 'treasury') {
+      const paymentMethodText = cellText(sheet, config.mapping.paymentMethod, row);
+      const fromBank = cellText(sheet, config.mapping.fromBank || config.mapping.bank, row);
+      const toBank = cellText(sheet, config.mapping.toBank, row);
+      const resolveAccount = (type: typeof fromType, account: string): string => {
+        if (type === 'HEAD_OFFICE') return 'HEAD_OFFICE';
+        if (type === 'BUILDING') return resolveBuilding(context.buildings, account || sheet.buildingId || sheet.buildingName || '')?.id || '';
+        if (type === 'OWNER') return resolveUser(context.users, account)?.id || '';
+        return '';
+      };
+      const fromId = resolveAccount(fromType, fromAccount);
+      const toId = resolveAccount(toType, toAccount);
+      if (!fromType) errors.push('From Type is required');
+      if (!toType) errors.push('To Type is required');
+      if (fromType && !fromId) errors.push('From Account could not be matched');
+      if (toType && !toId) errors.push('To Account could not be matched');
+      if (fromType && toType && fromType === toType && fromId && toId && fromId === toId) errors.push('Source and destination must be different');
+      if (!purpose) errors.push('Purpose is required');
+      const paymentMethod = resolvePaymentMethod(paymentMethodText);
+      if ((paymentMethod === PaymentMethod.BANK || paymentMethod === PaymentMethod.CHEQUE) && (!fromBank || !toBank)) {
+        errors.push('From Bank and To Bank are required for bank/cheque treasury rows');
+      }
+      const transfer = {
+        id: crypto.randomUUID(),
+        date,
+        fromType,
+        toType,
+        fromId,
+        toId,
+        fromName: fromType === 'HEAD_OFFICE' ? 'Head Office' : fromAccount,
+        toName: toType === 'HEAD_OFFICE' ? 'Head Office' : toAccount,
+        amount,
+        purpose: purpose || 'Treasury Transfer',
+        notes: notes || purpose || 'Treasury Transfer',
+        paymentMethod,
+        bankName: fromBank || undefined,
+        fromBankName: fromBank || undefined,
+        toBankName: toBank || undefined,
+        status: 'COMPLETED',
+        createdBy: sheet.rowsMeta?.[String(row)]?.enteredBy || context.currentUser.id,
+        createdByName: sheet.rowsMeta?.[String(row)]?.enteredByName || context.currentUser.name,
+        createdAt: Date.now(),
+      };
+      results.push({ row, ok: errors.length === 0, errors, transfer: errors.length ? undefined : transfer });
+      continue;
+    }
+
     if ((kind === 'otherIncome' || kind === 'expense' || kind === 'vatExpense') && !category) errors.push('Category is required');
-    const needsTarget = kind === 'expense' && [
-      ExpenseCategory.SALARY,
-      ExpenseCategory.BORROWING,
-      ExpenseCategory.PROPERTY_RENT,
-      ExpenseCategory.MAINTENANCE,
-      ExpenseCategory.VENDOR_PAYMENT,
-    ].map(String).includes(category);
+    const needsTarget = kind === 'expense' && (
+      isSalaryCategory ||
+      isBorrowingCategory ||
+      isPropertyRentCategory ||
+      categoryMatches(category, ExpenseCategory.MAINTENANCE) ||
+      categoryMatches(category, ExpenseCategory.VENDOR_PAYMENT)
+    );
     if (needsTarget && !target) errors.push('Target is required');
+    if (kind === 'expense' && isSalaryCategory && !related) errors.push('Month is required for salary rows');
     if (kind === 'vatIncome' && !customerVAT) errors.push('Customer VAT is required');
     if (kind === 'vatExpense' && !vendorName) errors.push('Vendor is required');
     if (kind === 'vatExpense' && !vendorVAT) errors.push('Vendor VAT is required');
-    if (kind === 'vatExpense' && !vendorRefNo) errors.push('Vendor reference is required');
+    if (kind === 'vatExpense' && !vendorRefNo) errors.push('Invoice Number is required');
 
     const building = resolveBuilding(context.buildings, buildingText || sheet.buildingId || sheet.buildingName || '');
     if (['RENT', 'EXPENSE', 'OTHER_INCOME'].includes(postType) && !building) errors.push('Building could not be matched');
 
     const paymentMethod = resolvePaymentMethod(cellText(sheet, config.mapping.paymentMethod, row));
     const bankName = cellText(sheet, config.mapping.bank, row);
-    if (paymentMethod === PaymentMethod.BANK && postType !== 'OWNER_EXPENSE' && !bankName && !building?.bankName) errors.push('Bank is required for bank rows');
+    if (paymentMethod === PaymentMethod.BANK && postType !== 'OWNER_EXPENSE' && config.mapping.bank && !bankName && !building?.bankName) errors.push('Bank is required for bank rows');
 
     const contract = (postType === 'RENT' || kind === 'vatIncome' || kind === 'fees') && building ? resolveContract(context.contracts, building.id, unit) : null;
     if ((postType === 'RENT' || kind === 'vatIncome' || kind === 'fees') && !unit) errors.push('Unit is required');
@@ -543,12 +655,13 @@ export function validateWorksheetPostingRows(
     const person = resolveUser(context.users, target || employeeOrOwner || details);
     if ((postType === 'SALARY' || postType === 'BORROWING') && !person) errors.push('Employee could not be matched');
     if (postType === 'OWNER_EXPENSE' && !person) errors.push('Owner could not be matched');
-    const targetBuilding = category === ExpenseCategory.PROPERTY_RENT || category === 'Property Rent'
+    const targetBuilding = isPropertyRentCategory
       ? resolveExpenseTargetBuilding(context.buildings, target)
       : null;
-    if ((category === ExpenseCategory.PROPERTY_RENT || category === 'Property Rent') && !targetBuilding) errors.push('Leased property could not be matched');
+    if (isPropertyRentCategory && !targetBuilding) errors.push('Leased property could not be matched');
 
-    const isVat = kind === 'vatIncome' || kind === 'vatExpense';
+    const buildingChargesVat = building?.propertyType === 'NON_RESIDENTIAL' || (building as any)?.vatApplicable === true;
+    const isVat = kind === 'vatIncome' || kind === 'vatExpense' || (kind === 'rentalIncome' && buildingChargesVat);
     const netAmount = amount + (postType === 'EXPENSE' ? Math.max(0, cellNumber(sheet, config.mapping.extra, row)) : 0);
     const amountExcl = isVat ? Math.round((amount / 1.15) * 100) / 100 : undefined;
     const vatAmount = isVat ? Math.round((amount - (amountExcl || 0)) * 100) / 100 : undefined;
@@ -574,8 +687,8 @@ export function validateWorksheetPostingRows(
       customerId: contract?.customerId,
       customerName: contract?.customerName,
       expectedAmount: postType === 'RENT' && dueAmount > 0 ? dueAmount : undefined,
-      dueDate: postType === 'RENT' && installmentDueDate ? installmentDueDate : undefined,
-      installmentStartDate: postType === 'RENT' && installmentDueDate ? installmentDueDate : undefined,
+      dueDate: (postType === 'RENT' || kind === 'fees') && installmentDueDate ? installmentDueDate : undefined,
+      installmentStartDate: (postType === 'RENT' || kind === 'fees') && installmentDueDate ? installmentDueDate : undefined,
       incomeSubType: (postType === 'RENT' || kind === 'vatIncome') && kind !== 'fees' ? 'RENTAL' : (postType === 'OTHER_INCOME' || kind === 'fees') ? 'OTHER' : undefined,
       expenseCategory:
         postType === 'SALARY' ? ExpenseCategory.SALARY :
@@ -585,9 +698,9 @@ export function validateWorksheetPostingRows(
         type === TransactionType.INCOME && (postType === 'OTHER_INCOME' || kind === 'fees') ? (category || (kind === 'fees' ? 'Non-VAT Fees' : 'Other Income')) :
         undefined,
       expenseSubCategory:
-        category === ExpenseCategory.SALARY || category === 'Salary' ||
-        category === ExpenseCategory.BORROWING || category === 'Borrowing' ||
-        category === ExpenseCategory.PROPERTY_RENT || category === 'Property Rent'
+        isSalaryCategory ||
+        isBorrowingCategory ||
+        isPropertyRentCategory
           ? undefined
           : subCategory || undefined,
       employeeId: (postType === 'SALARY' || postType === 'BORROWING') ? person?.id : undefined,
@@ -595,7 +708,7 @@ export function validateWorksheetPostingRows(
       ownerId: postType === 'OWNER_EXPENSE' ? person?.id : undefined,
       ownerName: postType === 'OWNER_EXPENSE' ? person?.name || employeeOrOwner : undefined,
       borrowingType: postType === 'BORROWING' ? 'BORROW' : undefined,
-      salaryPeriod: postType === 'SALARY' ? (related || (date ? date.slice(0, 7) : undefined)) : undefined,
+      salaryPeriod: postType === 'SALARY' ? related : undefined,
       vendorName: kind === 'vatExpense' ? vendorName : (category === ExpenseCategory.MAINTENANCE || category === ExpenseCategory.VENDOR_PAYMENT ? target || undefined : undefined),
       vendorVATNumber: kind === 'vatExpense' ? vendorVAT : undefined,
       vendorRefNo: kind === 'vatExpense' ? vendorRefNo : undefined,
@@ -603,12 +716,15 @@ export function validateWorksheetPostingRows(
       feesEntry: kind === 'fees' ? true : undefined,
       discountAmount: kind === 'fees' ? Math.max(0, cellNumber(sheet, config.mapping.discount, row)) || undefined : undefined,
       details: details || (
-        category === ExpenseCategory.SALARY || category === 'Salary'
-          ? `Salary ${related || (date ? date.slice(0, 7) : '')} - ${person?.name || target}`.trim()
-          : category === ExpenseCategory.PROPERTY_RENT || category === 'Property Rent'
+        isSalaryCategory
+          ? `Salary ${related || ''} - ${person?.name || target}`.trim()
+          : isPropertyRentCategory
             ? `Property Rent - ${targetBuilding?.name || target}`
             : `${templateName(kind)}${unit ? ` - Unit ${unit}` : ''}`
       ),
+      source: 'amlak_sheets',
+      sourceLabel: 'Amlak Sheets',
+      postedFromAmlakSheets: true,
       status: TransactionStatus.APPROVED,
       createdAt: Date.now(),
       createdBy: sheet.rowsMeta?.[String(row)]?.enteredBy || context.currentUser.id,

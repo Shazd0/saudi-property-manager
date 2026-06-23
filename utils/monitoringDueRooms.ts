@@ -102,6 +102,7 @@ export function buildMonitoringDueRoomRows(input: {
   transactions: Transaction[];
   reportUpTo?: string;
   payThrough?: string;
+  includePriorLeaseRows?: boolean;
 }): MonitoringDueRoomRow[] {
   const reportUpTo = input.reportUpTo || localDateStr();
   const payThrough = input.payThrough || localDateStr();
@@ -295,7 +296,7 @@ export function buildMonitoringDueRoomRows(input: {
     });
 
     const priorRemaining = Math.max(0, priorOutstanding - paid);
-    if (priorOutstanding <= 0 || priorRemaining <= 0) return scheduleRows;
+    if (input.includePriorLeaseRows === false || priorOutstanding <= 0 || priorRemaining <= 0) return scheduleRows;
 
     const renewalYmd = contractDateToYmd((contract as any).fromDate);
     const catalogForPriorPaid = catalogIncludingDeleted.map((x: any) =>

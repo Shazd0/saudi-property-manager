@@ -32,7 +32,7 @@ import { fmtDate, fmtDateTime, isDateInCurrentMonth } from '../utils/dateFormat'
 import { addMoneyFingerprint, buildTransactionSearchHaystack, buildVendorSearchHaystack, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
-import { getNextVatInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { createVatReportSnapshot } from '../utils/vatSnapshot';
 import SearchableSelect from './SearchableSelect';
 
@@ -79,6 +79,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const location = useLocation();
     const { showSuccess, showInfo, showError, showToast } = useToast();
     const { t, language } = useLanguage();
+    const isPostedFromAmlakSheets = (tx: Transaction | any) =>
+        tx?.postedFromAmlakSheets === true || tx?.source === 'amlak_sheets';
     const [transactions, setTransactions] = useState<Transaction[]>([]);
     /** For resolving contract numbers in details (avoid showing raw Firestore IDs). */
     const [contracts, setContracts] = useState<Contract[]>([]);
@@ -233,8 +235,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const openVatModal = (tx: Transaction) => {
         setVatModalTx(tx);
         const autoInv = tx.type === TransactionType.INCOME
-            ? getNextVatInvoiceNumber(
-                transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+            ? getNextVatSalesInvoiceNumber(
+                transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && (t.zatcaQRCode || (t as any).zatcaReportedAt)),
                 tx.date,
               )
             : getNextVatInvoiceNumber(transactions, tx.date);
@@ -298,8 +300,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         try {
             const purchaseBillNo = String((vatModalTx as any).vendorRefNo || '').trim();
             const inv = vatInvoiceNumber.trim() || (vatModalTx.type === TransactionType.EXPENSE && purchaseBillNo ? purchaseBillNo : '') || (vatModalTx.type === TransactionType.INCOME
-                ? getNextVatInvoiceNumber(
-                    transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote),
+                ? getNextVatSalesInvoiceNumber(
+                    transactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && (t.zatcaQRCode || (t as any).zatcaReportedAt)),
                     vatModalTx.date,
                   )
                 : getNextVatInvoiceNumber(transactions, vatModalTx.date));
@@ -3330,10 +3332,11 @@ const canDelete = useCallback((tx: Transaction) => {
                                                 ? 'bg-rose-50 text-rose-600 border-rose-100'
                                                 : 'bg-slate-100 text-slate-600 border-slate-200'
                                         }`}>{row.type}</span>
-                                        <span className="text-[10px] font-mono text-slate-500 shrink-0">{fmtDate(row.date)}</span>
-                                        {showDeleted && <span className="text-[10px] font-bold bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded shrink-0">{t('history.deleted')}</span>}
-                                        {duplicateIds.has(row.id) && <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded shrink-0 border border-amber-200">{t('history.duplicate') || 'Duplicate'}</span>}
-                                    </div>
+	                                        <span className="text-[10px] font-mono text-slate-500 shrink-0">{fmtDate(row.date)}</span>
+	                                        {showDeleted && <span className="text-[10px] font-bold bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded shrink-0">{t('history.deleted')}</span>}
+	                                        {duplicateIds.has(row.id) && <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-1.5 py-0.5 rounded shrink-0 border border-amber-200">{t('history.duplicate') || 'Duplicate'}</span>}
+	                                        {isPostedFromAmlakSheets(row) && <span className="text-[10px] font-black bg-emerald-100 text-emerald-700 px-1.5 py-0.5 rounded shrink-0 border border-emerald-200">Posted from Amlak Sheets</span>}
+	                                    </div>
                                     <div className="flex justify-end w-full min-w-0">
                                         {row.type === TransactionType.INCOME ? (
                                             <div className={`amount-pill amount-income text-[0.9rem] sm:text-sm ${showDeleted ? 'line-through' : ''}`}><span className="amt-value tabular-nums">{displayAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
@@ -3545,10 +3548,11 @@ const canDelete = useCallback((tx: Transaction) => {
                                             }`}>
                                                 {row.type}
                                             </span>
-                                            {isPending && <div className={`mt-1 text-[9px] font-bold uppercase ${(row as any).isAutoPayment ? 'text-blue-500' : 'text-amber-500'}`}>{(row as any).isAutoPayment ? t('history.pendingBankConfirmation') : 'Pending Approval'}</div>}
-                                            {row.status === 'REJECTED' && <div className="mt-1 text-[9px] font-bold text-rose-500 uppercase">{t('common.rejected')}</div>}
-                                            {duplicateIds.has(row.id) && <div className="mt-1 text-[9px] font-bold text-amber-600 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200 inline-block">{t('history.duplicate') || 'Duplicate'}</div>}
-                                        </td>
+	                                            {isPending && <div className={`mt-1 text-[9px] font-bold uppercase ${(row as any).isAutoPayment ? 'text-blue-500' : 'text-amber-500'}`}>{(row as any).isAutoPayment ? t('history.pendingBankConfirmation') : 'Pending Approval'}</div>}
+	                                            {row.status === 'REJECTED' && <div className="mt-1 text-[9px] font-bold text-rose-500 uppercase">{t('common.rejected')}</div>}
+	                                            {duplicateIds.has(row.id) && <div className="mt-1 text-[9px] font-bold text-amber-600 bg-amber-100 px-1.5 py-0.5 rounded border border-amber-200 inline-block">{t('history.duplicate') || 'Duplicate'}</div>}
+	                                            {isPostedFromAmlakSheets(row) && <div className="mt-1 text-[9px] font-black text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded border border-emerald-200 inline-block">Posted from Amlak Sheets</div>}
+	                                        </td>
                                         <td className="px-4 py-3 text-sm text-slate-700 text-left align-middle">
                                             {row.unitNumber && (
                                                 <div className="mb-1">
@@ -4153,10 +4157,11 @@ const canDelete = useCallback((tx: Transaction) => {
                                         : selectedTx.type === TransactionType.EXPENSE
                                         ? 'bg-rose-50 text-rose-600 border-rose-100'
                                         : 'bg-slate-100 text-slate-600 border-slate-200'
-                                }`}>{selectedTx.type}</span>
-                                <span className="text-[11px] font-mono text-slate-600">{fmtDate(selectedTx.date)}</span>
-                                {selectedTx.status && <span className="text-[10px] font-bold text-amber-600">{selectedTx.status}</span>}
-                            </div>
+	                                }`}>{selectedTx.type}</span>
+	                                <span className="text-[11px] font-mono text-slate-600">{fmtDate(selectedTx.date)}</span>
+	                                {selectedTx.status && <span className="text-[10px] font-bold text-amber-600">{selectedTx.status}</span>}
+	                                {isPostedFromAmlakSheets(selectedTx) && <span className="text-[10px] font-black text-emerald-700 bg-emerald-100 px-2 py-1 rounded-md border border-emerald-200">Posted from Amlak Sheets</span>}
+	                            </div>
                             <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-2">
                                 <div className="p-3 bg-slate-50 rounded-lg border">
                                     <div className="text-[11px] text-slate-500 font-bold">{t('common.details')}</div>

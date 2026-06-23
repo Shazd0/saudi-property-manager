@@ -1,16 +1,17 @@
 
 import React, { useState, useEffect } from 'react';
-import { getSettings, saveSettings, generateBackup, restoreBackup, resetSystem, getAuditLogs, getBanks, saveBank, deleteBank, uploadProfilePhoto } from '../services/firestoreService';
+import { getSettings, saveSettings, generateBackup, restoreBackup, resetSystem, getAuditLogs, getBanks, saveBank, deleteBank, uploadProfilePhoto, getBankTransactionCounts, mergeBankAccounts, updateBankAccount, getFirestoreStorageEstimate } from '../services/firestoreService';
 import { getAllBackups, deleteBackup, restoreFromBackupRecord, getBackupStats, performAutoBackup, BackupRecord } from '../services/backupService';
 import { getUserStats, getAllUsersStats, getCurrentSessionDuration, formatDuration, UsageStats } from '../services/screenTimeService';
 import { SystemSettings, AuditLog, UserRole, User, Bank } from '../types';
-import { Settings as SettingsIcon, Database, Shield, Moon, Sun, Smartphone, Download, Upload, Trash2, Layout, Globe, Bell, FileText, AlertTriangle, Lock, CheckCircle, Landmark, Edit2, Plus, Save, X, Clock, HardDrive, User as UserIcon, Camera, Timer, TrendingUp, Share2, FileDown, FileUp, CheckCircle2, RefreshCw, Package } from 'lucide-react';
+import { Settings as SettingsIcon, Database, Shield, Moon, Sun, Smartphone, Download, Upload, Trash2, Layout, Globe, Bell, FileText, AlertTriangle, Lock, CheckCircle, Landmark, Edit2, Plus, Save, X, Clock, HardDrive, User as UserIcon, Camera, Timer, TrendingUp, Share2, FileDown, FileUp, CheckCircle2, RefreshCw, Package, ArrowRightLeft } from 'lucide-react';
 import { exportSyncPackage, importSyncPackage, shareSyncPackage, canNativeShare } from '../services/offlineSyncService';
 import { changeUserPassword } from '../services/firestoreService';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
 import { fmtDate, fmtDateTime } from '../utils/dateFormat';
+import { bankAccountKey } from '../utils/bankAccounts';
 import { useLanguage } from '../i18n';
 import { isAutoRentEnabled, setAutoRentEnabled } from '../services/autoRentService';
 
@@ -198,12 +199,23 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     const [pwdConfirm, setPwdConfirm] = useState('');
     const [pwdMsg, setPwdMsg] = useState<string>('');
     const [banks, setBanks] = useState<Bank[]>([]);
+    const [bankTransactionCounts, setBankTransactionCounts] = useState<Record<string, number>>({});
     const [editingBank, setEditingBank] = useState<Bank | null>(null);
+    const [editingBankOriginalName, setEditingBankOriginalName] = useState('');
+    const [editingBankOriginalId, setEditingBankOriginalId] = useState('');
+    const [savingBankEdit, setSavingBankEdit] = useState(false);
     const [isAddingBank, setIsAddingBank] = useState(false);
     const [newBankName, setNewBankName] = useState('');
     const [newBankIban, setNewBankIban] = useState('');
+    const [showMergeBanks, setShowMergeBanks] = useState(false);
+    const [mergeBankA, setMergeBankA] = useState('');
+    const [mergeBankB, setMergeBankB] = useState('');
+    const [mergeTargetBank, setMergeTargetBank] = useState('');
+    const [mergingBanks, setMergingBanks] = useState(false);
     const [backups, setBackups] = useState<BackupRecord[]>([]);
     const [backupStats, setBackupStats] = useState<any>(null);
+    const [firestoreStorage, setFirestoreStorage] = useState<any>(null);
+    const [loadingFirestoreStorage, setLoadingFirestoreStorage] = useState(false);
     const [autoBackupEnabled, setAutoBackupEnabled] = useState(true);
     const [uploadingPhoto, setUploadingPhoto] = useState(false);
     const [photoPreview, setPhotoPreview] = useState<string | null>(null);
@@ -228,6 +240,111 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
         setConfirmMessage('');
         setConfirmAction(null);
     };
+
+    const refreshBankManagement = async () => {
+        const [bankRows, counts] = await Promise.all([
+            getBanks(),
+            getBankTransactionCounts().catch(() => ({} as Record<string, number>)),
+        ]);
+        setBanks(bankRows || []);
+        setBankTransactionCounts(counts || {});
+    };
+
+    const bankTransactionCount = (bankName: string) => bankTransactionCounts[bankAccountKey(bankName)] || 0;
+
+    const resetMergeBankForm = () => {
+        setShowMergeBanks(false);
+        setMergeBankA('');
+        setMergeBankB('');
+        setMergeTargetBank('');
+    };
+
+    const handleMergeBanks = () => {
+        const sourceA = mergeBankA.trim();
+        const sourceB = mergeBankB.trim();
+        const target = mergeTargetBank.trim();
+        if (!sourceA || !sourceB || !target) {
+            showError('Select two source banks and one merged bank.');
+            return;
+        }
+        if (bankAccountKey(sourceA) === bankAccountKey(sourceB)) {
+            showError('Select two different bank accounts to merge.');
+            return;
+        }
+        openConfirm(
+            `Merge "${sourceA}" and "${sourceB}" into "${target}"? This will update all matching transaction bank fields in every book. Source bank records not kept as the merged bank will be removed.`,
+            async () => {
+                closeConfirm();
+                setMergingBanks(true);
+                try {
+                    const result = await mergeBankAccounts({
+                        sourceBankNames: [sourceA, sourceB],
+                        targetBankName: target,
+                        updatedBy: currentUser.id,
+                        removeMergedBanks: true,
+                    });
+                    await refreshBankManagement();
+                    resetMergeBankForm();
+                    showSuccess(`Banks merged. Updated ${result.transactionsUpdated} transaction(s), ${result.transfersUpdated} treasury transfer(s), ${result.buildingsUpdated} building default(s), and ${result.bankStatementsUpdated} bank statement(s).`);
+                } catch (e: any) {
+                    showError(e?.message || 'Failed to merge bank accounts.');
+                } finally {
+                    setMergingBanks(false);
+                }
+            },
+            { title: 'Merge Bank Accounts', danger: true }
+        );
+    };
+
+    const startEditingBank = (bank: Bank) => {
+        setEditingBank({ ...bank, iban: bank.iban || '' });
+        setEditingBankOriginalName(bank.name);
+        setEditingBankOriginalId(bank.id || bank.name);
+    };
+
+    const cancelEditingBank = () => {
+        setEditingBank(null);
+        setEditingBankOriginalName('');
+        setEditingBankOriginalId('');
+        setSavingBankEdit(false);
+    };
+
+    const handleSaveBankEdit = async () => {
+        if (!editingBank) return;
+        const nextName = editingBank.name.trim();
+        const originalName = editingBankOriginalName.trim();
+        if (!nextName) {
+            showError('Bank name is required.');
+            return;
+        }
+        const duplicate = banks.some(bank => bankAccountKey(bank.name) === bankAccountKey(nextName) && bankAccountKey(bank.name) !== bankAccountKey(originalName));
+        if (duplicate) {
+            showError('A bank with this name already exists. Use Merge Banks if you want to combine accounts.');
+            return;
+        }
+        setSavingBankEdit(true);
+        try {
+            const result = await updateBankAccount(originalName || editingBank.name, {
+                id: editingBankOriginalId || editingBank.id || originalName || editingBank.name,
+                name: nextName,
+                iban: editingBank.iban || '',
+            }, currentUser.id);
+            await refreshBankManagement();
+            cancelEditingBank();
+            if (result.renamed) {
+                showSuccess(`Bank updated. Renamed transaction references in ${result.transactionsUpdated} transaction(s).`);
+            } else {
+                showSuccess('Bank updated.');
+            }
+        } catch (e: any) {
+            showError(e?.message || 'Failed to update bank.');
+        } finally {
+            setSavingBankEdit(false);
+        }
+    };
+
+    const bankOptions = banks.map(bank => bank.name).filter(Boolean);
+    const canMergeBanks = !!mergeBankA && !!mergeBankB && !!mergeTargetBank && bankAccountKey(mergeBankA) !== bankAccountKey(mergeBankB) && !mergingBanks;
   
   // Load profile photo from localStorage on mount
   useEffect(() => {
@@ -246,7 +363,7 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
   useEffect(() => {
       const load = async () => {
           if (activeTab === 'AUDIT') setLogs(await getAuditLogs());
-          if (activeTab === 'BANKS') setBanks(await getBanks());
+          if (activeTab === 'BANKS') await refreshBankManagement();
           if (activeTab === 'DATA') {
               setBackups(await getAllBackups());
               setBackupStats(await getBackupStats());
@@ -383,6 +500,17 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
           handleChange('lastBackupDate', new Date().toISOString());
       } catch (error) {
           showError('Failed to create backup');
+      }
+  };
+
+  const handleCalculateFirestoreStorage = async () => {
+      setLoadingFirestoreStorage(true);
+      try {
+          setFirestoreStorage(await getFirestoreStorageEstimate());
+      } catch (error: any) {
+          showError(error?.message || 'Failed to calculate Firestore storage.');
+      } finally {
+          setLoadingFirestoreStorage(false);
       }
   };
 
@@ -902,20 +1030,94 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
             {/* BANKS TAB */}
             {activeTab === 'BANKS' && (
                 <div className="space-y-6">
-                    <div className="flex justify-between items-center">
+                    <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-3">
                         <div>
                             <h3 className="font-bold text-slate-800 flex items-center gap-2"><Landmark className="text-blue-600" size={20}/> Bank Accounts</h3>
                             <p className="text-sm text-slate-500 mt-1">Manage your bank accounts and IBANs</p>
                         </div>
                         {isAdmin && (
-                            <button
-                                onClick={() => setIsAddingBank(true)}
-                                className="px-4 py-2 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center gap-2"
-                            >
-                                <Plus size={16}/> Add Bank
-                            </button>
+                            <div className="flex gap-2 flex-wrap">
+                                <button
+                                    onClick={() => setShowMergeBanks(v => !v)}
+                                    disabled={banks.length < 2}
+                                    className="px-4 py-2 bg-indigo-50 text-indigo-700 border border-indigo-100 font-bold rounded-xl hover:bg-indigo-100 transition-all flex items-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    <ArrowRightLeft size={16}/> Merge Banks
+                                </button>
+                                <button
+                                    onClick={() => setIsAddingBank(true)}
+                                    className="px-4 py-2 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center gap-2"
+                                >
+                                    <Plus size={16}/> Add Bank
+                                </button>
+                            </div>
                         )}
                     </div>
+
+                    {showMergeBanks && (
+                        <div className="bg-indigo-50 p-6 rounded-2xl border border-indigo-200 space-y-4">
+                            <div className="flex justify-between items-start gap-3">
+                                <div>
+                                    <h4 className="font-bold text-indigo-900 flex items-center gap-2"><ArrowRightLeft size={18}/> Merge Bank Accounts</h4>
+                                    <p className="text-xs text-indigo-700 mt-1">Moves every matching transaction bank reference into the merged bank across all books.</p>
+                                </div>
+                                <button onClick={resetMergeBankForm} className="text-indigo-400 hover:text-indigo-700">
+                                    <X size={18}/>
+                                </button>
+                            </div>
+                            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                                <div className="space-y-2">
+                                    <label className="text-xs font-bold text-indigo-700 uppercase">Source Bank 1</label>
+                                    <select
+                                        value={mergeBankA}
+                                        onChange={e => setMergeBankA(e.target.value)}
+                                        className="w-full p-3 rounded-xl border border-indigo-200 bg-white font-bold text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                    >
+                                        <option value="">Select bank</option>
+                                        {bankOptions.map(name => <option key={name} value={name}>{name} ({bankTransactionCount(name)} tx)</option>)}
+                                    </select>
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-xs font-bold text-indigo-700 uppercase">Source Bank 2</label>
+                                    <select
+                                        value={mergeBankB}
+                                        onChange={e => setMergeBankB(e.target.value)}
+                                        className="w-full p-3 rounded-xl border border-indigo-200 bg-white font-bold text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                    >
+                                        <option value="">Select bank</option>
+                                        {bankOptions
+                                            .filter(name => bankAccountKey(name) !== bankAccountKey(mergeBankA))
+                                            .map(name => <option key={name} value={name}>{name} ({bankTransactionCount(name)} tx)</option>)}
+                                    </select>
+                                </div>
+                                <div className="space-y-2">
+                                    <label className="text-xs font-bold text-indigo-700 uppercase">Merge Into</label>
+                                    <select
+                                        value={mergeTargetBank}
+                                        onChange={e => setMergeTargetBank(e.target.value)}
+                                        className="w-full p-3 rounded-xl border border-indigo-200 bg-white font-bold text-sm outline-none focus:ring-2 focus:ring-indigo-500"
+                                    >
+                                        <option value="">Select final bank</option>
+                                        {bankOptions.map(name => <option key={name} value={name}>{name}</option>)}
+                                    </select>
+                                </div>
+                            </div>
+                            <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 bg-white/70 border border-indigo-100 rounded-xl p-3">
+                                <div className="text-xs text-indigo-800">
+                                    {mergeBankA && mergeBankB
+                                        ? `${mergeBankA}: ${bankTransactionCount(mergeBankA)} transaction(s) | ${mergeBankB}: ${bankTransactionCount(mergeBankB)} transaction(s)`
+                                        : 'Choose two source banks to see their transaction counts before merging.'}
+                                </div>
+                                <button
+                                    onClick={handleMergeBanks}
+                                    disabled={!canMergeBanks}
+                                    className="px-4 py-2 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                                >
+                                    {mergingBanks ? <><RefreshCw size={16} className="animate-spin"/> Merging...</> : <><ArrowRightLeft size={16}/> Merge & Update</>}
+                                </button>
+                            </div>
+                        </div>
+                    )}
 
                     {isAddingBank && (
                         <div className="bg-blue-50 p-6 rounded-2xl border border-blue-200 space-y-4">
@@ -949,7 +1151,7 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                 onClick={async () => {
                                     if (newBankName && newBankIban) {
                                         await saveBank({ name: newBankName, iban: newBankIban });
-                                        setBanks(await getBanks());
+                                        await refreshBankManagement();
                                         setIsAddingBank(false);
                                         setNewBankName('');
                                         setNewBankIban('');
@@ -963,8 +1165,8 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
 
                     <div className="space-y-3">
                         {banks.map(bank => (
-                            <div key={bank.name} className="bg-white p-6 rounded-2xl border border-slate-200 hover:shadow-md transition-all">
-                                {editingBank?.name === bank.name ? (
+                            <div key={bank.id || bank.name} className="bg-white p-6 rounded-2xl border border-slate-200 hover:shadow-md transition-all">
+                                {editingBank && editingBankOriginalId === (bank.id || bank.name) ? (
                                     <div className="space-y-4">
                                         <div className="space-y-2">
                                             <label className="text-xs font-bold text-slate-600 uppercase">{t('entry.bankName')}</label>
@@ -986,17 +1188,15 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                         </div>
                                         <div className="flex gap-3">
                                             <button
-                                                onClick={async () => {
-                                                    await saveBank(editingBank);
-                                                    setBanks(await getBanks());
-                                                    setEditingBank(null);
-                                                }}
-                                                className="flex-1 py-2 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2"
+                                                onClick={handleSaveBankEdit}
+                                                disabled={savingBankEdit}
+                                                className="flex-1 py-2 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                                             >
-                                                <Save size={16}/>{t('common.save')}</button>
+                                                {savingBankEdit ? <><RefreshCw size={16} className="animate-spin"/> Saving...</> : <><Save size={16}/>{t('common.save')}</>}</button>
                                             <button
-                                                onClick={() => setEditingBank(null)}
-                                                className="flex-1 py-2 bg-slate-200 text-slate-700 font-bold rounded-xl hover:bg-slate-300 transition-all"
+                                                onClick={cancelEditingBank}
+                                                disabled={savingBankEdit}
+                                                className="flex-1 py-2 bg-slate-200 text-slate-700 font-bold rounded-xl hover:bg-slate-300 transition-all disabled:opacity-50 disabled:cursor-not-allowed"
                                             >{t('common.cancel')}</button>
                                         </div>
                                     </div>
@@ -1008,11 +1208,15 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                                 {bank.name}
                                             </div>
                                             <div className="text-sm text-slate-500 font-mono mt-1">{bank.iban}</div>
+                                            <div className="inline-flex items-center gap-1.5 mt-3 px-2.5 py-1 rounded-full bg-slate-100 text-slate-600 text-xs font-bold">
+                                                <FileText size={13} className="text-blue-600"/>
+                                                {bankTransactionCount(bank.name)} transaction{bankTransactionCount(bank.name) === 1 ? '' : 's'}
+                                            </div>
                                         </div>
                                         {isAdmin && (
                                             <div className="flex gap-2">
                                                 <button
-                                                    onClick={() => setEditingBank(bank)}
+                                                    onClick={() => startEditingBank(bank)}
                                                     className="p-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-all"
                                                     title="Edit Bank"
                                                 >
@@ -1021,8 +1225,8 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                                 <button
                                                     onClick={async () => {
                                                         openConfirm(`Delete ${bank.name}? This cannot be undone.`, async () => {
-                                                            await deleteBank(bank.name);
-                                                            setBanks(await getBanks());
+                                                            await deleteBank(bank.id || bank.name);
+                                                            await refreshBankManagement();
                                                             closeConfirm();
                                                         }, { danger: true, title: 'Delete Bank' });
                                                     }}
@@ -1096,6 +1300,70 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                                      <span className="text-slate-600 flex items-center gap-2"><HardDrive size={14} /> Storage Used:</span>
                                      <span className="font-bold text-slate-800">{backupStats.totalSizeMB} MB</span>
                                  </div>
+                             </div>
+                         )}
+                     </div>
+
+                     {/* Firestore Storage */}
+                     <div className="bg-white p-4 sm:p-5 rounded-xl border border-slate-200">
+                         <div className="flex flex-col sm:flex-row sm:items-start sm:justify-between gap-3 mb-4">
+                             <div>
+                                 <h3 className="font-bold text-slate-800 flex items-center gap-2"><HardDrive className="text-blue-600"/> Firestore Storage</h3>
+                                 <p className="text-sm text-slate-500 mt-1">Estimate total app data stored in Firestore across readable collections and books.</p>
+                             </div>
+                             <button
+                                 onClick={handleCalculateFirestoreStorage}
+                                 disabled={loadingFirestoreStorage}
+                                 className="px-4 py-2 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                             >
+                                 {loadingFirestoreStorage ? <><RefreshCw size={16} className="animate-spin"/> Calculating...</> : <><RefreshCw size={16}/> Calculate Usage</>}
+                             </button>
+                         </div>
+
+                         {firestoreStorage ? (
+                             <div className="space-y-4">
+                                 <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                                     <div className="bg-blue-50 border border-blue-100 p-4 rounded-xl">
+                                         <div className="text-xs font-bold text-blue-600 uppercase">Estimated Size</div>
+                                         <div className="text-2xl font-black text-blue-900 mt-1">{firestoreStorage.totalSizeLabel}</div>
+                                         <div className="text-[11px] text-blue-500 mt-1">{firestoreStorage.totalSizeMB} MB / {firestoreStorage.totalSizeGB} GB</div>
+                                     </div>
+                                     <div className="bg-slate-50 border border-slate-100 p-4 rounded-xl">
+                                         <div className="text-xs font-bold text-slate-500 uppercase">Documents</div>
+                                         <div className="text-2xl font-black text-slate-800 mt-1">{firestoreStorage.documentCount}</div>
+                                         <div className="text-[11px] text-slate-500 mt-1">{firestoreStorage.collectionCount} collection(s)</div>
+                                     </div>
+                                     <div className="bg-emerald-50 border border-emerald-100 p-4 rounded-xl">
+                                         <div className="text-xs font-bold text-emerald-600 uppercase">Books Scanned</div>
+                                         <div className="text-2xl font-black text-emerald-900 mt-1">{firestoreStorage.booksScanned}</div>
+                                         <div className="text-[11px] text-emerald-600 mt-1">{fmtDateTime(firestoreStorage.estimatedAt)}</div>
+                                     </div>
+                                 </div>
+
+                                 {firestoreStorage.collections.length > 0 && (
+                                     <div className="bg-slate-50 border border-slate-100 rounded-xl overflow-hidden">
+                                         <div className="px-4 py-3 text-xs font-black text-slate-500 uppercase tracking-wide">Largest Collections</div>
+                                         <div className="divide-y divide-slate-100">
+                                             {firestoreStorage.collections.slice(0, 8).map((collection: any) => (
+                                                 <div key={collection.name} className="flex items-center justify-between px-4 py-3 text-sm">
+                                                     <div>
+                                                         <div className="font-bold text-slate-800">{collection.name}</div>
+                                                         <div className="text-xs text-slate-500">{collection.documents} document(s)</div>
+                                                     </div>
+                                                     <div className="font-black text-slate-700">{collection.sizeLabel}</div>
+                                                 </div>
+                                             ))}
+                                         </div>
+                                     </div>
+                                 )}
+
+                                 <p className="text-xs text-slate-500 bg-amber-50 border border-amber-100 rounded-xl p-3">
+                                     {firestoreStorage.note}
+                                 </p>
+                             </div>
+                         ) : (
+                             <div className="text-sm text-slate-500 bg-slate-50 border border-slate-100 rounded-xl p-4">
+                                 Click Calculate Usage to scan Firestore and show the total in KB, MB, and GB.
                              </div>
                          )}
                      </div>
