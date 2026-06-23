@@ -2885,6 +2885,15 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
     updateWorkbook(nextWorkbook, { trackHistory: true });
   };
 
+  const updateBuildingSheet = (workbook: AmlakWorkbook, nextSheet: AmlakWorksheet, options?: { trackHistory?: boolean }) => {
+    const nextWorkbook = {
+      ...workbook,
+      sheets: workbook.sheets.map(sheet => sheet.id === nextSheet.id ? ensureTrailingEmptyRows(nextSheet) : sheet),
+      updatedAt: Date.now(),
+    };
+    updateWorkbook(nextWorkbook, options);
+  };
+
   const manualSheetEmptyRowLimit = (sheet: AmlakWorksheet | undefined) => Math.max(0, Number(sheet?.visibleEmptyRowLimit ?? AUTO_EMPTY_ROW_BUFFER) || 0);
 
   const removeManualSheetRow = (row: number) => {
@@ -3463,6 +3472,193 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
     updateSheet(next);
   };
 
+  const setSectionCell = (input: { building: Building; workbook: AmlakWorkbook; sheet: AmlakWorksheet; row: number; col: string; value: string; isActive: boolean }) => {
+    if (input.isActive) {
+      setCell(input.row, input.col, input.value);
+      return;
+    }
+    if (sheetLocked) {
+      showInfo(futureMonthLocked ? 'Future month sheets are locked for everyone.' : 'Staff editing for this month is closed after the 10th of the next month.');
+      return;
+    }
+    const targetColumn = sheetColumns(activeKind).find(item => item.col === input.col);
+    const previousMeta = input.sheet.rowsMeta?.[String(input.row)] as any;
+    if (previousMeta?.status === 'posted' || previousMeta?.postedTransactionId) {
+      showInfo('Posted rows cannot be edited.');
+      return;
+    }
+    if (targetColumn && cellLockedForUser(input.sheet, input.row, targetColumn)) {
+      showInfo(targetColumn.key === 'unit' ? 'Unit is locked and cannot be edited.' : 'This cell is locked for staff.');
+      return;
+    }
+
+    const nextValue = shouldNormalizeInputCell(activeKind, input.col) ? normalizeAmlakTextValue(input.value) : input.value;
+    const isRentalPaidAmountEdit = isRentalDueBoardKind(activeKind) && targetColumn?.key === 'amount';
+    const isSplitBalancePaidAmountEdit = isSplitBalanceBoardKind(activeKind) && targetColumn?.key === 'amount';
+    let next = input.sheet;
+
+    if (isRentalDueBoardKind(activeKind) && input.col === 'B' && !String(nextValue || '').trim()) {
+      updateBuildingSheet(input.workbook, clearRentalUnitRow(input.sheet, input.row, currentUser), { trackHistory: true });
+      return;
+    }
+    if (isRentalPaidAmountEdit && !String(nextValue || '').trim()) {
+      updateBuildingSheet(input.workbook, clearRentalPaymentFields(input.sheet, input.row, currentUser), { trackHistory: true });
+      return;
+    }
+    if (activeKind === 'fees' && targetColumn?.key === 'amount' && !String(nextValue || '').trim()) {
+      next = setWorksheetCellFast(next, cellAddress(colLabelToIndex(input.col), input.row), '0');
+      next = deleteSplitChildRows(next, input.row);
+      updateBuildingSheet(input.workbook, setWorksheetRowMeta(next, input.row, currentUser, {
+        status: 'draft',
+        error: undefined,
+        enteredBy: currentUser.id,
+        enteredByName: currentUser.name,
+      }), { trackHistory: true });
+      return;
+    }
+
+    if (isSplitBalanceBoardKind(activeKind) && input.col === 'E') {
+      const amount = parseSheetAmount(nextValue);
+      const max = maxRentalPaymentForRow(input.sheet, input.row);
+      if (amount > max + 0.001) {
+        showInfo(rentalPaymentLimitMessage(input.sheet, input.row, amount));
+        return;
+      }
+    }
+
+    const address = cellAddress(colLabelToIndex(input.col), input.row);
+    next = setWorksheetCellFast(next, address, nextValue);
+    next = setWorksheetRowMeta(next, input.row, currentUser, {
+      status: 'draft',
+      error: undefined,
+      enteredBy: currentUser.id,
+      enteredByName: currentUser.name,
+      ...(previousMeta?.generatedDueSource === 'monitoring' && !previousMeta?.postedTransactionId
+        ? { enteredAt: Date.now() }
+        : {}),
+      ...(isRentalDueBoardKind(activeKind) && input.col === 'B' && String(nextValue || '').trim()
+        ? { generatedDueSuppressedKey: undefined }
+        : {}),
+      ...(isSplitBalancePaidAmountEdit && parseSheetAmount(nextValue) > 0.001
+        ? { paymentClearedAt: undefined }
+        : {}),
+    });
+
+    const buildingContracts = contracts.filter((contract: any) => itemMatchesSelectedBuilding(contract, input.building));
+    const buildingTransactions = transactions.filter((tx: any) => itemMatchesSelectedBuilding(tx, input.building));
+    if ((activeKind === 'rentalIncome' || activeKind === 'income' || activeKind === 'vatIncome' || activeKind === 'fees') && input.col === 'B') {
+      if (isRentalDueBoardKind(activeKind)) {
+        const dueRow = findManualRentalDueRow({
+          building: input.building,
+          contracts: buildingContracts,
+          transactions: buildingTransactions,
+          activeMonth,
+          unit: nextValue,
+          date: undefined,
+        });
+        if (dueRow) {
+          const paidMatch = findAlreadyPaidRentalRow(input.sheet, input.row, nextValue, dueRow.date);
+          if (paidMatch) {
+            showError(alreadyPaidRentalMessage(paidMatch));
+            return;
+          }
+          next = setWorksheetCellFast(next, `A${input.row}`, dueRow.date);
+          next = setWorksheetCellFast(next, `C${input.row}`, normalizeAmlakTextValue(dueRow.details));
+          next = setWorksheetCellFast(next, `D${input.row}`, String(dueRow.dueAmount));
+          next = setWorksheetRowMeta(next, input.row, currentUser, {
+            status: 'draft',
+            error: undefined,
+            enteredBy: currentUser.id,
+            enteredByName: currentUser.name,
+            generatedDueSource: 'monitoring',
+            generatedDueKey: rentalDueRowKey(dueRow),
+            generatedAt: Date.now(),
+            generatedDueSuppressedKey: undefined,
+          });
+          next = clearRentalPaymentFields(next, input.row, currentUser);
+        }
+      }
+      const contract = buildingContracts.find(contract => String(contract.unitName || '').trim().toLowerCase() === String(nextValue || '').trim().toLowerCase() && contract.status === 'Active')
+        || buildingContracts.find(contract => String(contract.unitName || '').trim().toLowerCase() === String(nextValue || '').trim().toLowerCase());
+      const details = activeKind === 'fees'
+        ? `Non-VAT Fees - ${contract?.customerName || 'Tenant'}${nextValue ? ` - Unit ${nextValue}` : ''}${contract?.contractNo ? ` - #${contract.contractNo}` : ''}`
+        : buildIncomeSheetDetails({
+          building: input.building,
+          contracts: buildingContracts,
+          unitName: nextValue,
+          date: cellRaw(next, 'A', input.row),
+        });
+      const detailCol = activeKind === 'vatIncome' ? 'D' : 'C';
+      next = setWorksheetCellFast(next, detailCol + input.row, normalizeAmlakTextValue(details || ''));
+      if (activeKind === 'vatIncome' && contract) {
+        const customer = customers.find((c: any) => c.id === contract.customerId) || customers.find((c: any) => c.nameEn === contract.customerName || c.nameAr === contract.customerName);
+        next = setWorksheetCellFast(next, 'C' + input.row, (customer as any)?.vatNumber || '');
+      } else if (activeKind === 'vatIncome') {
+        next = setWorksheetCellFast(next, 'C' + input.row, '');
+      }
+      if (isRentalDueBoardKind(activeKind)) next = clearRentalPaymentFields(next, input.row, currentUser);
+    }
+
+    if ((activeKind === 'expense' || activeKind === 'vatExpense') && input.col === 'B') {
+      next = setWorksheetCellFast(next, `C${input.row}`, '');
+      if (activeKind === 'expense') next = setWorksheetCellFast(next, `D${input.row}`, '');
+      if (activeKind === 'expense') next = setWorksheetCellFast(next, `E${input.row}`, '');
+      if (activeKind === 'expense') next = setWorksheetCellFast(next, `G${input.row}`, '');
+    }
+    if (activeKind === 'expense' && ['A', 'B', 'C', 'D'].includes(input.col)) {
+      const category = cellRaw(next, 'B', input.row);
+      const target = cellRaw(next, 'C', input.row);
+      const rowDate = cellRaw(next, 'A', input.row) || `${activeMonth}-01`;
+      const categoryKey = normRowKey(category);
+      if (categoryKey === normRowKey(ExpenseCategory.SALARY) || categoryKey === 'salary') {
+        const salary = salarySheetAutofill({
+          users,
+          transactions: buildingTransactions,
+          target,
+          period: cellRaw(next, 'D', input.row) || undefined,
+          rowDate,
+        });
+        if (salary) {
+          next = setWorksheetCellFast(next, `D${input.row}`, salary.period);
+          next = setWorksheetCellFast(next, `E${input.row}`, normalizeAmlakTextValue(salary.details));
+          next = setWorksheetCellFast(next, `G${input.row}`, salary.amount > 0 ? moneyRaw(salary.amount) : '0');
+          if (!cellRaw(next, 'F', input.row)) next = setWorksheetCellFast(next, `F${input.row}`, 'BANK');
+        }
+      }
+      if (categoryKey === normRowKey(ExpenseCategory.PROPERTY_RENT) || categoryKey === 'property rent') {
+        const rent = propertyRentSheetAutofill(buildings, transactions, target);
+        if (rent) {
+          next = setWorksheetCellFast(next, `D${input.row}`, '');
+          next = setWorksheetCellFast(next, `E${input.row}`, normalizeAmlakTextValue(rent.details));
+          next = setWorksheetCellFast(next, `G${input.row}`, rent.amount > 0 ? moneyRaw(rent.amount) : '0');
+          if (!cellRaw(next, 'F', input.row)) next = setWorksheetCellFast(next, `F${input.row}`, 'BANK');
+        }
+      }
+    }
+    if (activeKind === 'vatExpense' && input.col === 'D') {
+      const vendor = findVendorByValue(vendors, nextValue) || findVendorByValue(vendors, input.value);
+      if (vendor) {
+        next = setWorksheetCellFast(next, 'D' + input.row, normalizeAmlakTextValue(vendor.nameEn || vendor.name || nextValue));
+        next = setWorksheetCellFast(next, 'E' + input.row, vendor.vatNumber || vendor.vatNo || '');
+      } else {
+        next = setWorksheetCellFast(next, 'E' + input.row, '');
+      }
+    }
+
+    if (isSplitBalanceBoardKind(activeKind) && ['A', 'B', 'C', 'D', 'E'].includes(input.col)) {
+      next = syncSplitChildRows(next, input.row, currentUser, activeKind);
+      const childMeta = next.rowsMeta?.[String(input.row)] as any;
+      if (isSplitBalancePaidAmountEdit && childMeta?.splitPaymentChild && childMeta?.splitParentRow) {
+        next = syncSplitChildRows(next, Number(childMeta.splitParentRow), currentUser, activeKind);
+      }
+    }
+    if (isSplitBalancePaidAmountEdit) {
+      next = autoEnsureSplitRow(next, input.row, currentUser, activeKind).sheet;
+    }
+
+    updateBuildingSheet(input.workbook, next, { trackHistory: true });
+  };
+
   const splitRentalPaymentRow = (row: number) => {
     if (!activeSheet || !selectedBuilding || !isRentalDueBoardKind(activeKind)) return;
     if (sheetLocked || pastMonthReadOnly) {
@@ -3590,29 +3786,29 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
     );
   };
 
-  const visibleRows = useMemo(() => {
-    if (!activeSheet) return [];
+  const visibleRowsForSheet = (sheet: AmlakWorksheet | undefined): number[] => {
+    if (!sheet) return [];
     const pastMonth = activeMonth < currentMonthKey();
     const emptyRowLimit = supportsManualRows(activeKind)
-      ? Math.max(0, Number(activeSheet.visibleEmptyRowLimit ?? AUTO_EMPTY_ROW_BUFFER) || 0)
+      ? Math.max(0, Number(sheet.visibleEmptyRowLimit ?? AUTO_EMPTY_ROW_BUFFER) || 0)
       : 0;
     const rowIsPosted = (row: number) => {
-      const meta = activeSheet.rowsMeta?.[String(row)];
+      const meta = sheet.rowsMeta?.[String(row)];
       return meta?.status === 'posted' ||
         !!meta?.postedTransactionId;
     };
     const maxDataRow = Math.max(
       1,
-      ...Object.keys(activeSheet.rowsMeta || {}).map(Number).filter(Number.isFinite),
-      ...Object.values(activeSheet.cells || {}).map(cell => Number(cell.address.match(/\d+$/)?.[0] || 0)),
+      ...Object.keys(sheet.rowsMeta || {}).map(Number).filter(Number.isFinite),
+      ...Object.values(sheet.cells || {}).map(cell => Number(cell.address.match(/\d+$/)?.[0] || 0)),
     );
-    const scanEnd = Math.min(activeSheet.rowCount, Math.max(maxDataRow + emptyRowLimit, 1 + emptyRowLimit));
+    const scanEnd = Math.min(sheet.rowCount, Math.max(maxDataRow + emptyRowLimit, 1 + emptyRowLimit));
     const candidates = Array.from({ length: Math.max(0, scanEnd - 1) }, (_, i) => i + 2);
     const matched: number[] = [];
     let visibleEmptyRows = 0;
     for (const row of candidates) {
-      const hasData = rowHasData(activeSheet, row);
-      const meta = activeSheet.rowsMeta?.[String(row)] as any;
+      const hasData = rowHasData(sheet, row);
+      const meta = sheet.rowsMeta?.[String(row)] as any;
       if (pastMonth && !hasData) continue;
       if (!hasData) {
         if (!deferredSheetSearchTerm.trim() && meta?.manualAddedRow) {
@@ -3627,23 +3823,23 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
       }
       const generatedPriorOrPastBalance = isGeneratedPriorOrPastBalanceRow(meta);
       if (pastMonth && !rowIsPosted(row) && !generatedPriorOrPastBalance) continue;
-      if (activeKind === 'fees' && isDuplicateAutoFeeDueRow(activeSheet, row)) continue;
-      if (isRentalDueBoardKind(activeKind) && isDuplicateAutoRentalDueRow(activeSheet, row)) continue;
+      if (activeKind === 'fees' && isDuplicateAutoFeeDueRow(sheet, row)) continue;
+      if (isRentalDueBoardKind(activeKind) && isDuplicateAutoRentalDueRow(sheet, row)) continue;
       if (isRentalDueBoardKind(activeKind)) {
-        if (isSplitPaymentChildRow(activeSheet, row)) {
+        if (isSplitPaymentChildRow(sheet, row)) {
           matched.push(row);
           continue;
         }
-        const date = cellRaw(activeSheet, 'A', row);
+        const date = cellRaw(sheet, 'A', row);
         if (!date) {
           matched.push(row);
           continue;
         }
         const current = currentMonthKey();
         if (activeMonth > current) continue;
-        const due = Number(String(cellRaw(activeSheet, 'D', row) || '').replace(/,/g, '')) || 0;
-        const paid = Number(String(cellRaw(activeSheet, 'E', row) || '').replace(/,/g, '')) || 0;
-        const paidDate = cellRaw(activeSheet, 'G', row);
+        const due = Number(String(cellRaw(sheet, 'D', row) || '').replace(/,/g, '')) || 0;
+        const paid = Number(String(cellRaw(sheet, 'E', row) || '').replace(/,/g, '')) || 0;
+        const paidDate = cellRaw(sheet, 'G', row);
         if (paid > 0 && !paidDate) {
           matched.push(row);
           continue;
@@ -3658,40 +3854,44 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
             (date >= `${current}-01` && date < horizonEnd)
           );
           const legacyOverdueDraft = !meta?.generatedDueSource && !rowIsPosted(row) && date < dateToLocalStr(addMonths(monthStart(current), 1)) && due > paid;
-          if (rowDisplayMonthKey(activeSheet, activeKind, row) === current || generatedCurrentWindow || legacyOverdueDraft) matched.push(row);
+          if (rowDisplayMonthKey(sheet, activeKind, row) === current || generatedCurrentWindow || legacyOverdueDraft) matched.push(row);
           continue;
         }
-        if (rowDisplayMonthKey(activeSheet, activeKind, row) === activeMonth) matched.push(row);
+        if (rowDisplayMonthKey(sheet, activeKind, row) === activeMonth) matched.push(row);
         continue;
       }
-      if (supportsManualRows(activeKind) && !cellRaw(activeSheet, 'A', row)) {
+      if (supportsManualRows(activeKind) && !cellRaw(sheet, 'A', row)) {
         matched.push(row);
         continue;
       }
-      if (rowDisplayMonthKey(activeSheet, activeKind, row) === activeMonth) matched.push(row);
+      if (rowDisplayMonthKey(sheet, activeKind, row) === activeMonth) matched.push(row);
     }
     const searched = deferredSheetSearchTerm.trim()
-      ? matched.filter(row => rowMatchesSheetSearch(activeSheet, activeKind, row, deferredSheetSearchTerm))
+      ? matched.filter(row => rowMatchesSheetSearch(sheet, activeKind, row, deferredSheetSearchTerm))
       : matched;
     const categoryFiltered = activeKind === 'expense' && expenseCategoryFilter
-      ? searched.filter(row => normRowKey(cellRaw(activeSheet, 'B', row)) === normRowKey(expenseCategoryFilter))
+      ? searched.filter(row => normRowKey(cellRaw(sheet, 'B', row)) === normRowKey(expenseCategoryFilter))
       : searched;
     const displayRows = isRentalDueBoardKind(activeKind)
       ? [...categoryFiltered].sort((a, b) => {
-        const aDate = cellRaw(activeSheet, 'A', a);
-        const bDate = cellRaw(activeSheet, 'A', b);
+        const aDate = cellRaw(sheet, 'A', a);
+        const bDate = cellRaw(sheet, 'A', b);
         if (aDate !== bDate) return aDate.localeCompare(bDate);
-        const aUnit = normRowKey(cellRaw(activeSheet, 'B', a));
-        const bUnit = normRowKey(cellRaw(activeSheet, 'B', b));
+        const aUnit = normRowKey(cellRaw(sheet, 'B', a));
+        const bUnit = normRowKey(cellRaw(sheet, 'B', b));
         if (aUnit !== bUnit) return aUnit.localeCompare(bUnit);
         return a - b;
       })
       : categoryFiltered;
     if (pastMonth) return displayRows;
     const emptyFallbackRows = candidates
-      .filter(row => !rowHasData(activeSheet, row))
+      .filter(row => !rowHasData(sheet, row))
       .slice(0, emptyRowLimit);
     return displayRows.length ? displayRows : (deferredSheetSearchTerm.trim() || expenseCategoryFilter) ? [] : emptyFallbackRows;
+  };
+
+  const visibleRows = useMemo(() => {
+    return visibleRowsForSheet(activeSheet);
   }, [activeSheet, activeKind, activeMonth, deferredSheetSearchTerm, expenseCategoryFilter, compactSheetUi]);
   const activeGridTemplate = useMemo(() => (
     gridTemplate(activeKind, canPostRows, activeSheet || undefined, visibleRows, viewportWidth)
@@ -3706,20 +3906,11 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
           ? activeSheet
           : workbook?.sheets.find(item => (item.sheetKind === 'income' ? 'rentalIncome' : item.sheetKind) === activeKind);
         if (!sheet) return null;
-        if (isActiveBuilding) return { building, sheet, rows: visibleRows, editable: true };
-        const maxDataRow = Math.max(
-          1,
-          ...Object.keys(sheet.rowsMeta || {}).map(Number).filter(Number.isFinite),
-          ...Object.values(sheet.cells || {}).map(cell => Number(cell.address.match(/\d+$/)?.[0] || 0)),
-        );
-        const rows = Array.from({ length: Math.max(0, maxDataRow - 1) }, (_, index) => index + 2)
-          .filter(row => rowHasData(sheet, row))
-          .filter(row => rowDisplayMonthKey(sheet, activeKind, row) === activeMonth)
-          .filter(row => !deferredSheetSearchTerm.trim() || rowMatchesSheetSearch(sheet, activeKind, row, deferredSheetSearchTerm))
-          .filter(row => activeKind !== 'expense' || !expenseCategoryFilter || normRowKey(cellRaw(sheet, 'B', row)) === normRowKey(expenseCategoryFilter));
-        return { building, sheet, rows, editable: false };
+        if (isActiveBuilding) return { building, workbook: workbook!, sheet, rows: visibleRows, isActive: true };
+        const rows = visibleRowsForSheet(sheet);
+        return { building, workbook: workbook!, sheet, rows, isActive: false };
       })
-      .filter((section): section is { building: Building; sheet: AmlakWorksheet; rows: number[]; editable: boolean } => !!section);
+      .filter((section): section is { building: Building; workbook: AmlakWorkbook; sheet: AmlakWorksheet; rows: number[]; isActive: boolean } => !!section);
   }, [selectedBuilding?.id, selectedSummaryBuildings, activeWorkbook, activeSheet, workbooks, activeKind, activeMonth, visibleRows, deferredSheetSearchTerm, expenseCategoryFilter]);
 
   useEffect(() => {
@@ -4532,7 +4723,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
                 <div className="px-3 py-3" style={{ gridColumn: canPostRows ? '3 / -1' : '2 / -1' }}>
                   {section.building.name}
                   <span className="ml-2 rounded-full bg-white px-2 py-0.5 text-[10px] text-emerald-700">{section.rows.length} row(s)</span>
-                  {section.editable && <span className="ml-2 rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] text-white">Editable</span>}
+                  <span className="ml-2 rounded-full bg-emerald-600 px-2 py-0.5 text-[10px] text-white">Editable</span>
                 </div>
               </div>
               {section.rows.length === 0 && (
@@ -4549,7 +4740,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
               )}
               {section.rows.map((row, sectionIndex) => {
                 const meta = section.sheet.rowsMeta?.[String(row)];
-                const result = section.editable ? postingByRow.get(row) : undefined;
+                const result = section.isActive ? postingByRow.get(row) : undefined;
                 const hasData = rowHasData(section.sheet, row);
                 const posted = meta?.status === 'posted' || !!meta?.postedTransactionId;
                 const generatedRentalRow = isRentalDueBoardKind(activeKind) && isGeneratedRentalDueRow(section.sheet, row);
@@ -4558,18 +4749,18 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
                   <div
                     key={`${section.building.id}-${row}`}
                     onContextMenu={(event) => {
-                      if (!section.editable || !supportsManualRows(activeKind)) return;
+                      if (!section.isActive || !supportsManualRows(activeKind)) return;
                       event.preventDefault();
                       setSheetRowMenu({ row, x: event.clientX, y: event.clientY });
                     }}
                     className={`group grid min-h-9 items-stretch border-b border-slate-100 text-xs ${compactSheetUi ? '' : 'transition-colors duration-200'} ${
-                      section.editable && attentionRow === row ? 'bg-amber-100/90 ring-2 ring-amber-400 ring-inset' : posted ? 'bg-emerald-50/55' : extraRentalRow ? 'bg-sky-50/75 hover:bg-sky-50 ring-1 ring-sky-100/80 ring-inset' : hasData ? 'bg-white hover:bg-emerald-50/20' : 'bg-white/70 hover:bg-white'
+                      section.isActive && attentionRow === row ? 'bg-amber-100/90 ring-2 ring-amber-400 ring-inset' : posted ? 'bg-emerald-50/55' : extraRentalRow ? 'bg-sky-50/75 hover:bg-sky-50 ring-1 ring-sky-100/80 ring-inset' : hasData ? 'bg-white hover:bg-emerald-50/20' : 'bg-white/70 hover:bg-white'
                     } w-max min-w-full`}
                     style={{ gridTemplateColumns: activeGridTemplate }}
                   >
                     {canPostRows && (
                       <div className="px-1.5 grid place-items-center">
-                        {section.editable && (
+                        {section.isActive && (
                           <input
                             type="checkbox"
                             disabled={!result?.ok || posted || sheetLocked}
@@ -4585,7 +4776,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
                     )}
                     <div className="px-1.5 grid place-items-center text-[11px] font-black text-slate-400">{sectionIndex + 1}</div>
                     {sheetColumns(activeKind).map(col => {
-                      const cellLocked = section.editable ? cellLockedForUser(section.sheet, row, col) : true;
+                      const cellLocked = cellLockedForUser(section.sheet, row, col);
                       return (
                         <SheetCell
                           key={`${section.building.id}-${row}-${col.key}`}
@@ -4612,16 +4803,16 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
                           locked={cellLocked}
                           onFocus={() => {}}
                           onSelectCell={() => {}}
-                          onNavigate={section.editable ? (direction) => moveActiveCell(row, col.key, direction) : () => {}}
-                          onChange={section.editable ? (value) => col.col && setCell(row, col.col, value) : () => {}}
-                          onSplit={section.editable ? () => splitRentalPaymentRow(row) : undefined}
+                          onNavigate={section.isActive ? (direction) => moveActiveCell(row, col.key, direction) : () => {}}
+                          onChange={(value) => col.col && setSectionCell({ building: section.building, workbook: section.workbook, sheet: section.sheet, row, col: col.col, value, isActive: section.isActive })}
+                          onSplit={section.isActive ? () => splitRentalPaymentRow(row) : undefined}
                           onInvalidAmount={showInfo}
-                          onBlockedEarlierInstallment={section.editable ? blockEarlierInstallmentIfNeeded : undefined}
-                          onBlockedAlreadyPaidUnit={section.editable ? blockAlreadyPaidUnitIfNeeded : undefined}
+                          onBlockedEarlierInstallment={section.isActive ? blockEarlierInstallmentIfNeeded : undefined}
+                          onBlockedAlreadyPaidUnit={section.isActive ? blockAlreadyPaidUnitIfNeeded : undefined}
                           onClearSelectedCells={() => {}}
-                          onAddVendor={section.editable ? addVendorFromSheet : undefined}
-                          onDeleteVendor={section.editable ? deleteVendorFromSheet : undefined}
-                          onDeleteVendors={section.editable ? deleteVendorsFromSheet : undefined}
+                          onAddVendor={addVendorFromSheet}
+                          onDeleteVendor={deleteVendorFromSheet}
+                          onDeleteVendors={deleteVendorsFromSheet}
                         />
                       );
                     })}
