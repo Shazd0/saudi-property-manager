@@ -1372,6 +1372,15 @@ function supportsManualRows(kind: AmlakSheetKind): boolean {
   return !isRentalDueBoardKind(kind);
 }
 
+function buildingHasVatSheets(building: Building | undefined): boolean {
+  if (!building) return false;
+  return building.propertyType === 'NON_RESIDENTIAL' || (building as any).vatApplicable === true;
+}
+
+function isVatOnlySheetKind(kind: AmlakSheetKind): boolean {
+  return kind === 'vatIncome' || kind === 'vatExpense';
+}
+
 function buildingIdCandidates(id: unknown): string[] {
   const raw = String(id || '').trim();
   if (!raw) return [];
@@ -2381,10 +2390,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
     () => selectedBuilding ? transactions.filter((tx: any) => itemMatchesSelectedBuilding(tx, selectedBuilding)) : [],
     [transactions, selectedBuilding?.id],
   );
-  const isVatBuilding = !!selectedBuilding && (
-    isNonResidentialBuildingForContract([selectedBuilding], { buildingId: selectedBuilding.id }) ||
-    (selectedBuilding as any).vatApplicable === true
-  );
+  const isVatBuilding = buildingHasVatSheets(selectedBuilding);
   const visibleSheetTabs = useMemo(
     () => SHEET_TABS.filter(tab => isVatBuilding || !['vatIncome', 'vatExpense', 'fees'].includes(tab.kind)),
     [isVatBuilding],
@@ -3899,6 +3905,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
   const multiBuildingSheetSections = useMemo(() => {
     if (!selectedBuilding || selectedSummaryBuildings.length <= 1) return [];
     return selectedSummaryBuildings
+      .filter(building => !isVatOnlySheetKind(activeKind) || buildingHasVatSheets(building))
       .map(building => {
         const isActiveBuilding = building.id === selectedBuilding.id;
         const workbook = isActiveBuilding ? activeWorkbook : workbookForBuilding(workbooks, building);
