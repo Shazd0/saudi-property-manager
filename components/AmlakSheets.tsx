@@ -1377,8 +1377,8 @@ function buildingHasVatSheets(building: Building | undefined): boolean {
   return building.propertyType === 'NON_RESIDENTIAL' || (building as any).vatApplicable === true;
 }
 
-function isVatOnlySheetKind(kind: AmlakSheetKind): boolean {
-  return kind === 'vatIncome' || kind === 'vatExpense';
+function isNonResidentialOnlySheetKind(kind: AmlakSheetKind): boolean {
+  return kind === 'vatIncome' || kind === 'vatExpense' || kind === 'fees';
 }
 
 function buildingIdCandidates(id: unknown): string[] {
@@ -3905,7 +3905,7 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
   const multiBuildingSheetSections = useMemo(() => {
     if (!selectedBuilding || selectedSummaryBuildings.length <= 1) return [];
     return selectedSummaryBuildings
-      .filter(building => !isVatOnlySheetKind(activeKind) || buildingHasVatSheets(building))
+      .filter(building => !isNonResidentialOnlySheetKind(activeKind) || buildingHasVatSheets(building))
       .map(building => {
         const isActiveBuilding = building.id === selectedBuilding.id;
         const workbook = isActiveBuilding ? activeWorkbook : workbookForBuilding(workbooks, building);
