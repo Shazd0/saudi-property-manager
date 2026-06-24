@@ -2,7 +2,7 @@
 // Handles: caching, offline support, background sync, AND Firebase Cloud Messaging
 
 // ─── Cache Configuration ───
-const CACHE_VERSION = 'v3';
+const CACHE_VERSION = 'v4';
 const STATIC_CACHE  = `amlak-static-${CACHE_VERSION}`;
 const DYNAMIC_CACHE = `amlak-dynamic-${CACHE_VERSION}`;
 const CDN_CACHE     = `amlak-cdn-${CACHE_VERSION}`;
@@ -17,8 +17,6 @@ const MAX_IMG_CACHE = 60;
 const APP_SHELL = [
   '/',
   '/index.html',
-  '/owner.html',
-  '/tenant.html',
   '/manifest.webmanifest',
   '/images/logo.png',
   '/images/amlak-sheets-icon.svg',
@@ -283,10 +281,13 @@ self.addEventListener('fetch', (event) => {
   // Strategy 4: Same-origin navigation → Network First, fall back to cache, then offline page
   if (event.request.mode === 'navigate' || event.request.destination === 'document') {
     event.respondWith(
-      fetch(event.request).then(response => {
+      fetch(event.request, { cache: 'reload' }).then(response => {
         if (response && response.ok) {
-          const clone = response.clone();
-          caches.open(STATIC_CACHE).then(cache => cache.put(event.request, clone));
+          const contentType = response.headers.get('content-type') || '';
+          if (!contentType.includes('text/html')) {
+            const clone = response.clone();
+            caches.open(STATIC_CACHE).then(cache => cache.put(event.request, clone));
+          }
         }
         return response;
       }).catch(() =>

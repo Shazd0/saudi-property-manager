@@ -13,6 +13,26 @@
         _origWarn.apply(console, args);
       };
     </script>
+    <script>
+      (function() {
+        var key = 'tenant-sw-cleanup-v2';
+        if (sessionStorage.getItem(key)) return;
+        if (!('serviceWorker' in navigator) || !window.caches) return;
+        sessionStorage.setItem(key, '1');
+        Promise.all([
+          navigator.serviceWorker.getRegistrations().then(function(regs) {
+            return Promise.all(regs.map(function(reg) { return reg.unregister(); }));
+          }),
+          caches.keys().then(function(keys) {
+            return Promise.all(keys.filter(function(name) {
+              return /^amlak-/.test(name);
+            }).map(function(name) { return caches.delete(name); }));
+          })
+        ]).then(function() {
+          if (navigator.serviceWorker.controller) window.location.reload();
+        }).catch(function() {});
+      })();
+    </script>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Tajawal:wght@400;500;700;800&display=swap" rel="stylesheet">
     <link rel="manifest" href="/manifest.webmanifest" />
