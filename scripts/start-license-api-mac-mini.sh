@@ -4,19 +4,40 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-ENV_FILE="$ROOT_DIR/license-api-server/.env.production.local"
+ENV_CANDIDATES=(
+  "$ROOT_DIR/license-api-server/.env.production.local"
+  "$ROOT_DIR/functions/.env"
+  "$ROOT_DIR/.env.local"
+)
 
-if [[ -f "$ENV_FILE" ]]; then
+load_env_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
   set -a
   # shellcheck disable=SC1090
-  source "$ENV_FILE"
+  source "$f"
   set +a
-else
-  echo "Warning: missing $ENV_FILE — using process env only." >&2
+  echo "Loaded env from $f"
+}
+
+for f in "${ENV_CANDIDATES[@]}"; do
+  load_env_file "$f"
+done
+
+if [[ -z "${SALES_CONSOLE_PASSWORD:-}" && -n "${VITE_SALES_CONSOLE_PASSWORD:-}" ]]; then
+  export SALES_CONSOLE_PASSWORD="$VITE_SALES_CONSOLE_PASSWORD"
 fi
 
 if [[ -z "${SALES_CONSOLE_PASSWORD:-}" ]]; then
-  echo "Missing SALES_CONSOLE_PASSWORD. Add it to $ENV_FILE" >&2
+  echo "Missing SALES_CONSOLE_PASSWORD." >&2
+  echo "Run: ./scripts/prepare-license-env-mac-mini.sh" >&2
+  echo "Or create license-api-server/.env.production.local" >&2
+  exit 1
+fi
+
+if [[ ! -f "$ROOT_DIR/license-api-server/service-account.json" && -z "${FIREBASE_SERVICE_ACCOUNT_JSON:-}" ]]; then
+  echo "Missing Firebase Admin credentials." >&2
+  echo "Copy license-api-server/service-account.json from the Windows laptop." >&2
   exit 1
 fi
 

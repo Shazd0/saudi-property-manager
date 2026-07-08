@@ -29,6 +29,19 @@ Keep the laptop awake and online. Sleep/lid-close brings Error 1033 back.
 
 ---
 
+## Move permanently to the Mac mini
+
+Full cutover (copy files from Windows, stop laptop tunnel, start Mac): see **`docs/MAC_MINI_SALEAPI_SETUP.md`**.
+
+### Quick Mac mini start (after one-time setup)
+
+```bash
+cd ~/amlak-sale-product   # or your path
+./scripts/start-saleapi-stack-mac-mini.sh
+```
+
+---
+
 ## On the Mac mini (run these in Terminal)
 
 ### 1. Keep the Mac awake
