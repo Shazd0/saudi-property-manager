@@ -1,0 +1,35 @@
+# Render Blueprint — always-on License API (no laptop / Mac mini required).
+# Docs: docs/RENDER_LICENSE_API_SETUP.md
+#
+# Use Starter (not Free) so the API does not sleep after idle.
+# After deploy: Cloudflare DNS saleapi → this service; stop local cloudflared.
+
+services:
+  - type: web
+    name: amlak-license-api
+    runtime: node
+    plan: starter
+    region: frankfurt
+    # firebase-admin is in the repo-root package.json; handlers live in functions/licenseApi.js
+    buildCommand: npm install --omit=dev && npm install --prefix license-api-server --omit=dev
+    startCommand: node license-api-server/index.js
+    healthCheckPath: /health
+    domains:
+      - saleapi.amlak-app.com
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: SALES_CONSOLE_PASSWORD
+        sync: false
+      - key: FIREBASE_SERVICE_ACCOUNT_JSON
+        sync: false
+      - key: LICENSE_CORS_ORIGINS
+        value: https://amlak-app.com,https://www.amlak-app.com
+      - key: ZATCA_CREDENTIALS_SECRET
+        sync: false
+      - key: ZATCA_SIGNING_SERVICE_URL
+        sync: false
+      - key: ZATCA_SIGNING_SERVICE_KEY
+        sync: false
+      - key: GIFT_REVEAL_SECRET
+        sync: false
