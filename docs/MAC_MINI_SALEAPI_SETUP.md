@@ -9,7 +9,16 @@ You only change **which machine** runs License API + `cloudflared`.
 
 ## A. On the Windows laptop (copy these files)
 
-Copy to a USB / AirDrop / shared folder:
+**Easiest:** run this once on the laptop (builds a private folder on Desktop):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\export-saleapi-transfer-pack.ps1
+```
+
+That creates `Desktop\amlak-saleapi-mac-transfer\` with tunnel credentials + `service-account.json` + password env.  
+Copy that folder to the Mac (USB / AirDrop). **Delete it after setup.** Do not commit it.
+
+Or copy manually:
 
 | From Windows | To Mac mini |
 |--------------|-------------|
@@ -23,6 +32,12 @@ Tunnel identity (reuse — do **not** create a new tunnel unless the copy fails)
 
 - Name: `amlak-saleapi`
 - UUID: `cf968696-8198-487e-a62b-e83c6318a6a8`
+
+**When Mac is ready**, stop the laptop stack:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\stop-saleapi-stack-windows.ps1
+```
 
 ---
 
