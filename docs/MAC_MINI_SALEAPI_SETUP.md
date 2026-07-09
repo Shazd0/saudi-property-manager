@@ -145,7 +145,42 @@ https://amlak-app.com/app/?licenseSetup=1&teamCode=YOUR_CODE
 
 ## D. Survive reboot (recommended)
 
-Create LaunchAgents later so API + tunnel restart after login. Until then, leave Terminal open or re-run `./scripts/start-saleapi-stack-mac-mini.sh` after each reboot.
+Install **LaunchAgents** so License API + tunnel restart automatically when you log in:
+
+```bash
+cd ~/amlak-sale-product
+git pull
+chmod +x scripts/*.sh
+./scripts/install-saleapi-launchagents-mac-mini.sh
+```
+
+Logs:
+
+```text
+~/Library/Logs/amlak/license-api.log
+~/Library/Logs/amlak/saleapi-tunnel.log
+```
+
+Check after install:
+
+```bash
+curl -sS http://127.0.0.1:8787/health
+curl -sS https://saleapi.amlak-app.com/health
+```
+
+Remove auto-start:
+
+```bash
+./scripts/uninstall-saleapi-launchagents-mac-mini.sh
+```
+
+Also keep the Mac awake:
+
+```bash
+sudo pmset -a sleep 0 displaysleep 0 disksleep 0
+```
+
+Until LaunchAgents are installed, re-run `./scripts/start-saleapi-stack-mac-mini.sh` after each reboot.
 
 ---
 
