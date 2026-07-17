@@ -44,6 +44,20 @@ import { recordSessionCallHistory } from '../services/callHistoryService';
 import { registerMacCallBackgroundWatch, getMacApiConfig } from '../services/macSignalingClient';
 import { setCallPresence, clearCallPresence } from '../services/callPresenceService';
 
+const CALL_LOG_KEY = '__amlakCallDebug';
+type CallLogEntry = { t: string; msg: string; data?: unknown };
+const callLog = (msg: string, data?: unknown) => {
+  const entry: CallLogEntry = { t: new Date().toISOString(), msg, data };
+  try {
+    const w = window as any;
+    if (!Array.isArray(w[CALL_LOG_KEY])) w[CALL_LOG_KEY] = [];
+    w[CALL_LOG_KEY].push(entry);
+    if (w[CALL_LOG_KEY].length > 200) w[CALL_LOG_KEY].shift();
+  } catch { /* ignore */ }
+  if (data !== undefined) console.log(`[AmlakCall] ${msg}`, data);
+  else console.log(`[AmlakCall] ${msg}`);
+};
+
 const stopSwCallRing = (sessionId?: string) => {
   if (!('serviceWorker' in navigator)) return;
   navigator.serviceWorker.ready.then((reg) => {
@@ -247,7 +261,15 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
     ringtoneRef.current = null;
   }, []);
 
-  const cleanupCall = useCallback(async (notifyEnd = true) => {
+  const cleanupCall = useCallback(async (notifyEnd = true, opts?: { keepError?: boolean; reason?: string }) => {
+    callLog('cleanupCall', {
+      reason: opts?.reason || 'unspecified',
+      notifyEnd,
+      keepError: !!opts?.keepError,
+      sessionId: sessionRef.current?.id,
+      phase,
+      stack: new Error().stack?.split('\n').slice(0, 8),
+    });
     stopRingtone();
     if (durationTimerRef.current) {
       window.clearInterval(durationTimerRef.current);
@@ -300,8 +322,8 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
     setSession(null);
     setIncomingCall(null);
     setPhase('idle');
-    setError('');
-  }, [stopRingtone, recordCallHistory]);
+    if (!opts?.keepError) setError('');
+  }, [stopRingtone, recordCallHistory, phase]);
 
   const pendingPushActionRef = useRef<'answer' | 'decline' | null>(null);
 
@@ -555,12 +577,21 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
 
     const unsubSession = listenVoiceCallSession(session.id, updated => {
       // Ignore empty poll misses — only hang up on a real ended status.
-      if (!updated) return;
+      if (!updated) {
+        callLog('session listener got null (ignored)', { sessionId: session.id });
+        return;
+      }
+      callLog('session update', {
+        id: updated.id,
+        status: updated.status,
+        participants: updated.participants,
+      });
       setSession(updated);
 
       if (['ended', 'missed', 'declined', 'busy'].includes(updated.status)) {
+        callLog('session ended by status → cleanup', { status: updated.status });
         lastCallStatusRef.current = updated.status;
-        void cleanupCall(false);
+        void cleanupCall(false, { reason: `session-status:${updated.status}` });
         return;
       }
 
@@ -576,6 +607,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
           offerStartedRef.current = true;
           setPeerStatus('connecting');
           const targets = (updated.calleeIds || []).filter((id) => id !== userId);
+          callLog('callee joined → creating offer', { targets, joinedCount });
           void (async () => {
             try {
               await ensureLocalStream(updated.callType);
@@ -585,6 +617,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
                 }
               }
             } catch (err: any) {
+              callLog('offer create failed', { error: err?.message || String(err) });
               setError(err?.message || t('call.failed') || 'Could not connect call');
             }
           })();
@@ -594,10 +627,12 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
 
     signalStartedAtRef.current = Date.now();
     const unsubSignals = listenCallSignals(session.id, userId, signal => {
+      callLog('signal received', { type: signal.type, from: signal.fromUserId, to: signal.toUserId });
       handleSignal(signal);
     });
 
     return () => {
+      callLog('session listener unsubscribed', { sessionId: session.id });
       unsubSession();
       unsubSignals();
     };
@@ -618,13 +653,25 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
   }, [remoteStreams, speakerOn]);
 
   const startCall = useCallback(async (params: StartCallParams) => {
+    callLog('startCall requested', {
+      type: params.type,
+      targets: params.targetUserIds,
+      phase,
+      busy: busyRef.current,
+      macBackend: isMacCallBackend(),
+      api: getMacApiConfig(),
+    });
     if (busyRef.current || phase !== 'idle') {
+      callLog('startCall blocked', { busy: busyRef.current, phase });
       setError(t('call.busy') || 'Already in a call');
       return;
     }
 
     const targets = params.targetUserIds.filter(id => id !== userId);
-    if (targets.length === 0) return;
+    if (targets.length === 0) {
+      callLog('startCall aborted: no targets');
+      return;
+    }
 
     try {
       busyRef.current = true;
@@ -638,6 +685,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
       setPhase('outgoing');
       playRingtone();
 
+      callLog('creating voice session…');
       const sessionId = await createVoiceCallSession({
         callType: params.type,
         callerId: userId,
@@ -647,6 +695,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
         roomId: params.roomId,
         roomName: params.roomName,
       });
+      callLog('session created', { sessionId });
 
       const initialSession: VoiceCallSession = {
         id: sessionId,
@@ -670,35 +719,42 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
       setSession(initialSession);
       sessionRef.current = initialSession;
       try {
+        callLog('requesting microphone/camera…');
         await ensureLocalStream(params.type);
+        callLog('local media ready');
       } catch (mediaErr: any) {
+        callLog('media permission failed', { error: mediaErr?.message || String(mediaErr) });
         setError(mediaErr?.message || t('call.micDenied') || 'Microphone permission is required');
         await endVoiceCallSession(sessionId, 'ended');
-        await cleanupCall(false);
+        await cleanupCall(false, { keepError: true, reason: 'media-permission-failed' });
         return;
       }
       // WebRTC offer is created after the callee joins (see session listener).
+      callLog('outgoing call ringing — waiting for answer');
 
       window.setTimeout(() => {
         if (sessionRef.current?.id === sessionId && sessionRef.current.status === 'ringing') {
           setPeerStatus('offline');
+          callLog('peer still ringing after 10s → mark offline UI');
         }
       }, 10000);
 
       // Auto-end if nobody answers in 45s
       window.setTimeout(async () => {
         if (sessionRef.current?.id === sessionId && sessionRef.current.status === 'ringing') {
+          callLog('no answer after 45s → miss');
           lastCallStatusRef.current = 'missed';
           setConnectionIssue('no-answer');
           setPeerStatus('offline');
           await new Promise(r => setTimeout(r, 2000));
           await endVoiceCallSession(sessionId, 'missed');
-          cleanupCall(false);
+          cleanupCall(false, { reason: 'no-answer-timeout' });
         }
       }, 45000);
     } catch (err: any) {
+      callLog('startCall failed', { error: err?.message || String(err), stack: err?.stack });
       setError(err?.message || t('call.failed') || 'Could not start call');
-      await cleanupCall(false);
+      await cleanupCall(false, { keepError: true, reason: 'startCall-exception' });
     }
   }, [phase, userId, userName, playRingtone, ensureLocalStream, createPeerForRemote, cleanupCall, t]);
 

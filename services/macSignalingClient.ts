@@ -131,15 +131,18 @@ class MacSignalingClient {
     const params = new URLSearchParams({ userId: this.userId });
     if (MAC_API_TOKEN) params.set('token', MAC_API_TOKEN);
     const url = `${wsBase}/api/signaling/ws?${params.toString()}`;
+    console.log('[AmlakCall] opening WebSocket', { url: url.replace(/token=[^&]+/, 'token=***'), userId: this.userId });
 
     try {
       this.ws = new WebSocket(url);
-    } catch {
+    } catch (err) {
+      console.warn('[AmlakCall] WebSocket construct failed', err);
       this.scheduleReconnect();
       return;
     }
 
     this.ws.onopen = () => {
+      console.log('[AmlakCall] WebSocket open');
       this.reconnectAttempt = 0;
       if (this.pingTimer) window.clearInterval(this.pingTimer);
       this.pingTimer = window.setInterval(() => {
@@ -150,6 +153,7 @@ class MacSignalingClient {
     this.ws.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data) as SignalingMessage;
+        console.log('[AmlakCall] WebSocket message', { type: (msg as any).type });
         this.handlers.forEach((h) => h(msg));
       } catch {
         // ignore
@@ -157,6 +161,7 @@ class MacSignalingClient {
     };
 
     this.ws.onclose = (ev) => {
+      console.warn('[AmlakCall] WebSocket close', { code: ev.code, reason: ev.reason, attempt: this.reconnectAttempt });
       if (this.pingTimer) window.clearInterval(this.pingTimer);
       // 1006 / immediate close while Vite proxy or Cloudflare has no WS upgrade path
       if (this.reconnectAttempt >= 5) return;
@@ -164,6 +169,7 @@ class MacSignalingClient {
     };
 
     this.ws.onerror = () => {
+      console.warn('[AmlakCall] WebSocket error');
       this.ws?.close();
     };
   }

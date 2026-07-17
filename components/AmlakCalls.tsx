@@ -124,6 +124,7 @@ const AmlakCalls: React.FC<AmlakCallsProps> = ({ currentUser }) => {
   }, [history, search, tab]);
 
   const handleCall = (peer: { id: string; name: string }, type: 'audio' | 'video', status: StaffCallStatus) => {
+    console.log('[AmlakCall] UI call button', { peer, type, status, callable: isCallable(status) });
     if (!isCallable(status)) return;
     startCall({
       type,

@@ -227,10 +227,22 @@ export const createVoiceCallSession = async (params: {
       createdAt: nowIso(),
       updatedAt: nowIso(),
     };
-    await macSaveDocument('voiceCallSessions', session);
+    console.log('[AmlakCall] createVoiceCallSession (mac)', { id, calleeIds: params.calleeIds });
+    try {
+      await macSaveDocument('voiceCallSessions', session);
+      console.log('[AmlakCall] voiceCallSessions saved', { id });
+    } catch (err: any) {
+      console.error('[AmlakCall] voiceCallSessions save failed', err?.message || err);
+      throw err;
+    }
     macSessionsCache = [session, ...macSessionsCache.filter((s) => s.id !== id)];
     emitMacIncoming();
-    await macSignaling.notifyRing(session);
+    try {
+      await macSignaling.notifyRing(session);
+      console.log('[AmlakCall] notifyRing ok', { id });
+    } catch (err: any) {
+      console.warn('[AmlakCall] notifyRing failed', err?.message || err);
+    }
     macSignaling.send({ type: 'session-update', session });
     try {
       const { notifyIncomingCallPush } = await import('./pushNotificationService');
