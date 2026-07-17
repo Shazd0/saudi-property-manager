@@ -117,13 +117,21 @@ function emitMacSession(sessionId: string, session: VoiceCallSession | null) {
 
 async function macRefreshSessions() {
   try {
-    macSessionsCache = await macListCollection<VoiceCallSession>('voiceCallSessions', {
+    const remote = await macListCollection<VoiceCallSession>('voiceCallSessions', {
       orderField: 'updatedAt',
     });
+    const byId = new Map<string, VoiceCallSession>();
+    // Keep any local in-flight sessions that the list API has not returned yet.
+    for (const s of macSessionsCache) byId.set(s.id, s);
+    for (const s of remote) byId.set(s.id, s);
+    macSessionsCache = Array.from(byId.values()).sort((a, b) =>
+      String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')),
+    );
     emitMacIncoming();
     macSessionListeners.forEach((_, sessionId) => {
       const session = macSessionsCache.find((s) => s.id === sessionId) || null;
-      emitMacSession(sessionId, session);
+      // Do not emit null for a missing list hit — callers treat null as "call ended".
+      if (session) emitMacSession(sessionId, session);
     });
   } catch {
     // ignore transient API errors
@@ -167,7 +175,10 @@ if (typeof window !== 'undefined' && isMacCallBackend()) {
       macSignalListeners.get(msg.sessionId)?.forEach((cb) => cb(signal));
     }
     if (msg.type === 'session-update' && msg.session) {
-      macSessionsCache = macSessionsCache.map((s) => (s.id === msg.session.id ? msg.session : s));
+      const exists = macSessionsCache.some((s) => s.id === msg.session.id);
+      macSessionsCache = exists
+        ? macSessionsCache.map((s) => (s.id === msg.session.id ? msg.session : s))
+        : [msg.session, ...macSessionsCache];
       emitMacIncoming();
       emitMacSession(msg.session.id, msg.session);
     }
@@ -336,7 +347,8 @@ export const listenVoiceCallSession = (
     if (!macSessionListeners.has(sessionId)) macSessionListeners.set(sessionId, new Set());
     macSessionListeners.get(sessionId)!.add(callback);
     const current = macSessionsCache.find((s) => s.id === sessionId) || null;
-    callback(current);
+    // Only push an initial value when we have one; null would hang up the UI.
+    if (current) callback(current);
     return () => {
       macSessionListeners.get(sessionId)?.delete(callback);
       if (macSessionListeners.get(sessionId)?.size === 0) macSessionListeners.delete(sessionId);

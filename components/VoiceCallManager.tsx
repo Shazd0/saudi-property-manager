@@ -554,10 +554,8 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
     if (!session?.id) return;
 
     const unsubSession = listenVoiceCallSession(session.id, updated => {
-      if (!updated) {
-        cleanupCall(false);
-        return;
-      }
+      // Ignore empty poll misses — only hang up on a real ended status.
+      if (!updated) return;
       setSession(updated);
 
       if (['ended', 'missed', 'declined', 'busy'].includes(updated.status)) {
@@ -670,7 +668,15 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
       };
 
       setSession(initialSession);
-      await ensureLocalStream(params.type);
+      sessionRef.current = initialSession;
+      try {
+        await ensureLocalStream(params.type);
+      } catch (mediaErr: any) {
+        setError(mediaErr?.message || t('call.micDenied') || 'Microphone permission is required');
+        await endVoiceCallSession(sessionId, 'ended');
+        await cleanupCall(false);
+        return;
+      }
       // WebRTC offer is created after the callee joins (see session listener).
 
       window.setTimeout(() => {
