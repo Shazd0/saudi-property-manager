@@ -427,17 +427,18 @@ export const listenCallSignals = (
     if (!macSignalListeners.has(sessionId)) macSignalListeners.set(sessionId, new Set());
     macSignalListeners.get(sessionId)!.add(callback);
 
-    let lastPoll = nowIso();
-    const poll = window.setInterval(async () => {
+    // First poll must include offers/ICE saved while the callee was still ringing.
+    let lastPoll = '';
+    const pullSignals = async () => {
       try {
         const signals = await macListCollection<CallSignal & { sessionId?: string }>('callSignals', {
           orderField: 'createdAt',
           filters: { sessionId, toUserId: userId },
         });
         signals.forEach((sig) => {
-          const key = sig.id || `${sig.fromUserId}_${sig.type}_${lastPoll}`;
+          const key = sig.id || `${sig.fromUserId}_${sig.type}_${sig.createdAt || ''}`;
           if (seenSignalIds.has(key)) return;
-          if (sig.createdAt && sig.createdAt < lastPoll) return;
+          if (lastPoll && sig.createdAt && sig.createdAt < lastPoll) return;
           seenSignalIds.add(key);
           callback(sig);
         });
@@ -445,7 +446,9 @@ export const listenCallSignals = (
       } catch {
         // ignore
       }
-    }, 500);
+    };
+    void pullSignals();
+    const poll = window.setInterval(pullSignals, 500);
 
     return () => {
       macSignalListeners.get(sessionId)?.delete(callback);

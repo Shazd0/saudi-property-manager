@@ -175,6 +175,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
   const signalStartedAtRef = useRef(0);
   const isCallerRef = useRef(false);
   const busyRef = useRef(false);
+  const offerStartedRef = useRef(false);
   const callStartTimeRef = useRef<number>(0);
   const lastCallStatusRef = useRef<string>('ended');
   const durationRef = useRef(0);
@@ -280,6 +281,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
     setPeerStatus('ringing');
     busyRef.current = false;
     isCallerRef.current = false;
+    offerStartedRef.current = false;
 
     const endingSession = sessionRef.current;
     if (endingSession?.id) {
@@ -570,6 +572,25 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
         stopRingtone();
         callStartTimeRef.current = Date.now();
         startDurationTimer();
+
+        // Caller waits until callee joins, then creates the WebRTC offer.
+        if (isCallerRef.current && !offerStartedRef.current) {
+          offerStartedRef.current = true;
+          setPeerStatus('connecting');
+          const targets = (updated.calleeIds || []).filter((id) => id !== userId);
+          void (async () => {
+            try {
+              await ensureLocalStream(updated.callType);
+              for (const targetId of targets) {
+                if (updated.participants?.[targetId]?.status === 'joined') {
+                  await createPeerForRemote(updated.id, targetId, updated.callType, true);
+                }
+              }
+            } catch (err: any) {
+              setError(err?.message || t('call.failed') || 'Could not connect call');
+            }
+          })();
+        }
       }
     });
 
@@ -582,7 +603,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
       unsubSession();
       unsubSignals();
     };
-  }, [session?.id, userId, cleanupCall, handleSignal, startDurationTimer, stopRingtone, recordCallHistory]);
+  }, [session?.id, userId, cleanupCall, handleSignal, startDurationTimer, stopRingtone, recordCallHistory, ensureLocalStream, createPeerForRemote, t]);
 
   // Attach remote streams to media elements
   useEffect(() => {
@@ -610,6 +631,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
     try {
       busyRef.current = true;
       isCallerRef.current = true;
+      offerStartedRef.current = false;
       historyRecordedRef.current = false;
       lastCallStatusRef.current = 'ended';
       setError('');
@@ -649,10 +671,7 @@ const VoiceCallManager: React.FC<VoiceCallManagerProps> = ({ currentUser, childr
 
       setSession(initialSession);
       await ensureLocalStream(params.type);
-
-      for (const targetId of targets) {
-        await createPeerForRemote(sessionId, targetId, params.type, true);
-      }
+      // WebRTC offer is created after the callee joins (see session listener).
 
       window.setTimeout(() => {
         if (sessionRef.current?.id === sessionId && sessionRef.current.status === 'ringing') {
