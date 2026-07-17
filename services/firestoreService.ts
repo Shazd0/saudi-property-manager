@@ -126,6 +126,10 @@ const ALL_AMLAK_MAC_COLLECTIONS = new Set([
   'chatPresence',
   'chatStatuses',
   'userTokens',
+  'voiceCallSessions',
+  'callSignals',
+  'callHistory',
+  'callPresence',
   'images',
   'backups',
 ]);
@@ -166,6 +170,16 @@ const useMacBackend = () => {
   return true;
 };
 const useMacCollection = (name: string) => useMacBackend() && ALL_AMLAK_MAC_COLLECTIONS.has(name);
+
+if (typeof window !== 'undefined') {
+  const macOn = useMacBackend();
+  const apiUrl = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
+  console.info(
+    macOn
+      ? `[Amlak] Data backend: Mac Mini API (${apiUrl || '/'})`
+      : '[Amlak] Data backend: Firebase Firestore (set VITE_DATA_BACKEND=mac in .env.local to use Mac Mini)',
+  );
+}
 
 const macSave = async (name: string, data: any, bookId = currentBookId, merge = false) => {
   return macSaveDocument(name, sanitize(data), { bookId: bookId || 'default', merge });
@@ -442,6 +456,35 @@ export const getTransactions = async (opts?: { userId?: string; role?: string; b
   if (effectiveBuildings.length > 0) return all.filter((t: any) => matchesAnyBuilding(t, effectiveBuildings));
   return [];
 };
+export const listenTransactions = (callback: (transactions: any[]) => void) => {
+  if (useMacCollection('transactions')) {
+    let cancelled = false;
+    const load = async () => {
+      const rows = await getTransactions().catch(() => []);
+      if (!cancelled) callback(rows || []);
+    };
+    void load();
+    const timer = window.setInterval(load, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }
+  try {
+    const q = query(fsCollection('transactions'), orderBy('date', 'desc'));
+    return onSnapshot(q as any, (snap) => {
+      const all = toArray(snap || { docs: [] });
+      const scoped = filterByScope('transactions', all);
+      callback(scoped.filter((d: any) => !d.deleted));
+    }, (err) => {
+      console.error('listenTransactions error', err);
+    });
+  } catch (e) {
+    console.error('listenTransactions setup error', e);
+    return () => {};
+  }
+};
+
 type SaveTransactionOptions = {
   skipAmlakSheetSync?: boolean;
 };
@@ -1577,24 +1620,27 @@ export const deleteContract = async (id: string) => {
 };
 
 export const isUnitOccupied = async (bid: string, uname: string) => {
-  if (useMacCollection('contracts')) {
-    const contracts = await getContracts();
-    return contracts.some((c: any) => c.buildingId === bid && c.unitName === uname && c.status === "Active");
-  }
-  const q = query(fsCollection( "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
-  const snap = await getDocs(q as any);
-  return snap.size > 0;
+  const { contractIncludesUnit } = await import('../utils/contractUnits');
+  const contracts = await getContracts({ includeDeleted: true });
+  return contracts.some(
+    (c: any) =>
+      c.buildingId === bid &&
+      c.status === 'Active' &&
+      !c.deleted &&
+      contractIncludesUnit(c.unitName, uname),
+  );
 };
 
 export const getActiveContract = async (bid: string, uname: string) => {
-  if (useMacCollection('contracts')) {
-    const contracts = await getContracts({ includeDeleted: true });
-    return contracts.find((c: any) => c.buildingId === bid && c.unitName === uname && c.status === "Active" && !c.deleted) || null;
-  }
-  const q = query(fsCollection( "contracts"), where("buildingId", "==", bid), where("unitName", "==", uname), where("status", "==", "Active"));
-  const snap = await getDocs(q as any);
-  const arr = toArray(snap);
-  return arr[0] || null;
+  const { contractIncludesUnit, pickBestContractForUnit } = await import('../utils/contractUnits');
+  const contracts = await getContracts({ includeDeleted: true });
+  const matches = contracts.filter(
+    (c: any) =>
+      c.buildingId === bid &&
+      !c.deleted &&
+      contractIncludesUnit(c.unitName, uname),
+  );
+  return pickBestContractForUnit(matches) || null;
 };
 
 export const getOccupancyStats = async () => {
@@ -2546,6 +2592,9 @@ export const saveTransfer = async (t: any) => {
  * Returns the number of transaction documents created or relocated.
  */
 export const backfillInterBuildingTransactions = async (): Promise<number> => {
+  // Property books live on Mac Mini when VITE_DATA_BACKEND=mac — do not touch Firestore
+  // (Listen/getDocs hang or 404 and would block History forever).
+  if (useMacBackend()) return 0;
   try {
     const activeBookId = getCurrentBookId();
 

@@ -1,6 +1,7 @@
 type ListOptions = {
   bookId?: string;
   orderField?: string;
+  orderDirection?: 'asc' | 'desc';
   includeDeleted?: boolean;
   filters?: Record<string, string | number | boolean | undefined | null>;
 };
@@ -8,7 +9,14 @@ type ListOptions = {
 const MAC_API_URL = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
 const MAC_API_TOKEN = (import.meta as any).env?.VITE_MAC_API_TOKEN || '';
 
-const apiBase = String(MAC_API_URL).replace(/\/+$/, '');
+function resolveApiBase(): string {
+  const raw = String(MAC_API_URL).trim();
+  if (!raw || raw === '/' || raw === './' || raw === 'same-origin') {
+    if (typeof window !== 'undefined') return window.location.origin;
+    return '';
+  }
+  return raw.replace(/\/+$/, '');
+}
 
 function headers(): HeadersInit {
   const out: Record<string, string> = {
@@ -19,7 +27,7 @@ function headers(): HeadersInit {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${apiBase}${path}`, {
+  const res = await fetch(`${resolveApiBase()}${path}`, {
     ...init,
     headers: {
       ...headers(),
@@ -37,6 +45,7 @@ function collectionPath(collectionName: string, options?: ListOptions) {
   const params = new URLSearchParams();
   params.set('bookId', options?.bookId || 'default');
   if (options?.orderField) params.set('orderField', options.orderField);
+  if (options?.orderDirection) params.set('orderDirection', options.orderDirection);
   if (options?.includeDeleted) params.set('includeDeleted', 'true');
   for (const [key, value] of Object.entries(options?.filters || {})) {
     if (value === undefined || value === null || value === '') continue;

@@ -133,17 +133,31 @@ const VATReport: React.FC = () => {
   const [showDuplicateInspector, setShowDuplicateInspector] = useState(false);
 
   useEffect(() => {
+    let cancelled = false;
     (async () => {
-      await migrateVatInvoiceNumbers();
-      await loadData();
+      // Always load rows first — migrate/snapshots must never block the tab.
+      try {
+        await loadData();
+      } catch (e) {
+        console.error('VATReport loadData failed', e);
+      }
+      if (cancelled) return;
+      try {
+        await migrateVatInvoiceNumbers();
+        if (!cancelled) await loadData();
+      } catch (e) {
+        console.error('VATReport migrateVatInvoiceNumbers failed', e);
+      }
     })();
     Promise.all([getBuildings(), getCustomers(), getVendors(), getBanks(), getContracts()]).then(([b, c, v, bks, ctr]) => {
+      if (cancelled) return;
       setBuildings(b || []);
       setCustomers(c || []);
       setVendors((v || []).filter((vn: Vendor) => vn.status !== 'Inactive'));
       setBanks(bks || []);
       setContracts(ctr || []);
-    });
+    }).catch((e) => console.error('VATReport secondary load failed', e));
+    return () => { cancelled = true; };
   }, []);
 
   const customerRoomMap = useMemo(() => buildCustomerRoomMap(customers), [customers]);
@@ -229,6 +243,8 @@ const VATReport: React.FC = () => {
     const vatRows = txs.filter(t => t.isVATApplicable === true);
     if (vatRows.length === 0) return;
 
+    // One-time sequential renumber can rewrite hundreds of docs and freeze the tab.
+    // Only fill *missing* invoice numbers; never reshuffle existing SV-/CN- numbers on every visit.
     const invoiceRows = vatRows
       .filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && hasZatcaReport(t))
       .slice()
@@ -241,67 +257,68 @@ const VATReport: React.FC = () => {
 
     const yearlyInvoiceCounters: Record<string, number> = {};
     const yearlyCreditCounters: Record<string, number> = {};
-    const invoiceNumberMap = new Map<string, string>();
+    // Seed counters from numbers already assigned so new blanks continue the sequence.
+    for (const tx of invoiceRows) {
+      const m = String(tx.vatInvoiceNumber || '').match(/^SV-(\d+)$/i);
+      if (!m) continue;
+      const year = String(new Date(tx.date || Date.now()).getFullYear());
+      yearlyInvoiceCounters[year] = Math.max(yearlyInvoiceCounters[year] || 0, parseInt(m[1], 10) || 0);
+    }
+    for (const tx of creditRows) {
+      const m = String(tx.vatInvoiceNumber || '').match(/^CN-(\d{4})-(\d+)$/i);
+      if (!m) continue;
+      const year = m[1];
+      yearlyCreditCounters[year] = Math.max(yearlyCreditCounters[year] || 0, parseInt(m[2], 10) || 0);
+    }
+
     const updates: Transaction[] = [];
 
     for (const tx of invoiceRows) {
+      if (String(tx.vatInvoiceNumber || '').trim()) continue;
       const year = String(new Date(tx.date || Date.now()).getFullYear());
       yearlyInvoiceCounters[year] = (yearlyInvoiceCounters[year] || 0) + 1;
       const nextNo = `SV-${yearlyInvoiceCounters[year]}`;
-      const oldNo = String(tx.vatInvoiceNumber || '');
-      invoiceNumberMap.set(oldNo, nextNo);
-      if (oldNo !== nextNo || (tx as any).vatReportSnapshot?.vatInvoiceNumber !== nextNo) {
-        const nextTx: Transaction = {
-          ...tx,
-          vatInvoiceNumber: nextNo,
-          vatReportSnapshot: (tx as any).vatReportSnapshot
-            ? { ...(tx as any).vatReportSnapshot, vatInvoiceNumber: nextNo }
-            : (tx as any).vatReportSnapshot,
-        } as Transaction;
-        updates.push(nextTx);
-      }
+      updates.push({
+        ...tx,
+        vatInvoiceNumber: nextNo,
+        vatReportSnapshot: (tx as any).vatReportSnapshot
+          ? { ...(tx as any).vatReportSnapshot, vatInvoiceNumber: nextNo }
+          : (tx as any).vatReportSnapshot,
+      } as Transaction);
     }
 
     for (const tx of creditRows) {
+      if (String(tx.vatInvoiceNumber || '').trim()) continue;
       const year = String(new Date(tx.date || Date.now()).getFullYear());
       yearlyCreditCounters[year] = (yearlyCreditCounters[year] || 0) + 1;
       const nextNo = `CN-${year}-${String(yearlyCreditCounters[year]).padStart(2, '0')}`;
-      const oldNo = String(tx.vatInvoiceNumber || '');
-      const mappedOriginal = tx.originalInvoiceId ? (invoiceNumberMap.get(tx.originalInvoiceId) || tx.originalInvoiceId) : tx.originalInvoiceId;
-      if (
-        oldNo !== nextNo ||
-        tx.originalInvoiceId !== mappedOriginal ||
-        (tx as any).vatReportSnapshot?.vatInvoiceNumber !== nextNo ||
-        ((tx as any).vatReportSnapshot?.originalInvoiceId || undefined) !== mappedOriginal
-      ) {
-        const nextTx: Transaction = {
-          ...tx,
-          vatInvoiceNumber: nextNo,
-          originalInvoiceId: mappedOriginal,
-          vatReportSnapshot: (tx as any).vatReportSnapshot
-            ? { ...(tx as any).vatReportSnapshot, vatInvoiceNumber: nextNo, originalInvoiceId: mappedOriginal }
-            : (tx as any).vatReportSnapshot,
-        } as Transaction;
-        updates.push(nextTx);
-      }
+      updates.push({
+        ...tx,
+        vatInvoiceNumber: nextNo,
+        vatReportSnapshot: (tx as any).vatReportSnapshot
+          ? { ...(tx as any).vatReportSnapshot, vatInvoiceNumber: nextNo }
+          : (tx as any).vatReportSnapshot,
+      } as Transaction);
     }
 
     for (const tx of purchaseRows) {
       const billNo = String((tx as any).vendorRefNo || '').trim();
       if (!billNo) continue;
-      if (String(tx.vatInvoiceNumber || '') === billNo && (tx as any).vatReportSnapshot?.vatInvoiceNumber === billNo) continue;
-      const nextTx: Transaction = {
+      if (String(tx.vatInvoiceNumber || '') === billNo) continue;
+      updates.push({
         ...tx,
         vatInvoiceNumber: billNo,
         vatReportSnapshot: (tx as any).vatReportSnapshot
           ? { ...(tx as any).vatReportSnapshot, vatInvoiceNumber: billNo }
           : (tx as any).vatReportSnapshot,
-      } as Transaction;
-      updates.push(nextTx);
+      } as Transaction);
     }
 
     if (updates.length === 0) return;
-    await Promise.all(updates.map(tx => saveTransaction(tx)));
+    // Sequential saves — avoid slamming Mac API with hundreds of parallel PUTs.
+    for (const tx of updates) {
+      await saveTransaction(tx, { skipAmlakSheetSync: true }).catch(() => {});
+    }
   }, []);
 
   const nonResidentialBuildings = buildings.filter(b => b.propertyType === 'NON_RESIDENTIAL' || b.vatApplicable);
@@ -854,17 +871,24 @@ const VATReport: React.FC = () => {
     if (missingSnapshot.length === 0) return;
     let cancelled = false;
     (async () => {
-      const updates = await Promise.all(missingSnapshot.map(async tx => {
+      const updates: Transaction[] = [];
+      // Cap + sequential: avoid freezing the tab / flooding Mac API on first open.
+      for (const tx of missingSnapshot.slice(0, 40)) {
+        if (cancelled) return;
         const customerName = tx.type === TransactionType.INCOME ? resolveSalesCustomerName(tx) : undefined;
         const next = {
           ...tx,
           customerName: tx.type === TransactionType.INCOME ? (customerName || tx.customerName) : tx.customerName,
           vatReportSnapshot: createVatReportSnapshot(tx, { customerName }),
         } as Transaction;
-        await saveTransaction(next);
-        return next;
-      }));
-      if (cancelled) return;
+        try {
+          await saveTransaction(next, { skipAmlakSheetSync: true });
+          updates.push(next);
+        } catch {
+          // non-fatal
+        }
+      }
+      if (cancelled || updates.length === 0) return;
       setTransactions(prev => prev.map(tx => updates.find(u => u.id === tx.id) || tx));
     })();
     return () => { cancelled = true; };

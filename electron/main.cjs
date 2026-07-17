@@ -1,9 +1,13 @@
-const { app, BrowserWindow, shell, Menu, nativeTheme, ipcMain, dialog } = require('electron');
+const { app, BrowserWindow, shell, Menu, nativeTheme, ipcMain, dialog, Tray, Notification } = require('electron');
 const path = require('node:path');
 const fs = require('node:fs');
 const { fork } = require('node:child_process');
 
 let zatcaProcess = null;
+let tray = null;
+let callWatchTimer = null;
+let callWatchConfig = null;
+const seenDesktopRings = new Set();
 
 function startZatcaService() {
   const servicePath = isDev 
@@ -18,6 +22,70 @@ function startZatcaService() {
 }
 
 const isDev = !app.isPackaged;
+
+ipcMain.handle('desktop:call-watch-start', async (_event, config) => {
+  callWatchConfig = config || null;
+  if (callWatchTimer) clearInterval(callWatchTimer);
+  if (!callWatchConfig?.userId || !callWatchConfig?.apiBase) return { ok: false };
+  callWatchTimer = setInterval(pollDesktopIncomingCalls, 4000);
+  pollDesktopIncomingCalls();
+  return { ok: true };
+});
+
+ipcMain.handle('desktop:call-watch-stop', async () => {
+  if (callWatchTimer) clearInterval(callWatchTimer);
+  callWatchTimer = null;
+  callWatchConfig = null;
+  return { ok: true };
+});
+
+async function pollDesktopIncomingCalls() {
+  if (!callWatchConfig?.userId || !callWatchConfig?.apiBase) return;
+  try {
+    const url = `${callWatchConfig.apiBase}/api/calls/pending?userId=${encodeURIComponent(callWatchConfig.userId)}`;
+    const headers = callWatchConfig.token ? { Authorization: `Bearer ${callWatchConfig.token}` } : {};
+    const res = await fetch(url, { headers });
+    if (!res.ok) return;
+    const data = await res.json();
+    for (const ring of (data.rings || [])) {
+      const session = ring.session;
+      if (!session?.id || seenDesktopRings.has(session.id)) continue;
+      seenDesktopRings.add(session.id);
+      const callType = session.callType === 'video' ? 'Video' : 'Voice';
+      if (Notification.isSupported()) {
+        const n = new Notification({
+          title: '📞 Incoming Call',
+          body: `${session.callerName || 'Someone'} • ${callType}`,
+          silent: false,
+        });
+        // System beep for ring attention
+        try { shell.beep(); } catch { /* ignore */ }
+        n.on('click', () => {
+          const win = BrowserWindow.getAllWindows()[0];
+          if (win) {
+            win.show();
+            win.focus();
+            win.webContents.send('amlak:incoming-call', session);
+          }
+        });
+        n.show();
+      }
+    }
+  } catch {
+    // ignore
+  }
+}
+
+function createTray() {
+  const iconPath = getIconPath();
+  if (!iconPath || tray) return;
+  tray = new Tray(iconPath);
+  tray.setToolTip('Amlak Property Manager');
+  tray.on('click', () => {
+    const win = BrowserWindow.getAllWindows()[0];
+    if (win) { win.show(); win.focus(); }
+  });
+}
 
 ipcMain.handle('desktop:select-directory', async () => {
   try {
@@ -132,11 +200,21 @@ function createWindow() {
   win.webContents.on('did-fail-load', (_e, code, desc, url) => {
     console.error(`Load failed [${code}] ${desc} — ${url}`);
   });
+
+  win.on('close', (e) => {
+    if (!app.isQuitting) {
+      e.preventDefault();
+      win.hide();
+    }
+  });
+
+  return win;
 }
 
 app.whenReady().then(() => {
   startZatcaService();
   createWindow();
+  createTray();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -146,9 +224,11 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
+  // Keep running in tray for incoming calls
+});
+
+app.on('before-quit', () => {
+  app.isQuitting = true;
 });
 
 app.on('will-quit', () => {

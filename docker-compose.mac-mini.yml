@@ -26,13 +26,31 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      fcm-push:
+        condition: service_started
     environment:
       PORT: ${AMLAK_API_PORT:-8787}
       DATABASE_URL: postgres://${POSTGRES_USER:-amlak}:${POSTGRES_PASSWORD:-amlak_local_password}@postgres:5432/${POSTGRES_DB:-amlak}
       AMLAK_API_TOKEN: ${AMLAK_API_TOKEN:-change-me-local-token}
-      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+      CORS_ORIGIN: ${CORS_ORIGIN:-https://amlakrrgroup.netlify.app}
+      FCM_PUSH_URL: ${FCM_PUSH_URL:-http://fcm-push:3200}
     ports:
       - "${AMLAK_API_PORT:-8787}:${AMLAK_API_PORT:-8787}"
+
+  # WhatsApp-style call ring when app is closed
+  fcm-push:
+    image: node:22-alpine
+    container_name: amlak-fcm-push
+    restart: unless-stopped
+    working_dir: /app
+    volumes:
+      - ./fcm-server:/app
+    environment:
+      PORT: 3200
+      GOOGLE_APPLICATION_CREDENTIALS: ./fcm-service-account.json
+    command: ["sh", "-c", "npm install --omit=dev && node push-server.js"]
+    ports:
+      - "${FCM_PUSH_PORT:-3200}:3200"
 
   migration:
     build:

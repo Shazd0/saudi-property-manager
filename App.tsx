@@ -51,6 +51,7 @@ import ReportBugButton from './components/ReportBugButton';
 import AdminBugDashboard from './components/AdminBugDashboard';
 import AdminRemoteSupport from './components/AdminRemoteSupport';
 import RemoteSupportListener from './components/RemoteSupportListener';
+import VoiceCallManager from './components/VoiceCallManager';
 
 import { NotificationBell, NotificationPanel, useNotifications } from './components/Notifications';
 import QuickActions, { QuickActionButton, QuickActionFAB } from './components/QuickActions';
@@ -86,6 +87,7 @@ const VATReport = React.lazy(() => import('./components/VATReport'));
 const OwnerPortal = React.lazy(() => import('./components/OwnerPortal'));
 const SheetsImport = React.lazy(() => import('./components/SheetsImport'));
 const StaffChat = React.lazy(() => import('./components/StaffChat'));
+const AmlakCalls = React.lazy(() => import('./components/AmlakCalls'));
 const AccountingModule = React.lazy(() => import('./components/AccountingModule'));
 
 SoundService.init();
@@ -465,10 +467,9 @@ const AppContent: React.FC = () => {
     };
   }, [vacationReadOnly]);
 
-  // Initialize push notifications for ALL users (so admin tokens are registered from all devices)
+  // Initialize push notifications for ALL users (incoming calls + approvals)
   useEffect(() => {
     if (!user) return;
-    if (isMacDataBackend()) return;
     let refreshInterval: any = null;
 
     const setupPush = async () => {
@@ -476,30 +477,16 @@ const AppContent: React.FC = () => {
         const { registerDeviceForPush, listenForForegroundMessages } = await import('./services/pushNotificationService');
         const role = (user as any).role || 'EMPLOYEE';
         await registerDeviceForPush(user.id || user.uid || 'unknown', user.name || user.displayName || 'User', role);
-        
-        // Only admins/managers need to listen for foreground approval messages
-        const isAdmin = role === 'ADMIN' || role === UserRole.ADMIN || role === 'MANAGER';
-        if (isAdmin) {
-          // Await foreground listener setup to ensure it initializes properly
-          await listenForForegroundMessages((payload: any) => {
-            // Refresh approval count on incoming message
-            import('./services/firestoreService').then(svc => {
-              if (svc.listenApprovals) {
-                // The existing real-time listener will auto-update
-              }
-            });
-          }).catch((err) => {
-            console.log('Push: Foreground message listener setup completed with status:', err?.message || 'initialized');
-          });
 
-          // Re-register token every 6 hours to keep it fresh in Firestore
-          refreshInterval = setInterval(async () => {
-            try {
-              const { registerDeviceForPush: reReg } = await import('./services/pushNotificationService');
-              await reReg(user.id || user.uid || 'unknown', user.name || user.displayName || 'User', role);
-            } catch (e) { /* silent */ }
-          }, 6 * 60 * 60 * 1000);
-        }
+        await listenForForegroundMessages().catch(() => {});
+
+        // Re-register token every 6 hours so Mac API / FCM server can reach this device
+        refreshInterval = setInterval(async () => {
+          try {
+            const { registerDeviceForPush: reReg } = await import('./services/pushNotificationService');
+            await reReg(user.id || user.uid || 'unknown', user.name || user.displayName || 'User', role);
+          } catch (e) { /* silent */ }
+        }, 6 * 60 * 60 * 1000);
       } catch (e) {
         console.log('Push notification setup skipped:', (e as any)?.message);
       }
@@ -507,11 +494,8 @@ const AppContent: React.FC = () => {
 
     setupPush();
 
-    // Also re-register when the app comes back to foreground (e.g. phone unlocked)
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') {
-        setupPush();
-      }
+      if (document.visibilityState === 'visible') setupPush();
     };
     document.addEventListener('visibilitychange', handleVisibility);
 
@@ -672,6 +656,7 @@ const AppContent: React.FC = () => {
   // --- MAIN APP UI ---
 
   const appLayout = (
+    <VoiceCallManager currentUser={user}>
     <div className={`${darkMode ? 'dark' : 'light'} app-theme`} dir={isRTL ? 'rtl' : 'ltr'}>
       <OfflineBanner />
       <div className={`app-shell flex min-h-screen bg-gradient-to-br from-green-50 via-emerald-50 to-teal-50 dark:from-gray-900 dark:via-gray-900 dark:to-gray-900 dark:bg-none font-sans text-emerald-900 dark:text-slate-100 transition-colors duration-300 ${isRTL ? 'flex-row-reverse' : ''}`}>
@@ -776,6 +761,7 @@ const AppContent: React.FC = () => {
                     <Route path="/owner-portal" element={<OwnerPortal />} />
                     <Route path="/staff" element={(user?.role === 'ADMIN' || user?.role === 'MANAGER') ? <StaffPortfolio currentUser={user} /> : <Navigate to="/dashboard" replace />} />
                     <Route path="/chat" element={<StaffChat currentUser={user} fullScreen />} />
+                    <Route path="/calls" element={<AmlakCalls currentUser={user} />} />
                     <Route path="/sadad" element={<SadadBillManager />} />
                     <Route path="/ejar" element={<EjarIntegration />} />
                     <Route path="/utilities" element={<UtilitiesTracker />} />
@@ -827,6 +813,7 @@ const AppContent: React.FC = () => {
         <RemoteSupportListener currentUser={user} />
       </div>
     </div>
+    </VoiceCallManager>
   );
 
   // Add the bug report button to always show on main app UI

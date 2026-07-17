@@ -9,13 +9,28 @@ import {
   saveDocument,
   softDeleteDocument,
 } from '../lib/db.mjs';
+import { attachSignaling } from '../lib/signaling.mjs';
+import { pushIncomingCall } from '../lib/callPush.mjs';
 
 const app = express();
 const port = Number(process.env.PORT || 8787);
 const apiToken = process.env.AMLAK_API_TOKEN || '';
 
+const allowedOrigins = String(process.env.CORS_ORIGIN || '*')
+  .split(',')
+  .map((value) => value.trim())
+  .filter(Boolean);
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+    callback(new Error(`CORS blocked for origin: ${origin}`));
+  },
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-amlak-actor'],
 }));
 app.use(express.json({ limit: process.env.JSON_LIMIT || '50mb' }));
 
@@ -142,13 +157,64 @@ app.post('/api/migrations/firebase-to-postgres', requireToken, (_req, res) => {
   });
 });
 
+let signalingHub = null;
+
+app.post('/api/calls/ring', requireToken, async (req, res, next) => {
+  try {
+    const session = req.body?.session || req.body;
+    if (!session?.id || !session?.calleeIds?.length) {
+      return res.status(400).json({ error: 'session with id and calleeIds required' });
+    }
+    const payload = {
+      type: 'incoming-call',
+      session,
+      at: Date.now(),
+    };
+    const results = {};
+    for (const calleeId of session.calleeIds) {
+      const delivered = signalingHub?.sendToUser(calleeId, payload);
+      if (!delivered) signalingHub?.queueRing(calleeId, payload);
+      results[calleeId] = !!delivered;
+    }
+
+    // FCM push — wakes phone/desktop even when app is fully closed (WhatsApp-style)
+    pushIncomingCall(session).catch((err) => {
+      console.warn('Call push failed:', err?.message || err);
+    });
+
+    res.json({ ok: true, delivered: results });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/calls/pending', requireToken, (req, res) => {
+  const userId = String(req.query.userId || '');
+  if (!userId) return res.status(400).json({ error: 'userId required' });
+  const rings = signalingHub?.getPendingRings(userId) || [];
+  res.json({ rings });
+});
+
+app.delete('/api/calls/pending', requireToken, (req, res) => {
+  const userId = String(req.query.userId || '');
+  const sessionId = String(req.query.sessionId || '');
+  if (!userId || !sessionId) return res.status(400).json({ error: 'userId and sessionId required' });
+  signalingHub?.clearPendingRing(userId, sessionId);
+  res.json({ ok: true });
+});
+
+app.get('/api/calls/online/:userId', requireToken, (req, res) => {
+  res.json({ online: !!signalingHub?.isUserOnline(req.params.userId) });
+});
+
 app.use((error, _req, res, _next) => {
   console.error(error);
   res.status(500).json({ error: error?.message || 'Internal server error' });
 });
 
 const server = app.listen(port, () => {
-  console.log(`Amlak Mac API listening on ${port}`);
+  signalingHub = attachSignaling(server, apiToken);
+  console.log(`Amlak Mac API listening on ${port} (REST + WebSocket /api/signaling/ws)`);
 });
 
 async function shutdown() {

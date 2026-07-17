@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import { NavLink, useNavigate } from 'react-router-dom';
-import { LayoutDashboard, PlusCircle, History, Users, Settings, LogOut, Building, UserCheck, FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart, Search, Car, Bell, ArrowRightLeft, Receipt, ChevronLeft, ChevronRight, FolderOpen, Info, ChevronDown, ChevronUp, Upload, MessageCircle, FileText, DollarSign, BarChart3, Crown, BookOpen, Fingerprint, Landmark, ShieldAlert, MapPin, Zap, Shield, MessageSquare, Banknote, CreditCard, FileCheck, Star, GripVertical, Pencil, Check, Plus, X, Calculator, Layers, Scale, TrendingDown, TrendingUp, BookMarked, FileSpreadsheet, ScreenShare } from 'lucide-react';
+import { LayoutDashboard, PlusCircle, History, Users, Settings, LogOut, Building, UserCheck, FileSignature, CalendarDays, Briefcase, ClipboardList, PieChart, Search, Car, Bell, ArrowRightLeft, Receipt, ChevronLeft, ChevronRight, FolderOpen, Info, ChevronDown, ChevronUp, Upload, MessageCircle, FileText, DollarSign, BarChart3, Crown, BookOpen, Fingerprint, Landmark, ShieldAlert, MapPin, Zap, Shield, MessageSquare, Banknote, CreditCard, FileCheck, Star, GripVertical, Pencil, Check, Plus, X, Calculator, Layers, Scale, TrendingDown, TrendingUp, BookMarked, FileSpreadsheet, ScreenShare, Phone } from 'lucide-react';
 import SoundService from '../services/soundService';
 import logo from '../images/logo.png';
 import { User, UserRole } from '../types';
@@ -8,6 +8,8 @@ import { useLanguage } from '../i18n';
 import LanguageToggle from './LanguageToggle';
 import { useBook } from '../contexts/BookContext';
 import { matchesAdvancedSearch } from '../utils/advancedSearch';
+import { getMissedCallCount } from '../services/callHistoryService';
+import { isMacCallBackend } from '../services/voiceCallService';
 
 // Fallback logo URL if import fails
 const LOGO_URL = logo || '/images/logo.png';
@@ -29,6 +31,7 @@ const ALL_QA_DEFS: { to: string; labelKey: string; icon: any }[] = [
   { to: '/vat-report',        labelKey: 'nav.vatReport',    icon: Receipt },
   { to: '/accounting',        labelKey: 'nav.accounting',   icon: Calculator },
   { to: '/chat',              labelKey: 'nav.staffChat',    icon: MessageCircle },
+  { to: '/calls',             labelKey: 'nav.calls',        icon: Phone },
   { to: '/sadad',             labelKey: 'nav.sadadBills',   icon: CreditCard },
   { to: '/approvals',         labelKey: 'nav.approvals',    icon: Bell },
   { to: '/bulk-rent',         labelKey: 'nav.bulkRent',     icon: Upload },
@@ -37,9 +40,18 @@ const ALL_QA_DEFS: { to: string; labelKey: string; icon: any }[] = [
 ];
 
 const DEFAULT_QA_ROUTES = [
-  '/', '/properties', '/admin/employees', '/customers',
-  '/contracts', '/entry', '/history', '/monitoring',
+  '/calls', '/', '/properties', '/admin/employees', '/customers',
+  '/contracts', '/entry', '/history',
 ];
+
+/** Always pinned first in Quick Access — cannot be removed */
+const PINNED_QA_ROUTES = ['/calls'];
+
+function normalizeQaRoutes(routes: string[]): string[] {
+  const safe = Array.isArray(routes) ? routes.filter((r): r is string => typeof r === 'string') : [];
+  const rest = safe.filter((r) => !PINNED_QA_ROUTES.includes(r));
+  return [...PINNED_QA_ROUTES, ...rest];
+}
 
 // ── Main Menu (Menu group): default order + drag-reorder persistence ─────
 const MAIN_MENU_DRAG_MIME = 'application/x-spm-main-menu';
@@ -173,6 +185,7 @@ const ALL_NAV_ITEMS: { to: string; labelKey: string; icon: any }[] = [
   { to: '/owner-portal',              labelKey: 'nav.ownerPortal',        icon: Crown },
   { to: '/staff',                     labelKey: 'nav.staffPortfolio',     icon: Users },
   { to: '/chat',                      labelKey: 'nav.staffChat',          icon: MessageCircle },
+  { to: '/calls',                     labelKey: 'nav.calls',              icon: Phone },
   { to: '/stocks',                    labelKey: 'nav.stockManagement',    icon: Briefcase },
   { to: '/ejar',                      labelKey: 'nav.ejarPlatform',       icon: FileCheck },
   { to: '/municipality-licenses',     labelKey: 'nav.municipality',       icon: Landmark },
@@ -205,9 +218,9 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
     try {
       const s = localStorage.getItem(`qa_${userId}`);
       const parsed = s ? JSON.parse(s) : DEFAULT_QA_ROUTES;
-      return Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : DEFAULT_QA_ROUTES;
+      return normalizeQaRoutes(Array.isArray(parsed) ? parsed : DEFAULT_QA_ROUTES);
     } catch {
-      return DEFAULT_QA_ROUTES;
+      return normalizeQaRoutes(DEFAULT_QA_ROUTES);
     }
   });
   const [minimized, setMinimized] = useState(() => {
@@ -219,35 +232,44 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
   const longPressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
-    localStorage.setItem(`qa_${userId}`, JSON.stringify(Array.isArray(qaRoutes) ? qaRoutes : DEFAULT_QA_ROUTES));
+    localStorage.setItem(`qa_${userId}`, JSON.stringify(normalizeQaRoutes(qaRoutes)));
   }, [qaRoutes, userId]);
+
+  useEffect(() => {
+    setQaRoutes((prev) => normalizeQaRoutes(prev));
+  }, [userId]);
 
   useEffect(() => {
     localStorage.setItem(`qa_min_${userId}`, minimized ? '1' : '0');
   }, [minimized, userId]);
 
-  const safeQaRoutes = Array.isArray(qaRoutes) ? qaRoutes : DEFAULT_QA_ROUTES;
+  const safeQaRoutes = normalizeQaRoutes(Array.isArray(qaRoutes) ? qaRoutes : DEFAULT_QA_ROUTES);
   const activeItems = safeQaRoutes
     .map(r => ALL_QA_DEFS.find(d => d.to === r))
     .filter((d): d is (typeof ALL_QA_DEFS)[0] => !!d);
 
-  const removeRoute = (to: string) => setQaRoutes(prev => prev.filter(r => r !== to));
+  const removeRoute = (to: string) => {
+    if (PINNED_QA_ROUTES.includes(to)) return;
+    setQaRoutes(prev => normalizeQaRoutes(prev.filter(r => r !== to)));
+  };
   const toggleRoute = (to: string) =>
     setQaRoutes(prev => {
-      const safePrev = Array.isArray(prev) ? prev : DEFAULT_QA_ROUTES;
-      return safePrev.includes(to) ? safePrev.filter(r => r !== to) : [...safePrev, to];
+      const safePrev = normalizeQaRoutes(Array.isArray(prev) ? prev : DEFAULT_QA_ROUTES);
+      if (PINNED_QA_ROUTES.includes(to)) return safePrev;
+      return normalizeQaRoutes(safePrev.includes(to) ? safePrev.filter(r => r !== to) : [...safePrev, to]);
     });
 
   const onDragStart = (idx: number) => { dragIdx.current = idx; };
   const onDragOver = (e: React.DragEvent, idx: number) => {
     e.preventDefault();
     if (dragIdx.current === null || dragIdx.current === idx) return;
+    if (PINNED_QA_ROUTES.includes(safeQaRoutes[dragIdx.current] || '')) return;
     setQaRoutes(prev => {
-      const arr = [...prev];
+      const arr = [...normalizeQaRoutes(prev)];
       const [moved] = arr.splice(dragIdx.current!, 1);
       arr.splice(idx, 0, moved);
       dragIdx.current = idx;
-      return arr;
+      return normalizeQaRoutes(arr);
     });
   };
 
@@ -382,7 +404,7 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
                 <span className="text-sm">{t(item.labelKey)}</span>
               </NavLink>
             )}
-            {editMode && (
+            {editMode && !PINNED_QA_ROUTES.includes(item.to) && (
               <button
                 type="button"
                 onClick={() => removeRoute(item.to)}
@@ -391,6 +413,11 @@ const QuickAccessSection: React.FC<{ userId: string; isCollapsed: boolean }> = (
               >
                 <X size={13} />
               </button>
+            )}
+            {editMode && PINNED_QA_ROUTES.includes(item.to) && (
+              <span className="pr-2 pl-1 text-amber-500 flex-shrink-0" title="Pinned">
+                <Star size={12} className="fill-amber-400" />
+              </span>
             )}
           </div>
         ))}
@@ -554,7 +581,16 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse, pen
   const [isCollapsed, setIsCollapsed] = useState(false);
   const [userPhotoURL, setUserPhotoURL] = useState<string | null>(null);
   const [bookDropdownOpen, setBookDropdownOpen] = useState(false);
+  const [missedCalls, setMissedCalls] = useState(0);
   const { activeBook, books, switchBook, activeBookId } = useBook();
+
+  useEffect(() => {
+    if (!isMacCallBackend() || !user?.id) return;
+    const load = () => getMissedCallCount(user.id).then(setMissedCalls).catch(() => {});
+    load();
+    const iv = window.setInterval(load, 20000);
+    return () => window.clearInterval(iv);
+  }, [user?.id]);
 
   // Close book dropdown when clicking outside
   useEffect(() => {
@@ -914,6 +950,7 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse, pen
               {(isAdmin || isManager) && (
                 <NavItem to="/staff" icon={Users} label={t('nav.staffPortfolio')} isCollapsed={isCollapsed} />
               )}
+              <NavItem to="/calls" icon={Phone} label={t('nav.calls')} badge={missedCalls} isCollapsed={isCollapsed} />
               <NavItem to="/chat" icon={MessageCircle} label={t('nav.staffChat')} isCollapsed={isCollapsed} />
               {(isEngineer || isAdmin) && (
                 <NavItem to="/stocks" icon={Briefcase} label={t('nav.stockManagement')} isCollapsed={isCollapsed} />

@@ -4,6 +4,11 @@ import { Transaction, TransactionType, PaymentMethod, ExpenseCategory, User, Bui
 import { getBuildings, getUsersAcrossBooks, saveTransaction, getActiveContract, getContracts, getVendors, getBanks, saveBank, getTransactions, requestTransactionEdit, getCustomers, getCustomExpenseCategories, saveCustomExpenseCategories, getCustomIncomeCategories, saveCustomIncomeCategories, getTransfers, getServiceAgreements, saveServiceAgreement } from '../services/firestoreService';
 import { Save, RefreshCw, CheckCircle, ArrowRight, Banknote, Calendar, Plus, TrendingUp, TrendingDown, Info, CreditCard, UserPlus, FileSignature, Calculator, Receipt, Sparkles } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
+import {
+  computeInstallmentPaymentCoverage,
+  openTransactionInHistoryNewTab,
+  type PaymentCoverageItem,
+} from '../utils/installmentPaymentCoverage';
 import SearchableSelect from './SearchableSelect';
 import { useToast } from './Toast';
 import SoundService from '../services/soundService';
@@ -15,6 +20,7 @@ import LoadingOverlay from './LoadingOverlay';
 import ConfirmDialog from './ConfirmDialog';
 import VATQuickEntryModal, { VATQuickEntryType } from './VATQuickEntryModal';
 import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
+import { contractIncludesUnit, parseContractUnits, pickBestContractForUnit } from '../utils/contractUnits';
 import { getCarriedPriorInstallmentWindow } from '../utils/priorBalanceCarriedInstallment';
 import { getNonResFeePeriodContext } from '../utils/nonResidentialFeeSchedule';
 
@@ -239,6 +245,109 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
     const keepPrefillAmountRef = useRef(false);
     /** Resolved when a renewal contract has prior lease balance — used for details / date line outside checkContract. */
     const priorOldContractMetaRef = useRef<{ period: string; contractNo: string }>({ period: '', contractNo: '' });
+
+    const loadTransactionIntoForm = useCallback((transaction: Transaction) => {
+        const staffEligible =
+            currentUser.role === UserRole.EMPLOYEE &&
+            !!transaction.id &&
+            !!transaction.date &&
+            isDateInCurrentMonth(transaction.date);
+        setStaffOpenedCurrentMonthFullEdit(!!staffEligible);
+        setId(transaction.id);
+        setType(transaction.type);
+        setDate(transaction.date);
+        if (transaction.isVATApplicable && transaction.type === TransactionType.INCOME) {
+            const incl = getVatInclusiveEditAmount(transaction);
+            setAmount((incl || 0).toFixed(2));
+        } else if (transaction.isVATApplicable && transaction.type === TransactionType.EXPENSE) {
+            const extras = transaction.extraAmount || 0;
+            const discounts = transaction.discountAmount || 0;
+            const origInclusive = Math.max(0, getVatInclusiveEditAmount(transaction) - extras + discounts);
+            setAmount(origInclusive.toFixed(2));
+        } else {
+            setAmount((transaction.amount || 0).toString());
+        }
+        setDetails(transaction.details);
+        setPaymentMethod(transaction.paymentMethod);
+        setExtraAmount(transaction.extraAmount?.toString() || '0');
+        setDiscountAmount(transaction.discountAmount?.toString() || '0');
+        setIsVATApplicable(transaction.isVATApplicable || false);
+        setVatInvoiceNumber(transaction.vatInvoiceNumber || '');
+        if (transaction.bankName) setBankName(transaction.bankName);
+        if (transaction.chequeNo) setChequeNo(transaction.chequeNo);
+        if (transaction.chequeDueDate) setChequeDueDate(transaction.chequeDueDate);
+        if (transaction.createdAt) setOriginalCreatedAt(transaction.createdAt);
+        if (transaction.createdBy) setOriginalCreatedBy(transaction.createdBy);
+        if (transaction.borrowingType) setBorrowingType(transaction.borrowingType as 'BORROW' | 'REPAYMENT');
+        if ((transaction as any).isExternalBorrower) {
+            setIsExternalBorrower(true);
+            setExternalBorrowerName(transaction.employeeName || '');
+        } else if (transaction.employeeId) {
+            setTargetEmployeeId(transaction.employeeId);
+        }
+        if (transaction.type === TransactionType.INCOME) {
+            if (transaction.borrowingType) {
+                setType(TransactionType.EXPENSE);
+                setExpenseCategory(ExpenseCategory.BORROWING);
+                setBorrowingType(transaction.borrowingType as 'BORROW' | 'REPAYMENT');
+            } else {
+                if (transaction.incomeSubType) setIncomeSubType(transaction.incomeSubType);
+                if (transaction.expenseCategory && transaction.incomeSubType === 'OTHER') {
+                    setOtherIncomeCategory(transaction.expenseCategory);
+                }
+            }
+            if (transaction.buildingId) setBuildingId(transaction.buildingId);
+            if (transaction.unitNumber) setUnitNumber(transaction.unitNumber);
+        } else {
+            if (transaction.buildingId) setBuildingId(transaction.buildingId);
+            if (transaction.expenseCategory) setExpenseCategory(transaction.expenseCategory);
+            if (transaction.expenseCategory === ExpenseCategory.SALARY || transaction.expenseCategory === 'Salary') {
+                setBonus(String((transaction as any).bonusAmount || 0));
+                setDeduction(String((transaction as any).deductionAmount || 0));
+                setBorrowDeduction(String((transaction as any).borrowDeductionAmount || 0));
+                const txPeriod = (transaction as any).salaryPeriod || getPeriodFromDate(transaction.date || '');
+                if (txPeriod) {
+                    setSalaryPeriodInput(txPeriod);
+                    setSalaryPeriodManual(true);
+                }
+            }
+        }
+    }, [currentUser.role]);
+
+    const renderPaymentCoverage = (items: PaymentCoverageItem[]) => {
+        if (!items.length) return null;
+        return (
+            <div className="mt-2 pt-2 border-t border-emerald-200/60 space-y-1">
+                <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wider">{t('entry.coveredBy')}</div>
+                {items.map((item, idx) => {
+                    if (item.kind === 'upfront') {
+                        return (
+                            <div key={`upfront-${idx}`} className="flex justify-between text-[10px] font-bold">
+                                <span className="text-slate-500">{t('entry.coveredByUpfront')}</span>
+                                <span className="text-emerald-700">{item.amount.toLocaleString()} SAR</span>
+                            </div>
+                        );
+                    }
+                    const tx = item.transaction;
+                    const label = tx.details?.trim() || fmtDate(tx.date) || t('entry.paymentTransaction');
+                    return (
+                        <button
+                            key={tx.id || idx}
+                            type="button"
+                            onClick={() => openTransactionInHistoryNewTab(tx)}
+                            className="w-full flex justify-between items-center text-[10px] font-bold rounded-lg px-2 py-1.5 -mx-0.5 hover:bg-emerald-100/80 transition-colors text-left group"
+                            title={t('entry.openTransactionInHistory')}
+                        >
+                            <span className="text-sky-700 group-hover:text-sky-800 truncate max-w-[58%] underline decoration-dotted underline-offset-2">
+                                {label}
+                            </span>
+                            <span className="text-emerald-700 shrink-0">{item.amount.toLocaleString()} SAR</span>
+                        </button>
+                    );
+                })}
+            </div>
+        );
+    };
 
     const resetForm = useCallback(() => {
         setId(null);
@@ -577,79 +686,12 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
 
     useEffect(() => {
         if (location.state && location.state.transaction) {
-            const transaction = location.state.transaction as Transaction;
-            const staffEligible =
-                currentUser.role === UserRole.EMPLOYEE &&
-                !!transaction.id &&
-                !!transaction.date &&
-                isDateInCurrentMonth(transaction.date);
-            setStaffOpenedCurrentMonthFullEdit(!!staffEligible);
-            setId(transaction.id); setType(transaction.type); setDate(transaction.date);
-            // --- VAT amount fix: show inclusive total matching History display ---
-            if (transaction.isVATApplicable && transaction.type === TransactionType.INCOME) {
-                // Show the inclusive total so the form amount matches what the user sees in History.
-                const incl = getVatInclusiveEditAmount(transaction);
-                setAmount((incl || 0).toFixed(2));
-            } else if (transaction.isVATApplicable && transaction.type === TransactionType.EXPENSE) {
-                // Expense VAT: edit amount must match the inclusive total shown in History.
-                // Strip out extras/discounts to recover the original entered inclusive base.
-                const extras = transaction.extraAmount || 0;
-                const discounts = transaction.discountAmount || 0;
-                const origInclusive = Math.max(0, getVatInclusiveEditAmount(transaction) - extras + discounts);
-                setAmount(origInclusive.toFixed(2));
-            } else {
-                setAmount((transaction.amount || 0).toString());
-            }
-            setDetails(transaction.details); setPaymentMethod(transaction.paymentMethod);
-            setExtraAmount(transaction.extraAmount?.toString() || '0');
-            setDiscountAmount(transaction.discountAmount?.toString() || '0');
-            setIsVATApplicable(transaction.isVATApplicable || false);
-            setVatInvoiceNumber(transaction.vatInvoiceNumber || '');
-            if (transaction.bankName) setBankName(transaction.bankName);
-            if (transaction.chequeNo) setChequeNo(transaction.chequeNo);
-            if (transaction.chequeDueDate) setChequeDueDate(transaction.chequeDueDate);
-            // Preserve original author info on edit
-            if (transaction.createdAt) setOriginalCreatedAt(transaction.createdAt);
-            if (transaction.createdBy) setOriginalCreatedBy(transaction.createdBy);
-            // Restore borrowing-specific fields
-            if (transaction.borrowingType) setBorrowingType(transaction.borrowingType as 'BORROW' | 'REPAYMENT');
-            if ((transaction as any).isExternalBorrower) {
-                setIsExternalBorrower(true);
-                setExternalBorrowerName(transaction.employeeName || '');
-            } else if (transaction.employeeId) {
-                setTargetEmployeeId(transaction.employeeId);
-            }
-            if (transaction.type === TransactionType.INCOME) {
-                // Repayment borrowing transactions are stored as INCOME
-                if (transaction.borrowingType) {
-                    setType(TransactionType.EXPENSE);
-                    setExpenseCategory(ExpenseCategory.BORROWING);
-                    setBorrowingType(transaction.borrowingType as 'BORROW' | 'REPAYMENT');
-                } else {
-                    if (transaction.incomeSubType) setIncomeSubType(transaction.incomeSubType);
-                    if (transaction.expenseCategory && transaction.incomeSubType === 'OTHER') setOtherIncomeCategory(transaction.expenseCategory);
-                }
-                if (transaction.buildingId) setBuildingId(transaction.buildingId);
-                if (transaction.unitNumber) setUnitNumber(transaction.unitNumber);
-            } else {
-                if (transaction.buildingId) setBuildingId(transaction.buildingId);
-                if (transaction.expenseCategory) setExpenseCategory(transaction.expenseCategory);
-                if (transaction.expenseCategory === ExpenseCategory.SALARY || transaction.expenseCategory === 'Salary') {
-                    setBonus(String((transaction as any).bonusAmount || 0));
-                    setDeduction(String((transaction as any).deductionAmount || 0));
-                    setBorrowDeduction(String((transaction as any).borrowDeductionAmount || 0));
-                    const txPeriod = (transaction as any).salaryPeriod || getPeriodFromDate(transaction.date || '');
-                    if (txPeriod) {
-                        setSalaryPeriodInput(txPeriod);
-                        setSalaryPeriodManual(true);
-                    }
-                }
-            }
+            loadTransactionIntoForm(location.state.transaction as Transaction);
             window.history.replaceState({}, document.title);
         } else {
             setStaffOpenedCurrentMonthFullEdit(false);
         }
-    }, [location, currentUser.role]);
+    }, [location, loadTransactionIntoForm]);
 
     useEffect(() => {
             const prefill = (location.state as any)?.prefill;
@@ -745,9 +787,11 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                 // Try active contract first; fall back to any contract for this unit
                 let contract = await getActiveContract(buildingId, unitNumber);
                 if (!contract) {
-                    const unitContracts = catalog.filter((c: any) => c.buildingId === buildingId && c.unitName === unitNumber);
-                    unitContracts.sort((a: any, b: any) => (a.status === 'Active' ? -1 : b.status === 'Active' ? 1 : 0));
-                    contract = unitContracts[0] || null;
+                    const unitContracts = catalog.filter(
+                        (c: any) =>
+                            c.buildingId === buildingId && contractIncludesUnit(c.unitName, unitNumber),
+                    );
+                    contract = pickBestContractForUnit(unitContracts) || null;
                 }
                 setActiveContract(contract as any);
         setOverpaymentWarning('');
@@ -1891,7 +1935,13 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                         {autoCustomerName && !overpaymentWarning && (
                             <div className="bg-emerald-50 border border-emerald-200 p-2 sm:p-3 rounded-lg sm:rounded-xl flex items-center gap-2">
                                 <Info size={14} className="text-emerald-600 flex-shrink-0" />
-                                <div className="text-xs sm:text-sm font-bold text-emerald-800">{t('entry.customer')}<span className="text-emerald-900">{autoCustomerName}</span>
+                                <div className="text-xs sm:text-sm font-bold text-emerald-800">
+                                    {t('entry.customer')}<span className="text-emerald-900">{autoCustomerName}</span>
+                                    {activeContract && parseContractUnits(activeContract.unitName).length > 1 && (
+                                        <span className="block text-[10px] font-bold text-teal-700 mt-0.5">
+                                            {t('entry.multiUnitPaymentNote', { units: parseContractUnits(activeContract.unitName).join(', ') })}
+                                        </span>
+                                    )}
                                 </div>
                             </div>
                         )}
@@ -1954,6 +2004,24 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                             const isPartialPrior =
                                 isPriorBucket && paidTowardPrior > 0 && paidTowardPrior < priorO;
 
+                            const nonResContract = isNonResidentialBuildingForContract(buildings, activeContract as any);
+                            const rentPaymentsForCoverage = nonResContract
+                                ? contractPayments.filter((t) => !(t as any).feesEntry)
+                                : contractPayments;
+                            const paymentCoverage = computeInstallmentPaymentCoverage({
+                                contract: activeContract,
+                                payments: rentPaymentsForCoverage,
+                                priorOutstanding: priorO,
+                                firstInstAmt,
+                                otherInstAmt,
+                                totalInst,
+                            });
+                            const priorCoverage = paymentCoverage.prior.allocations;
+                            const currentInstCoverage =
+                                contractStats.installmentNo > 0
+                                    ? paymentCoverage.installments.find((i) => i.no === contractStats.installmentNo)?.allocations || []
+                                    : [];
+
                             return (
                                 <div className="relative overflow-hidden bg-gradient-to-br from-emerald-50/80 via-white to-teal-50/60 border border-emerald-200/60 rounded-2xl p-4 sm:p-5 space-y-4 shadow-lg shadow-emerald-100/40">
                                                                                                 {/* Contract Date Period */}
@@ -1977,6 +2045,16 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                         <div>
                                             <h4 className="text-xs sm:text-sm font-black text-slate-800">Contract #{activeContract.contractNo}</h4>
                                             <p className="text-[9px] sm:text-[10px] text-slate-500 font-medium">{autoCustomerName}</p>
+                                            {(() => {
+                                                const units = parseContractUnits(activeContract.unitName);
+                                                if (units.length <= 1) return null;
+                                                return (
+                                                    <p className="text-[9px] sm:text-[10px] font-bold text-teal-700 mt-0.5">
+                                                        {t('entry.multiUnitContract')}: {units.join(', ')}
+                                                        {unitNumber ? ` · ${t('entry.selectedUnit')}: ${unitNumber}` : ''}
+                                                    </p>
+                                                );
+                                            })()}
                                         </div>
                                     </div>
                                     <div className="px-2.5 py-1 rounded-lg text-[8px] sm:text-[9px] font-black uppercase tracking-wider bg-emerald-100 text-emerald-700 border border-emerald-200">
@@ -2054,6 +2132,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                                     <span className="text-emerald-600">{t('entry.alreadyPaid')}</span>
                                                     <span className="text-emerald-700">{paidTowardPrior.toLocaleString()} SAR</span>
                                                 </div>
+                                                {renderPaymentCoverage(priorCoverage)}
                                                 <div className="w-full bg-white/70 rounded-full h-1.5 mt-1">
                                                     <div
                                                         className="bg-gradient-to-r from-sky-400 to-sky-600 h-1.5 rounded-full transition-all"
@@ -2096,6 +2175,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                                     <span className="text-emerald-600">{t('entry.alreadyPaid')}</span>
                                                     <span className="text-emerald-700">{currentInst.paid.toLocaleString()} SAR</span>
                                                 </div>
+                                                {renderPaymentCoverage(currentInstCoverage)}
                                                 <div className="w-full bg-white/70 rounded-full h-1.5 mt-1">
                                                     <div className="bg-gradient-to-r from-emerald-400 to-emerald-500 h-1.5 rounded-full transition-all" style={{ width: `${Math.min(100, (currentInst.paid / currentInst.total) * 100)}%` }}></div>
                                                 </div>
@@ -2168,23 +2248,40 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                 )}
 
                                 {/* Payments history */}
-                                {contractPayments.length > 0 && (
+                                {(contractPayments.length > 0 || Number((activeContract as any).upfrontPaid || 0) > 0) && (
                                     <div className="bg-white/70 backdrop-blur-sm rounded-xl p-3 border border-white/50">
                                         <div className="text-[9px] font-bold text-slate-500 uppercase tracking-wider mb-2">{t('tenant.myPayments')}</div>
                                         <div className="space-y-1.5 max-h-32 overflow-y-auto">
+                                            {Number((activeContract as any).upfrontPaid || 0) > 0 && (
+                                                <div className="flex items-center justify-between text-[10px] py-1.5 border-b border-slate-100">
+                                                    <span className="text-slate-500 font-bold">{t('entry.coveredByUpfront')}</span>
+                                                    <span className="font-black text-emerald-700">{Number((activeContract as any).upfrontPaid).toLocaleString()} SAR</span>
+                                                </div>
+                                            )}
                                             {[...contractPayments].sort((a, b) => new Date(b.date).getTime() - new Date(a.date).getTime()).map(p => (
-                                                <div key={p.id} className="flex items-center justify-between text-[10px] py-1.5 border-b border-slate-100 last:border-0">
-                                                    <div className="flex items-center gap-2">
+                                                <button
+                                                    key={p.id}
+                                                    type="button"
+                                                    onClick={() => p.id && openTransactionInHistoryNewTab(p)}
+                                                    className="w-full flex items-center justify-between text-[10px] py-1.5 border-b border-slate-100 last:border-0 hover:bg-emerald-50/80 rounded-lg px-1 -mx-1 transition-colors text-left group"
+                                                    title={t('entry.openTransactionInHistory')}
+                                                >
+                                                    <div className="flex items-center gap-2 min-w-0">
                                                         <span className="text-slate-400 font-medium">{fmtDate(p.date)}</span>
+                                                        {p.details?.trim() && (
+                                                            <span className="text-sky-600 truncate underline decoration-dotted underline-offset-2 group-hover:text-sky-700">
+                                                                {p.details.trim()}
+                                                            </span>
+                                                        )}
                                                         {(p as any).discountAmount > 0 && (
-                                                            <span className="text-[8px] bg-teal-100 text-teal-600 px-1 rounded font-bold">-{(p as any).discountAmount.toLocaleString()}</span>
+                                                            <span className="text-[8px] bg-teal-100 text-teal-600 px-1 rounded font-bold shrink-0">-{(p as any).discountAmount.toLocaleString()}</span>
                                                         )}
                                                     </div>
-                                                    <div className="flex items-center gap-2">
+                                                    <div className="flex items-center gap-2 shrink-0">
                                         <span className="font-black text-emerald-700">{Number((p as any).amountIncludingVAT || (p as any).totalWithVat || p.amount).toLocaleString()} SAR</span>
                                         <span className={`w-1.5 h-1.5 rounded-full ${p.status === TransactionStatus.APPROVED ? 'bg-emerald-500' : 'bg-teal-500'}`}></span>
                                                     </div>
-                                                </div>
+                                                </button>
                                             ))}
                                         </div>
                                     </div>

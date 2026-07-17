@@ -1,21 +1,13 @@
 import { Building, Contract } from '../types';
 import { getInstallmentRange } from './installmentSchedule';
 import { fmtDate } from './dateFormat';
-
-function norm(value: string): string {
-  return String(value || '').toLowerCase().replace(/[^a-z0-9]+/g, '');
-}
-
-function unitMatches(contractUnit: string, unitName: string): boolean {
-  const a = norm(contractUnit);
-  const b = norm(unitName);
-  if (!a || !b) return false;
-  return a === b || a.includes(b) || b.includes(a);
-}
+import { contractIncludesUnit, pickBestContractForUnit } from './contractUnits';
 
 export function findActiveContractForUnit(contracts: Contract[], buildingId: string, unitName: string): Contract | null {
-  const matches = contracts.filter(contract => contract.buildingId === buildingId && unitMatches(contract.unitName, unitName));
-  return matches.find(contract => contract.status === 'Active') || matches[0] || null;
+  const matches = contracts.filter(
+    (contract) => contract.buildingId === buildingId && contractIncludesUnit(contract.unitName, unitName),
+  );
+  return pickBestContractForUnit(matches);
 }
 
 export function buildIncomeSheetDetails(input: {

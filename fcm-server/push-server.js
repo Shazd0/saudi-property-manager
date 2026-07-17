@@ -134,6 +134,110 @@ app.post('/send', async (req, res) => {
   }
 });
 
+// ─── POST /send-call ───
+// High-priority incoming voice/video call push (WhatsApp / BOTIM style)
+app.post('/send-call', async (req, res) => {
+  const { tokens, session } = req.body || {};
+
+  if (!tokens || !Array.isArray(tokens) || tokens.length === 0) {
+    return res.status(400).json({ error: 'No tokens provided' });
+  }
+  if (!session?.id) {
+    return res.status(400).json({ error: 'Missing session' });
+  }
+
+  const callTypeLabel = session.callType === 'video' ? 'Video' : 'Voice';
+  const callerName = session.callerName || 'Someone';
+  const title = `📞 ${callerName}`;
+  const body = `Incoming ${callTypeLabel} call`;
+  const ringUrl = `/#/calls?ring=${encodeURIComponent(session.id)}`;
+
+  console.log(`📞 Sending call push to ${tokens.length} device(s): ${callerName}`);
+
+  if (!messaging) {
+    console.warn('⚠️  Firebase Messaging not initialized – call push not sent');
+    return res.json({ success: false, reason: 'Firebase not configured', queued: true });
+  }
+
+  try {
+    const data = {
+      type: 'incoming-call',
+      sessionId: String(session.id),
+      callerId: String(session.callerId || ''),
+      callerName: String(callerName),
+      callType: String(session.callType || 'audio'),
+      sessionJson: JSON.stringify(session),
+      url: ringUrl,
+    };
+
+    const message = {
+      notification: { title, body },
+      data,
+      webpush: {
+        headers: {
+          Urgency: 'high',
+          TTL: '120',
+        },
+        notification: {
+          title,
+          body,
+          icon: '/images/logo-192.png',
+          badge: '/images/logo-192.png',
+          vibrate: [400, 200, 400, 200, 400, 200, 400, 200, 400],
+          requireInteraction: 'true',
+          renotify: 'true',
+          silent: 'false',
+          tag: `incoming-call-${session.id}`,
+          actions: [
+            { action: 'answer', title: '📞 Answer' },
+            { action: 'decline', title: '❌ Decline' },
+          ],
+        },
+        fcmOptions: { link: ringUrl },
+      },
+      android: {
+        priority: 'high',
+        notification: {
+          channelId: 'incoming_calls',
+          sound: 'default',
+          priority: 'max',
+          visibility: 'public',
+        },
+      },
+      apns: {
+        headers: { 'apns-priority': '10' },
+        payload: {
+          aps: {
+            sound: 'default',
+            'content-available': 1,
+          },
+        },
+      },
+      tokens,
+    };
+
+    const response = await messaging.sendEachForMulticast(message);
+    console.log(`📞 Call push: ${response.successCount} success, ${response.failureCount} failed`);
+
+    if (response.failureCount > 0 && firestoreDb) {
+      response.responses.forEach((resp, idx) => {
+        if (!resp.success && resp.error?.code === 'messaging/registration-token-not-registered') {
+          firestoreDb.collection('userTokens').doc(tokens[idx]).delete().catch(() => {});
+        }
+      });
+    }
+
+    res.json({
+      success: true,
+      successCount: response.successCount,
+      failureCount: response.failureCount,
+    });
+  } catch (err) {
+    console.error('❌ Call push error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ─── GET /health ───
 app.get('/health', (req, res) => {
   res.json({
@@ -233,6 +337,7 @@ await initFirestoreListener();
 
 app.listen(PORT, () => {
   console.log(`\n🚀 FCM Push Server running on http://localhost:${PORT}`);
-  console.log(`   POST /send   — Send push notifications`);
-  console.log(`   GET  /health — Health check\n`);
+  console.log(`   POST /send      — Send push notifications`);
+  console.log(`   POST /send-call — Send incoming call push (high priority)`);
+  console.log(`   GET  /health    — Health check\n`);
 });

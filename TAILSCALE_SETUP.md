@@ -276,3 +276,54 @@ If the API does not work:
    ```
 
 6. Make sure `api.yourdomain.com` is the subdomain routed to the tunnel, not the root landing page domain.
+
+### CORS errors from Netlify or another hosted frontend
+
+Browsers show a CORS error when the API preflight does not return `Access-Control-Allow-Origin`. Two common causes:
+
+1. **The API is down behind Cloudflare** — a `502 Bad Gateway` from Cloudflare also appears as a CORS failure in the browser. Test first:
+
+   ```bash
+   curl https://api.yourdomain.com/api/health
+   ```
+
+   If you get `502`, restart Docker and the Cloudflare tunnel on the Mac mini before changing CORS settings.
+
+2. **The hosted site origin is not allowed** — set `CORS_ORIGIN` on the Mac mini API to include every frontend origin, comma-separated:
+
+   ```bash
+   CORS_ORIGIN=https://amlakrrgroup.netlify.app,https://your-other-site.com
+   ```
+
+   Or allow all origins during testing:
+
+   ```bash
+   CORS_ORIGIN=*
+   ```
+
+   Then restart the API container:
+
+   ```bash
+   docker compose -f docker-compose.mac-mini.yml up -d --build amlak-api
+   ```
+
+### Netlify proxy (recommended for hosted sites)
+
+This repo includes a Netlify rewrite in `netlify.toml` that proxies `/api/*` to `https://api.amlak-app.com`. That lets the browser call the API on the same origin and avoids CORS entirely.
+
+Set these Netlify environment variables before building:
+
+```bash
+VITE_DATA_BACKEND=mac
+VITE_MAC_API_URL=/
+VITE_MAC_PROXY_TARGET=https://api.amlak-app.com
+VITE_MAC_API_TOKEN=your-api-token
+```
+
+On the Mac mini API, allow the Netlify origin (needed for direct WebSocket to `wss://api.amlak-app.com`):
+
+```bash
+CORS_ORIGIN=https://amlakrrgroup.netlify.app
+```
+
+Redeploy Netlify after changing env vars. The API tunnel must still be healthy; the proxy only removes CORS for REST. Voice calls use WebSocket directly to `api.amlak-app.com` because Netlify cannot proxy WebSocket upgrades.

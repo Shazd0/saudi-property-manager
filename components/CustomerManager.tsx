@@ -14,7 +14,7 @@ import SoundService from '../services/soundService';
 import * as pdfjsLib from 'pdfjs-dist';
 // @ts-ignore - Import worker as URL
 import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
-import Tesseract from 'tesseract.js';
+import { createOcrWorker } from '../utils/createOcrWorker';
 import * as XLSX from 'xlsx';
 import { useLanguage } from '../i18n';
 
@@ -694,7 +694,7 @@ const CustomerManager: React.FC = () => {
             console.log('Starting OCR fallback...');
             try {
               // Create Tesseract worker
-              const worker = await Tesseract.createWorker('eng', 1, {
+              const worker = await createOcrWorker('eng', {
                 logger: (m: any) => {
                   console.log('Tesseract:', m);
                   if (m.status === 'recognizing text') {
@@ -933,19 +933,31 @@ const CustomerManager: React.FC = () => {
           if (parsedRows.length === 0) {
             setImportStatus('No embedded text found, running OCR...');
 
+            const ocrWorker = await createOcrWorker('eng', {
+              logger: (m: any) => {
+                if (m.status === 'recognizing text') {
+                  setImportStatus(`OCR: ${Math.round(m.progress * 100)}%`);
+                }
+              },
+            });
             let ocrText = '';
-            for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-              const page = await pdf.getPage(pageNum);
-              const viewport = page.getViewport({ scale: 1.5 });
-              const canvas = document.createElement('canvas');
-              const ctx = canvas.getContext('2d');
-              if (!ctx) continue;
-              canvas.width = viewport.width;
-              canvas.height = viewport.height;
-              await page.render({ canvasContext: ctx, viewport } as any).promise;
+            try {
+              const pagesToProcess = Math.min(pdf.numPages, 8);
+              for (let pageNum = 1; pageNum <= pagesToProcess; pageNum++) {
+                const page = await pdf.getPage(pageNum);
+                const viewport = page.getViewport({ scale: 1.5 });
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                if (!ctx) continue;
+                canvas.width = viewport.width;
+                canvas.height = viewport.height;
+                await page.render({ canvasContext: ctx, viewport } as any).promise;
 
-              const result = await Tesseract.recognize(canvas, 'eng');
-              ocrText += (result.data.text || '') + '\n';
+                const { data } = await ocrWorker.recognize(canvas);
+                ocrText += (data.text || '') + '\n';
+              }
+            } finally {
+              await ocrWorker.terminate().catch(() => {});
             }
 
             // Re-run the same parsing logic on OCR text

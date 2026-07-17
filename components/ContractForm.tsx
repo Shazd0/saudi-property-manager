@@ -16,6 +16,13 @@ import { useLanguage } from '../i18n';
 import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
 import { computeContractBalance, type RenewalPriorBalanceSnap } from '../utils/contractBalance';
 import { buildContractSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
+import { parseContractUnits } from '../utils/contractUnits';
+
+/** Prefer a single unit for Entry form dropdown when contract covers multiple rooms. */
+function entryUnitForContract(c: { unitName?: string }): string {
+  const units = parseContractUnits(c.unitName);
+  return units[0] || String(c.unitName || '').trim();
+}
 
 interface ContractFormProps {
   currentUser: User;
@@ -1106,7 +1113,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
             type: TransactionType.INCOME,
             date: localDateStr(),
             buildingId: c.buildingId,
-            unitNumber: c.unitName,
+            unitNumber: entryUnitForContract(c),
             amount,
             paymentMethod,
             bankName: b?.bankName || '',
@@ -1846,7 +1853,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                         prefill: {
                           type: 'INCOME',
                           buildingId: selectedContract.buildingId,
-                          unitNumber: selectedContract.unitName,
+                          unitNumber: entryUnitForContract(selectedContract),
                           amount: feesPerInst,
                           details: `Non-VAT Fees (Water/Internet/Parking) - ${displayContractCustomerName(selectedContract)} - ${selectedContract.contractNo}`,
                           date: new Date().toISOString().split('T')[0],

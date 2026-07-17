@@ -1,4 +1,5 @@
 import type { Building } from '../types';
+import { contractIncludesUnit } from './contractUnits';
 
 /** True when the building is commercial/non-residential (split VAT rent vs non-VAT fees collection in UI). */
 function isNonResidentialBuildingForContract(
@@ -52,8 +53,8 @@ function txDateWithinContractPeriod(
 
 /**
  * For income without contractId: pick the contract that should own this row
- * (same building/unit, payment date inside contract period). Used so a new lease
- * does not absorb legacy payments from a previous lease on the same unit.
+ * (same building/unit — including multi-unit contracts — payment date inside contract period).
+ * Used so a new lease does not absorb legacy payments from a previous lease on the same unit.
  */
 export function resolveContractIdForUnscopedIncomeTx(
   t: TxLike,
@@ -72,7 +73,7 @@ export function resolveContractIdForUnscopedIncomeTx(
   let candidates = allContracts.filter(c => {
     if ((c as { deleted?: boolean }).deleted) return false;
     if (c.buildingId !== bid) return false;
-    if (String(c.unitName || '').trim() !== u) return false;
+    if (!contractIncludesUnit(c.unitName, u)) return false;
     return txDateWithinContractPeriod(d, c);
   });
 
@@ -103,8 +104,7 @@ function legacyMatchWithoutCatalog(t: TxLike, c: ContractScope): boolean {
   const cTo = String(c.toDate || '').trim();
   if (t.buildingId !== c.buildingId) return false;
   const u = String(t.unitNumber || '').trim();
-  const cu = String(c.unitName || '').trim();
-  if (u !== cu) return false;
+  if (!contractIncludesUnit(c.unitName, u)) return false;
   if (cFrom && txDate && txDate < cFrom) return false;
   if (cTo && txDate && txDate > cTo) return false;
 

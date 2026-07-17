@@ -1,8 +1,16 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useRef, useEffect } from 'react';
 import * as pdfjsLib from 'pdfjs-dist';
+import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
+import { createOcrWorker } from '../utils/createOcrWorker';
+import {
+  getLocalAiVisionModel,
+  hasGroqApiKey,
+  isLocalAiAvailable,
+} from '../utils/localAi';
+import { extractPurchaseInvoicesWithAi } from '../services/invoiceAiExtractService';
 import {
   X, Upload, FileText, ArrowRight, ArrowLeft,
-  CheckCircle, Loader, AlertCircle, Trash2, Info,
+  CheckCircle, Loader, AlertCircle, Trash2, Info, Sparkles, Zap, Cloud,
 } from 'lucide-react';
 import {
   Transaction, TransactionType, TransactionStatus,
@@ -12,26 +20,36 @@ import { saveTransaction } from '../services/firestoreService';
 import { auth } from '../firebase';
 
 // ── Worker ─────────────────────────────────────────────────────────────
-pdfjsLib.GlobalWorkerOptions.workerSrc = new URL(
-  'pdfjs-dist/build/pdf.worker.min.mjs',
-  import.meta.url,
-).href;
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
 
 // ── Types ───────────────────────────────────────────────────────────────
 type SystemField =
-  | 'date' | 'invoiceNumber' | 'vendorName' | 'vendorVAT'
-  | 'amountExcl' | 'amountVAT' | 'amountIncl' | 'description' | 'skip';
+  | 'rowNumber'
+  | 'date'
+  | 'type'
+  | 'invoiceNumber'
+  | 'vendorName'
+  | 'vendorVAT'
+  | 'amountExcl'
+  | 'amountVAT'
+  | 'amountIncl'
+  | 'payment'
+  | 'description'
+  | 'skip';
 
 const FIELD_OPTIONS: { value: SystemField; label: string }[] = [
   { value: 'skip',          label: '— Skip column —' },
-  { value: 'date',          label: '📅 Date' },
-  { value: 'invoiceNumber', label: '🔖 Invoice Number' },
-  { value: 'vendorName',    label: '🏢 Vendor Name' },
-  { value: 'vendorVAT',     label: '🔢 Vendor VAT No.' },
-  { value: 'amountExcl',    label: '💰 Amount (Excl. VAT)' },
-  { value: 'amountVAT',     label: '🧾 VAT Amount' },
-  { value: 'amountIncl',    label: '💵 Amount (Incl. VAT)' },
-  { value: 'description',   label: '📝 Description / Notes' },
+  { value: 'rowNumber',     label: '#' },
+  { value: 'date',          label: 'DATE' },
+  { value: 'type',          label: 'TYPE' },
+  { value: 'invoiceNumber', label: 'INVOICE #' },
+  { value: 'vendorName',    label: 'PARTY NAME' },
+  { value: 'vendorVAT',     label: 'PARTY VAT' },
+  { value: 'amountExcl',    label: 'EXCL. VAT' },
+  { value: 'amountVAT',     label: 'VAT (15%)' },
+  { value: 'amountIncl',    label: 'INCL. VAT' },
+  { value: 'payment',       label: 'PAYMENT' },
+  { value: 'description',   label: 'DESCRIPTION / NOTES' },
 ];
 
 interface MappedInvoice {
@@ -44,6 +62,7 @@ interface MappedInvoice {
   vatAmount: number;
   amountIncl: number;
   description: string;
+  type?: string;
   valid: boolean;
   errors: string[];
   selected: boolean;
@@ -62,11 +81,80 @@ interface Props {
   buildings: Building[];
 }
 
-// ── PDF text extraction ────────────────────────────────────────────────
-async function extractRows(file: File): Promise<{ rows: string[][]; pageCount: number }> {
+/** How to read the PDF — Fast OCR is default (no Ollama wait). */
+type ImportMode = 'fast' | 'ai-local' | 'ai-cloud';
+const IMPORT_MODE_LS = 'amlak_pdf_import_mode';
+
+function loadImportMode(): ImportMode {
+  try {
+    const v = localStorage.getItem(IMPORT_MODE_LS);
+    if (v === 'fast' || v === 'ai-local' || v === 'ai-cloud') return v;
+  } catch { /* ignore */ }
+  return 'fast';
+}
+
+function saveImportMode(mode: ImportMode) {
+  try { localStorage.setItem(IMPORT_MODE_LS, mode); } catch { /* ignore */ }
+}
+
+function applyTableToMapState(
+  dataRows: string[][],
+  dominantLen: number,
+  skipped: number,
+  setters: {
+    setColCount: (n: number) => void;
+    setSkippedRows: (n: number) => void;
+    setAllRows: (r: string[][]) => void;
+    setHeaderRowIndex: (n: number) => void;
+    setSampleRows: (r: string[][]) => void;
+    setColumnMapping: (m: SystemField[]) => void;
+    setExtractMethod: (m: 'ai-vision' | 'ai-ocr' | 'table' | null) => void;
+    setStep: (s: 'upload' | 'map' | 'preview' | 'done') => void;
+  },
+) {
+  setters.setColCount(dominantLen);
+  setters.setSkippedRows(skipped);
+  setters.setAllRows(dataRows);
+  setters.setExtractMethod('table');
+
+  const isNumberLike = (s: string) => /[\d,]+\.?\d*/.test(s);
+  let hIdx = -1;
+  for (let i = 0; i < Math.min(3, dataRows.length); i++) {
+    if (!dataRows[i].some(isNumberLike)) { hIdx = i; break; }
+  }
+  setters.setHeaderRowIndex(hIdx);
+
+  const headerRow = hIdx >= 0 ? dataRows[hIdx] : null;
+  const display = hIdx >= 0 ? dataRows.slice(hIdx + 1, hIdx + 4) : dataRows.slice(0, 3);
+  setters.setSampleRows(display);
+
+  const mapping: SystemField[] = Array.from({ length: dominantLen }, (_, col) => {
+    const hint = (headerRow?.[col] ?? '').toLowerCase().replace(/\s+/g, ' ').trim();
+    const samples = display.map(r => r[col] ?? '');
+
+    if (/^#+$|^no\.?$|^s\.?n\.?$|serial|row/.test(hint))     return 'rowNumber';
+    if (/^date$|تاريخ/.test(hint))                           return 'date';
+    if (/^type$|نوع|category|صنف/.test(hint))                return 'type';
+    if (/invoice|inv\b|فاتورة|رقم.*فاتورة/.test(hint))        return 'invoiceNumber';
+    if (/party.*name|vendor|supplier|مورد|اسم|party(?!\s*vat)/.test(hint)) return 'vendorName';
+    if (/party.*vat|vat.*no|tax.*no|رقم.*ضريب|tax.*reg|vat\s*#/.test(hint)) return 'vendorVAT';
+    if (/excl|before|base|صافي|قبل/.test(hint))              return 'amountExcl';
+    if (/^vat(\s*\(?15%?\)?)?$|vat\s*\(15%\)|ضريبة|tax.*amnt|vat.*amnt/.test(hint)) return 'amountVAT';
+    if (/incl|total|gross|إجمالي/.test(hint))                return 'amountIncl';
+    if (/^payment$|pay\b|method|طريقة|دفع/.test(hint))       return 'payment';
+    if (/desc|notes|detail|بيان/.test(hint))                 return 'description';
+    return autoDetectField(samples);
+  });
+  setters.setColumnMapping(mapping);
+  setters.setStep('map');
+}
+
+// ── PDF text / OCR extraction ──────────────────────────────────────────
+async function extractEmbeddedTextRows(file: File): Promise<{ rows: string[][]; pageCount: number; charCount: number }> {
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
   const allRows: string[][] = [];
+  let charCount = 0;
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
@@ -77,6 +165,7 @@ async function extractRows(file: File): Promise<{ rows: string[][]; pageCount: n
     for (const rawItem of content.items) {
       const item = rawItem as any;
       if (!item.str?.trim()) continue;
+      charCount += String(item.str).length;
       const y = Math.round(item.transform[5]);
       const x = item.transform[4];
       let bucket = -1;
@@ -105,7 +194,118 @@ async function extractRows(file: File): Promise<{ rows: string[][]; pageCount: n
       if (row.length > 0) allRows.push(row);
     }
   }
-  return { rows: allRows, pageCount: pdf.numPages };
+  return { rows: allRows, pageCount: pdf.numPages, charCount };
+}
+
+/** Turn OCR / plain text into rough table rows (split on 2+ spaces, tabs, or pipes). */
+function textToTableRows(text: string): string[][] {
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.replace(/\u00A0/g, ' ').trim())
+    .filter((l) => l.length >= 4);
+
+  const rows: string[][] = [];
+  for (const line of lines) {
+    let cells = line.split(/\s{2,}|\t|\|/).map((c) => c.trim()).filter(Boolean);
+    // Fallback: dense single-spaced OCR line — split amount-like tokens / VAT nos
+    if (cells.length < 3) {
+      const tokens = line.split(/\s+/).filter(Boolean);
+      if (tokens.length >= 3) cells = tokens;
+    }
+    if (cells.length >= 2) rows.push(cells);
+  }
+  return rows;
+}
+
+async function extractRowsViaOcr(
+  file: File,
+  onProgress?: (msg: string) => void,
+  maxPages = 40,
+): Promise<{ rows: string[][]; pageCount: number }> {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  onProgress?.('Starting fast OCR for scanned PDF…');
+
+  const worker = await createOcrWorker('eng+ara', {
+    logger: (m: any) => {
+      if (m?.status === 'recognizing text' && typeof m.progress === 'number') {
+        onProgress?.(`OCR: ${Math.round(m.progress * 100)}%`);
+      } else if (m?.status) {
+        onProgress?.(`OCR: ${m.status}`);
+      }
+    },
+  });
+
+  let ocrText = '';
+  const pagesToProcess = Math.min(pdf.numPages, maxPages);
+  try {
+    for (let pageNum = 1; pageNum <= pagesToProcess; pageNum++) {
+      onProgress?.(`OCR page ${pageNum}/${pagesToProcess}…`);
+      const page = await pdf.getPage(pageNum);
+      const viewport = page.getViewport({ scale: 2.0 });
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) continue;
+      canvas.width = viewport.width;
+      canvas.height = viewport.height;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport } as any).promise;
+      const { data } = await worker.recognize(canvas);
+      ocrText += (data.text || '') + '\n';
+    }
+  } finally {
+    await worker.terminate().catch(() => {});
+  }
+
+  return { rows: textToTableRows(ocrText), pageCount: pdf.numPages };
+}
+
+function findDominantTable(rows: string[][]): { dominantLen: number; dataRows: string[][]; skipped: number } | null {
+  const freq: Record<number, number> = {};
+  for (const r of rows) {
+    if (r.length >= 3) freq[r.length] = (freq[r.length] || 0) + 1;
+    else if (r.length === 2) freq[2] = (freq[2] || 0) + 1; // OCR often collapses columns
+  }
+  const modalEntry = Object.entries(freq).sort((a, b) => Number(b[1]) - Number(a[1]))[0];
+  if (!modalEntry) return null;
+
+  const dominantLen = Number(modalEntry[0]);
+  const minLen = dominantLen >= 3 ? dominantLen - 1 : 2;
+  const dataRows = rows
+    .filter((r) => r.length >= minLen && r.length <= dominantLen + 1)
+    .map((r) => {
+      let next = [...r];
+      while (next.length < dominantLen) next.push('');
+      return next.slice(0, dominantLen);
+    });
+  if (dataRows.length === 0) return null;
+  return { dominantLen, dataRows, skipped: rows.length - dataRows.length };
+}
+
+async function extractRows(
+  file: File,
+  onProgress?: (msg: string) => void,
+): Promise<{ rows: string[][]; pageCount: number; usedOcr: boolean }> {
+  onProgress?.('Reading PDF text…');
+  const embedded = await extractEmbeddedTextRows(file);
+  let table = findDominantTable(embedded.rows);
+  // Scanned PDFs usually have almost no embedded text / no ≥3-column rows
+  if (table && embedded.charCount >= 40) {
+    return { rows: table.dataRows, pageCount: embedded.pageCount, usedOcr: false };
+  }
+
+  onProgress?.('No selectable text table found — running OCR…');
+  const ocr = await extractRowsViaOcr(file, onProgress);
+  table = findDominantTable(ocr.rows);
+  if (!table) {
+    // Last resort: keep raw OCR lines as single-column-ish rows for manual mapping help
+    throw new Error(
+      'Could not detect invoice rows in this PDF (including after OCR). ' +
+        'Try a clearer scan, or export the purchases as a text PDF / Excel and import again.',
+    );
+  }
+  return { rows: table.dataRows, pageCount: ocr.pageCount, usedOcr: true };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -138,6 +338,16 @@ function autoDetectField(samples: string[]): SystemField {
   if (nonEmpty.every(s => /^3\d{14}$/.test(s.replace(/\s/g, '')))) return 'vendorVAT';
   if (nonEmpty.every(s => /^[\d,]+\.?\d{0,3}$/.test(s.replace(/[SAR ريال٪%]/g, '').trim()))) return 'amountExcl';
   return 'skip';
+}
+
+function normalizePaymentMethod(raw: string, fallback: PaymentMethod): PaymentMethod {
+  const s = raw.trim().toLowerCase();
+  if (!s) return fallback;
+  if (/cash|نقد|كاش/.test(s)) return PaymentMethod.CASH;
+  if (/cheque|check|شيك/.test(s)) return PaymentMethod.CHEQUE;
+  if (/bank|transfer|حوالة|تحويل|wire|ach|iban|card|mada|visa|master/.test(s)) return PaymentMethod.BANK;
+  const match = Object.values(PaymentMethod).find(m => m.toLowerCase() === s);
+  return match || fallback;
 }
 
 function buildInvoice(
@@ -175,6 +385,11 @@ function buildInvoice(
     amountIncl = amountExcl + vatAmount;
   }
 
+  const type = get('type').trim();
+  const descFromPdf = get('description').trim();
+  const description = descFromPdf
+    || (type ? `${type} – ${defaultCategory}` : `PDF Import – ${defaultCategory}`);
+
   const errors: string[] = [];
   if (!amountExcl && !amountIncl) errors.push('No amount found');
 
@@ -187,11 +402,12 @@ function buildInvoice(
     amountExcl:  Math.round(amountExcl  * 100) / 100,
     vatAmount:   Math.round(vatAmount   * 100) / 100,
     amountIncl:  Math.round(amountIncl  * 100) / 100,
-    description: get('description') || `PDF Import – ${defaultCategory}`,
+    description,
+    type: type || undefined,
     valid: errors.length === 0,
     errors,
     selected: errors.length === 0,
-    paymentMethod: defaultPaymentMethod,
+    paymentMethod: normalizePaymentMethod(get('payment'), defaultPaymentMethod),
   };
 }
 
@@ -201,6 +417,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
 
   // Upload step
   const [parsing, setParsing]     = useState(false);
+  const [parseStatus, setParseStatus] = useState('');
   const [parseError, setParseError] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
@@ -224,6 +441,30 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
   // Import
   const [importing,    setImporting]    = useState(false);
   const [importCount,  setImportCount]  = useState(0);
+  const [extractMethod, setExtractMethod] = useState<'ai-vision' | 'ai-ocr' | 'table' | null>(null);
+  const [aiNotes, setAiNotes] = useState('');
+  const [localAiReady, setLocalAiReady] = useState<boolean | null>(null);
+  const [aiProviderLabel, setAiProviderLabel] = useState('');
+  const [importMode, setImportMode] = useState<ImportMode>(loadImportMode);
+
+  const setMode = (mode: ImportMode) => {
+    setImportMode(mode);
+    saveImportMode(mode);
+  };
+
+  useEffect(() => {
+    // Only probe Ollama when user may use local AI — avoids CORS spam on Fast OCR.
+    if (importMode !== 'ai-local') return;
+    let cancelled = false;
+    (async () => {
+      const ok = await isLocalAiAvailable(true);
+      if (cancelled) return;
+      setLocalAiReady(ok);
+      if (ok) setAiProviderLabel(`Ollama · ${getLocalAiVisionModel()}`);
+      else setAiProviderLabel('');
+    })();
+    return () => { cancelled = true; };
+  }, [importMode]);
 
   // ── Parse PDF ───────────────────────────────────────────────────────
   const handleFile = useCallback(async (file: File) => {
@@ -233,70 +474,89 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
     }
     setParsing(true);
     setParseError('');
+    setAiNotes('');
+    setExtractMethod(null);
+    setParseStatus('Reading PDF…');
+
+    const mapSetters = {
+      setColCount, setSkippedRows, setAllRows, setHeaderRowIndex,
+      setSampleRows, setColumnMapping, setExtractMethod, setStep,
+    };
+
     try {
-      const { rows } = await extractRows(file);
-      setAllRows(rows);
-
-      // Find most common row length (≥3 cells)
-      const freq: Record<number, number> = {};
-      for (const r of rows) if (r.length >= 3) freq[r.length] = (freq[r.length] || 0) + 1;
-      const modalEntry = Object.entries(freq).sort((a, b) => Number(b[1]) - Number(a[1]))[0];
-
-      if (!modalEntry) {
-        setParseError(
-          'Could not detect a table structure in this PDF. ' +
-          'Ensure the PDF contains a table of purchase invoices (not a scanned image).',
-        );
+      // ── Fast OCR / text table (default) — no Ollama ───────────────
+      if (importMode === 'fast') {
+        setParseStatus('Fast OCR / table parse…');
+        const { rows, usedOcr } = await extractRows(file, setParseStatus);
+        setAllRows(rows);
+        const table = findDominantTable(rows);
+        if (!table) {
+          setParseError(
+            'Could not detect invoice rows with Fast OCR' +
+              (usedOcr ? '' : '') +
+              '. Try Cloud AI (if you have a Groq key) for messy scans, or export as Excel / a text PDF.',
+          );
+          return;
+        }
+        applyTableToMapState(table.dataRows, table.dominantLen, table.skipped, mapSetters);
         return;
       }
 
-      const dominantLen = Number(modalEntry[0]);
-      setColCount(dominantLen);
-
-      // Accept rows within ±1 column of dominant (handles optional empty trailing cell)
-      const dataRows = rows.filter(r => r.length >= dominantLen - 1 && r.length <= dominantLen + 1)
-        .map(r => {
-          // Pad shorter rows with empty strings so mapping stays aligned
-          while (r.length < dominantLen) r = [...r, ''];
-          return r.slice(0, dominantLen);
-        });
-      setSkippedRows(rows.length - dataRows.length);
-
-      // Detect header row: first row where no cell looks like a number
-      const isNumberLike = (s: string) => /[\d,]+\.?\d*/.test(s);
-      let hIdx = -1;
-      for (let i = 0; i < Math.min(3, dataRows.length); i++) {
-        if (!dataRows[i].some(isNumberLike)) { hIdx = i; break; }
+      // ── AI paths (optional) ───────────────────────────────────────
+      const prefer = importMode === 'ai-local' ? 'local' as const : 'groq' as const;
+      if (prefer === 'local') {
+        const localOk = await isLocalAiAvailable();
+        setLocalAiReady(localOk);
+        if (!localOk) {
+          setParseError('Local Ollama is offline. Start Ollama, or switch to Fast OCR / Cloud AI.');
+          return;
+        }
+      } else if (!hasGroqApiKey()) {
+        setParseError('No Groq API key. Open Amlak AI → Settings to add one, or use Fast OCR.');
+        return;
       }
-      setHeaderRowIndex(hIdx);
 
-      const headerRow = hIdx >= 0 ? dataRows[hIdx] : null;
-      const display = hIdx >= 0 ? dataRows.slice(hIdx + 1, hIdx + 4) : dataRows.slice(0, 3);
-      setSampleRows(display);
+      setParseStatus(prefer === 'local'
+        ? `Local AI (${getLocalAiVisionModel()}) — this can take a long time…`
+        : 'Cloud AI: analyzing scanned invoices…');
+      const ai = await extractPurchaseInvoicesWithAi(file, setParseStatus, defaultPaymentMethod, prefer);
+      if (ai.invoices.length > 0) {
+        const mapped: MappedInvoice[] = ai.invoices.map((inv) => ({
+          ...inv,
+          description: inv.description || `AI Import – ${defaultCategory}`,
+          paymentMethod: defaultPaymentMethod,
+        }));
+        setInvoices(mapped);
+        setExcludedRows([]);
+        setExtractMethod(ai.method === 'vision' ? 'ai-vision' : 'ai-ocr');
+        setAiNotes(ai.notes || '');
+        setAiProviderLabel(ai.provider === 'local'
+          ? `Ollama · ${getLocalAiVisionModel()}`
+          : 'Groq cloud');
+        setStep('preview');
+        return;
+      }
 
-      // Auto-detect column mapping
-      const mapping: SystemField[] = Array.from({ length: dominantLen }, (_, col) => {
-        const hint = (headerRow?.[col] ?? '').toLowerCase();
-        const samples = display.map(r => r[col] ?? '');
-
-        if (/date|تاريخ/.test(hint))                          return 'date';
-        if (/invoice|inv\b|فاتورة|رقم.*فاتورة/.test(hint))   return 'invoiceNumber';
-        if (/vendor|supplier|name|مورد|اسم/.test(hint))       return 'vendorName';
-        if (/vat.*no|tax.*no|رقم.*ضريب|tax.*reg/.test(hint)) return 'vendorVAT';
-        if (/excl|before|base|صافي|قبل/.test(hint))           return 'amountExcl';
-        if (/^vat|ضريبة|tax.*amnt|vat.*amnt/.test(hint))     return 'amountVAT';
-        if (/incl|total|gross|إجمالي/.test(hint))             return 'amountIncl';
-        if (/desc|notes|detail|بيان/.test(hint))              return 'description';
-        return autoDetectField(samples);
-      });
-      setColumnMapping(mapping);
-      setStep('map');
+      setAiNotes(ai.notes || '');
+      setParseStatus('AI found no invoices — falling back to Fast OCR…');
+      const { rows, usedOcr } = await extractRows(file, setParseStatus);
+      const table = findDominantTable(rows);
+      if (!table) {
+        setParseError(
+          'Could not detect invoices' +
+            (usedOcr ? ' after OCR' : '') +
+            '. Try a clearer scan or Excel export.',
+        );
+        return;
+      }
+      applyTableToMapState(table.dataRows, table.dominantLen, table.skipped, mapSetters);
     } catch (e: any) {
-      setParseError('Failed to parse PDF: ' + (e?.message || 'Unknown error'));
+      setParseError(e?.message || 'Failed to parse PDF.');
     } finally {
       setParsing(false);
+      setParseStatus('');
     }
-  }, []);
+  }, [defaultCategory, defaultPaymentMethod, importMode]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -410,7 +670,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
                 Import Purchase Invoices from PDF
               </h2>
               <p className="text-xs text-slate-500">
-                Parse a PDF table · map fields · preview · import to VAT report
+                Fast OCR for scans · optional AI · map · preview · import
               </p>
             </div>
           </div>
@@ -445,6 +705,62 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
           {/* ══════════════ STEP 1 – UPLOAD ══════════════ */}
           {step === 'upload' && (
             <div className="space-y-4">
+              {/* Import mode — Fast OCR default (skips slow Ollama) */}
+              <div>
+                <p className="text-xs font-bold text-slate-500 mb-2">How should we read this PDF?</p>
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMode('fast')}
+                    className={`text-left p-3 rounded-xl border-2 transition-all ${
+                      importMode === 'fast'
+                        ? 'border-emerald-500 bg-emerald-50 shadow-sm'
+                        : 'border-slate-200 bg-white hover:border-slate-300'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-bold text-sm text-slate-800">
+                      <Zap size={14} className="text-emerald-600" /> Fast OCR
+                      <span className="ml-auto text-[9px] font-black uppercase tracking-wide text-emerald-700 bg-emerald-100 px-1.5 py-0.5 rounded">Recommended</span>
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">
+                      Local Tesseract OCR + column mapping. Best for scanned packs — no Ollama wait.
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMode('ai-cloud')}
+                    className={`text-left p-3 rounded-xl border-2 transition-all ${
+                      importMode === 'ai-cloud'
+                        ? 'border-sky-500 bg-sky-50 shadow-sm'
+                        : 'border-slate-200 bg-white hover:border-slate-300'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-bold text-sm text-slate-800">
+                      <Cloud size={14} className="text-sky-600" /> Cloud AI
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">
+                      Groq vision (needs API key in Amlak AI). Faster than local Ollama for messy scans.
+                    </p>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMode('ai-local')}
+                    className={`text-left p-3 rounded-xl border-2 transition-all ${
+                      importMode === 'ai-local'
+                        ? 'border-violet-500 bg-violet-50 shadow-sm'
+                        : 'border-slate-200 bg-white hover:border-slate-300'
+                    }`}
+                  >
+                    <div className="flex items-center gap-1.5 font-bold text-sm text-slate-800">
+                      <Sparkles size={14} className="text-violet-600" /> Local AI
+                    </div>
+                    <p className="text-[11px] text-slate-500 mt-1 leading-snug">
+                      Ollama (`{getLocalAiVisionModel()}`) — accurate but slow on multi-page PDFs.
+                    </p>
+                  </button>
+                </div>
+              </div>
+
               <div
                 onDrop={handleDrop}
                 onDragOver={e => e.preventDefault()}
@@ -454,7 +770,11 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
                 <Upload size={44} className="mx-auto mb-3 text-amber-400 group-hover:text-amber-600 transition-colors" />
                 <p className="font-black text-slate-700 text-lg">Drop your PDF here or click to browse</p>
                 <p className="text-sm text-slate-400 mt-1">
-                  The PDF must contain a <strong>table of purchase invoices</strong> (e.g. vendor statement, invoice list export)
+                  {importMode === 'fast'
+                    ? 'Fast OCR will read scanned pages and let you map columns'
+                    : importMode === 'ai-cloud'
+                      ? 'Cloud AI will try to fill invoice fields automatically'
+                      : 'Local AI will read each page (can take many minutes)'}
                 </p>
                 <input
                   ref={fileRef}
@@ -465,9 +785,41 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
                 />
               </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">Default Expense Category</label>
+                  <select
+                    value={defaultCategory}
+                    onChange={e => setDefaultCategory(e.target.value)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-400"
+                  >
+                    {Object.values(ExpenseCategory).map(c => <option key={c} value={c}>{c}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs font-bold text-slate-500 mb-1">Default Payment Method</label>
+                  <select
+                    value={defaultPaymentMethod}
+                    onChange={e => setDefaultPaymentMethod(e.target.value as PaymentMethod)}
+                    className="w-full px-3 py-2 border border-slate-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-amber-400"
+                  >
+                    {Object.values(PaymentMethod).map(m => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+              </div>
+
               {parsing && (
-                <div className="flex items-center justify-center gap-3 py-4 text-amber-600 font-bold">
-                  <Loader size={20} className="animate-spin" /> Parsing PDF…
+                <div className="flex flex-col items-center justify-center gap-2 py-4 text-amber-600 font-bold">
+                  <div className="flex items-center gap-3">
+                    <Loader size={20} className="animate-spin" /> {parseStatus || 'Parsing PDF…'}
+                  </div>
+                  <p className="text-xs font-semibold text-amber-500/90 text-center max-w-md">
+                    {importMode === 'ai-local'
+                      ? 'Local AI reads one page at a time — large PDFs can take a long time.'
+                      : importMode === 'ai-cloud'
+                        ? 'Cloud AI is analyzing pages…'
+                        : 'Fast OCR is scanning pages — usually much quicker than local AI.'}
+                  </p>
                 </div>
               )}
               {parseError && (
@@ -477,16 +829,39 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
                 </div>
               )}
 
+              {importMode === 'ai-local' && (
+                <div className={`rounded-xl p-4 border ${localAiReady ? 'bg-violet-50 border-violet-200' : 'bg-amber-50 border-amber-200'}`}>
+                  <p className={`text-xs font-bold mb-1 flex items-center gap-1.5 ${localAiReady ? 'text-violet-700' : 'text-amber-800'}`}>
+                    <Sparkles size={13} />
+                    {localAiReady ? 'Local AI ready' : localAiReady === false ? 'Ollama offline' : 'Checking Ollama…'}
+                  </p>
+                  <p className={`text-xs ${localAiReady ? 'text-violet-700' : 'text-amber-800'}`}>
+                    {localAiReady
+                      ? `Using ${getLocalAiVisionModel()} via /ollama proxy.`
+                      : 'Start Ollama, or switch to Fast OCR for quicker imports.'}
+                  </p>
+                </div>
+              )}
+              {importMode === 'ai-cloud' && !hasGroqApiKey() && (
+                <div className="rounded-xl p-4 border bg-amber-50 border-amber-200">
+                  <p className="text-xs font-bold text-amber-800 mb-1 flex items-center gap-1.5">
+                    <Cloud size={13} /> Groq key needed
+                  </p>
+                  <p className="text-xs text-amber-800">
+                    Open Amlak AI → Settings and paste a free key from console.groq.com, or use Fast OCR instead.
+                  </p>
+                </div>
+              )}
+
               <div className="bg-blue-50 border border-blue-200 rounded-xl p-4">
                 <p className="text-xs font-bold text-blue-700 mb-2 flex items-center gap-1.5">
-                  <Info size={13} /> Tips for best results
+                  <Info size={13} /> Tips
                 </p>
                 <ul className="text-xs text-blue-600 space-y-1 list-disc ml-4">
-                  <li>PDF must have selectable text (not a scanned image)</li>
-                  <li>Each row should represent one purchase invoice</li>
-                  <li>Columns like Date, Invoice No., Vendor, VAT No., Amount are auto-detected and can be adjusted</li>
-                  <li>Both Arabic and English column headers are supported</li>
-                  <li>Only Amount (Excl. VAT) <em>or</em> Amount (Incl. VAT) is required — VAT is auto-calculated at 15%</li>
+                  <li><strong>Fast OCR</strong> is best for multi-page phone scans (like Scanned_*.pdf)</li>
+                  <li>Map columns on the next step if OCR shuffles fields</li>
+                  <li>Use Cloud / Local AI only when Fast OCR can’t find rows</li>
+                  <li>Only excl. or incl. VAT amount is required — 15% VAT is derived when missing</li>
                 </ul>
               </div>
             </div>
@@ -627,6 +1002,19 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
           {/* ══════════════ STEP 3 – PREVIEW ══════════════ */}
           {step === 'preview' && (
             <div className="space-y-4">
+
+              {(extractMethod === 'ai-vision' || extractMethod === 'ai-ocr') && (
+                <div className="flex items-start gap-2 bg-violet-50 border border-violet-200 text-violet-800 p-3 rounded-xl text-xs font-semibold">
+                  <Sparkles size={16} className="flex-shrink-0 mt-0.5 text-violet-600" />
+                  <div>
+                    <p>
+                      Extracted with {extractMethod === 'ai-vision' ? 'AI vision' : 'OCR + AI'}
+                      {aiProviderLabel ? ` (${aiProviderLabel})` : ''} — review amounts and vendor details before import.
+                    </p>
+                    {aiNotes && <p className="mt-1 font-normal text-violet-600/90">{aiNotes}</p>}
+                  </div>
+                </div>
+              )}
 
               {/* Summary cards */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 sm:gap-3">
@@ -836,7 +1224,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
 
               <div className="flex gap-3 pt-1">
                 <button
-                  onClick={() => setStep('map')}
+                  onClick={() => setStep(extractMethod === 'table' ? 'map' : 'upload')}
                   className="px-4 py-2.5 bg-slate-100 text-slate-700 rounded-xl font-bold text-sm flex items-center gap-2 hover:bg-slate-200"
                 >
                   <ArrowLeft size={16} /> Back

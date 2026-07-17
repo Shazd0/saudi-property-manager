@@ -8,7 +8,7 @@ import {
   LogOut, Package, Landmark, ClipboardCheck, BarChart3, FileText,
   Crown, ShieldAlert, MapPin, Zap, Shield, MessageSquare,
   Banknote, CreditCard, FileCheck, BookMarked, Layers, Scale,
-  TrendingUp, TrendingDown, DollarSign, FileSpreadsheet, ScreenShare,
+  TrendingUp, TrendingDown, DollarSign, FileSpreadsheet, ScreenShare, Phone,
 } from 'lucide-react';
 import SoundService from '../services/soundService';
 import HapticService from '../services/hapticService';
@@ -76,6 +76,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
   // Search-filtered routes
   const allRoutes = useMemo(() => {
     const base = [
+      { to: '/calls', icon: Phone, label: t('nav.calls'), section: 'main' },
       { to: '/', icon: Home, label: t('nav.dashboard'), section: 'main' },
       { to: '/tasks', icon: ClipboardList, label: t('nav.tasks'), section: 'main' },
       { to: '/calendar', icon: CalendarDays, label: t('nav.calendar'), section: 'main' },
@@ -108,6 +109,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
       { to: '/transfers', icon: ArrowRightLeft, label: t('nav.treasury'), section: 'ops' },
       { to: '/borrowings', icon: Landmark, label: t('nav.borrowings'), section: 'ops' },
       { to: '/stocks', icon: Package, label: t('nav.stockManagement'), section: 'ops' },
+      { to: '/calls', icon: Phone, label: t('nav.calls'), section: 'ops' },
       { to: '/chat', icon: MessageCircle, label: t('nav.staffChat'), section: 'ops' },
       { to: '/ejar', icon: FileCheck, label: t('nav.ejarPlatform'), section: 'compliance' },
       { to: '/municipality-licenses', icon: Landmark, label: t('nav.municipality'), section: 'compliance' },
@@ -158,6 +160,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
         { to: '/history', icon: History, label: t('nav.history'), color: 'amber' },
       ]
     : [
+        { to: '/calls', icon: Phone, label: t('nav.calls'), color: 'green' },
         { to: '/', icon: Home, label: t('nav.home'), color: 'emerald' },
         { to: '/entry', icon: PlusCircle, label: t('nav.entry'), color: 'blue' },
         { to: '/contracts', icon: FileSignature, label: t('nav.contracts'), color: 'violet' },
@@ -167,6 +170,7 @@ const MobileMenu: React.FC<MobileMenuProps> = ({ user, isOpen, onClose, onLogout
       ];
 
   const colorMap: Record<string, string> = {
+    green: 'from-green-500 to-emerald-500',
     emerald: 'from-emerald-500 to-emerald-600',
     blue: 'from-blue-500 to-blue-600',
     violet: 'from-violet-500 to-violet-600',

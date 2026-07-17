@@ -17,6 +17,9 @@
 
 import { db } from '../firebase';
 import { collection, getDocs, query, where, doc, setDoc, deleteDoc, addDoc } from 'firebase/firestore';
+import { macListCollection, macSaveDocument } from './macApiClient';
+
+const usesMacData = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
 
 // ─── VAPID key (Web Push certificate from Firebase Console) ───
 // Intentionally empty by default. A valid public VAPID key must be configured in Settings.
@@ -157,25 +160,34 @@ export const registerDeviceForPush = async (userId: string, userName: string, ro
       return true;
     }
 
-    // Save token to Firestore under userTokens/{token}
-    // Always update to keep lastActive fresh and handle token changes
-    await setDoc(doc(db, 'userTokens', token), {
+    // Save token so server can send call/approval pushes even when app is closed
+    const record = {
+      id: token,
       userId,
       userName,
-      role: role || 'ADMIN',
+      role: role || 'EMPLOYEE',
       token,
       createdAt: Date.now(),
       lastActive: Date.now(),
       platform: navigator.userAgent,
-    });
+    };
+
+    if (usesMacData()) {
+      await macSaveDocument('userTokens', record, { merge: true });
+    } else {
+      await setDoc(doc(db, 'userTokens', token), record);
+    }
 
     // Clean up any old tokens for this user on this device (different token IDs)
     try {
       const oldTokenKey = `fcm_prev_token_${userId}`;
       const prevToken = localStorage.getItem(oldTokenKey);
       if (prevToken && prevToken !== token) {
-        // Old token is stale, remove it from Firestore
-        await deleteDoc(doc(db, 'userTokens', prevToken)).catch(() => {});
+        if (usesMacData()) {
+          await macSaveDocument('userTokens', { id: prevToken, deleted: true } as any, { merge: true }).catch(() => {});
+        } else {
+          await deleteDoc(doc(db, 'userTokens', prevToken)).catch(() => {});
+        }
       }
       localStorage.setItem(oldTokenKey, token);
     } catch (e) { /* non-critical */ }
@@ -205,16 +217,122 @@ export const unregisterDevice = async (): Promise<void> => {
  */
 export const getAdminTokens = async (): Promise<string[]> => {
   try {
-    const snap = await getDocs(collection(db, 'userTokens'));
     const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
-    return snap.docs
-      .map(d => d.data())
-      .filter(d => d.token && (d.role === 'ADMIN' || d.role === 'MANAGER') && (d.lastActive || d.createdAt || 0) > thirtyDaysAgo)
-      .map(d => d.token);
+    let items: any[] = [];
+
+    if (usesMacData()) {
+      items = await macListCollection('userTokens');
+    } else {
+      const snap = await getDocs(collection(db, 'userTokens'));
+      items = snap.docs.map((d) => d.data());
+    }
+
+    return items
+      .filter((d) => d.token && (d.role === 'ADMIN' || d.role === 'MANAGER') && (d.lastActive || d.createdAt || 0) > thirtyDaysAgo)
+      .map((d) => d.token);
   } catch (err) {
     console.error('Push: Failed to fetch admin tokens', err);
     return [];
   }
+};
+
+/**
+ * Fetch FCM tokens for specific user IDs (for incoming call pushes).
+ */
+export const getUserPushTokens = async (userIds: string[]): Promise<string[]> => {
+  if (!userIds.length) return [];
+  const thirtyDaysAgo = Date.now() - (30 * 24 * 60 * 60 * 1000);
+  const wanted = new Set(userIds.map(String));
+  const tokens = new Set<string>();
+
+  try {
+    let items: any[] = [];
+    if (usesMacData()) {
+      items = await macListCollection('userTokens');
+    } else {
+      const snap = await getDocs(collection(db, 'userTokens'));
+      items = snap.docs.map((d) => d.data());
+    }
+
+    items.forEach((d) => {
+      if (!d.token || !wanted.has(String(d.userId))) return;
+      if ((d.lastActive || d.createdAt || 0) <= thirtyDaysAgo) return;
+      tokens.add(String(d.token));
+    });
+  } catch (err) {
+    console.warn('Push: Failed to fetch user tokens', err);
+  }
+
+  return [...tokens];
+};
+
+export interface IncomingCallPushSession {
+  id: string;
+  callerId: string;
+  callerName: string;
+  callType: 'audio' | 'video';
+  calleeIds: string[];
+}
+
+/**
+ * Client-side fallback: send incoming call push via FCM server when server-side push is unavailable.
+ */
+export const notifyIncomingCallPush = async (session: IncomingCallPushSession): Promise<void> => {
+  const tokens = await getUserPushTokens(session.calleeIds || []);
+  if (!tokens.length) return;
+
+  const fcmUrl = getFcmServerUrl();
+  if (!fcmUrl) return;
+
+  const callTypeLabel = session.callType === 'video' ? 'Video' : 'Voice';
+  const title = `📞 ${session.callerName || 'Someone'}`;
+  const body = `Incoming ${callTypeLabel} call`;
+
+  try {
+    await fetch(`${fcmUrl.replace(/\/$/, '')}/send-call`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tokens, session }),
+    });
+  } catch {
+    // Server-side push is primary; this is best-effort fallback
+  }
+
+  // Also show local notification if tab is open
+  showBrowserNotification(title, body, {
+    type: 'incoming-call',
+    sessionId: session.id,
+    callerName: session.callerName,
+    callType: session.callType,
+    url: `/#/calls?ring=${session.id}`,
+  });
+};
+
+/**
+ * Listen for foreground incoming-call FCM messages.
+ */
+export const listenForIncomingCallPush = async (
+  onIncoming: (session: IncomingCallPushSession) => void,
+): Promise<void> => {
+  await listenForForegroundMessages((payload) => {
+    const data = payload?.data || {};
+    if (data.type !== 'incoming-call' || !data.sessionId) return;
+
+    let session: IncomingCallPushSession | null = null;
+    try {
+      session = data.sessionJson ? JSON.parse(data.sessionJson) : null;
+    } catch {
+      session = null;
+    }
+
+    onIncoming(session || {
+      id: String(data.sessionId),
+      callerId: String(data.callerId || ''),
+      callerName: String(data.callerName || 'Someone'),
+      callType: (data.callType === 'video' ? 'video' : 'audio') as 'audio' | 'video',
+      calleeIds: [],
+    });
+  });
 };
 
 // ─── Send Push Notification (via FCM server or browser fallback) ───
@@ -393,6 +511,14 @@ export const listenForForegroundMessages = async (
 
       onMessage(messaging, (payload) => {
         console.log('Push: Foreground message received', payload);
+        const data = payload.data || {};
+
+        if (data.type === 'incoming-call') {
+          window.dispatchEvent(new CustomEvent('amlak-incoming-call-push', { detail: payload }));
+          if (callback) callback(payload);
+          return;
+        }
+
         const title = payload.notification?.title || 'Approval Request';
         const body = payload.notification?.body || 'A staff member needs your approval';
 

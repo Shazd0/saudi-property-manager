@@ -94,7 +94,7 @@ const BulkRentEntry: React.FC<BulkRentEntryProps> = ({ currentUser }) => {
     // Only build rows for units with active contracts AND outstanding balance
     const rows: UnitRow[] = [];
     for (const unit of bld.units) {
-      const contract = activeContracts.find(c => c.unitName === unit.name || (c.unitName && c.unitName.split(', ').includes(unit.name)));
+      const contract = activeContracts.find(c => c.unitName === unit.name || (c.unitName && c.unitName.split(',').map((x: string) => x.trim()).includes(unit.name)));
       if (!contract) continue; // Skip vacant units
 
       // Calculate paid so far for this contract

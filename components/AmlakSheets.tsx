@@ -1,5 +1,5 @@
 import React, { useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
-import { Banknote, CalendarDays, CheckCircle, ChevronLeft, ChevronRight, CircleDollarSign, Download, Eye, FileSpreadsheet, Home, Landmark, Loader2, Lock, Maximize2, Minimize2, Plus, Printer, Redo2, Save, Undo2, UsersRound, Wallet } from 'lucide-react';
+import { AlertCircle, Banknote, CalendarDays, CheckCircle, ChevronLeft, ChevronRight, CircleDollarSign, Download, Eye, FileSpreadsheet, Home, Landmark, Loader2, Lock, Maximize2, Minimize2, Plus, Printer, Redo2, RefreshCw, Save, Undo2, UsersRound, Wallet, X } from 'lucide-react';
 import * as XLSX from 'xlsx';
 import {
   AmlakSheetKind,
@@ -25,6 +25,7 @@ import {
   getCustomExpenseCategories,
   getCustomIncomeCategories,
   getTransactions,
+  listenTransactions,
   getUsers,
   getUsersAcrossBooks,
   getVendors,
@@ -2207,10 +2208,58 @@ function importTransactionIntoSheet(sheet: AmlakWorksheet, tx: Transaction, kind
   return setImportedRowMeta(next, row, tx);
 }
 
-function syncExistingTransactionsIntoWorkbook(workbook: AmlakWorkbook, building: Building, transactions: Transaction[], accountBuildings: Building[]): AmlakWorkbook {
+export interface AmlakSyncLogEntry {
+  txId: string;
+  txDate: string;
+  txType: string;
+  txAmount: number;
+  result: 'imported' | 'updated' | 'skipped' | 'stale-cleared';
+  skipReason?: string;
+  targetKinds?: AmlakSheetKind[];
+}
+
+function syncExistingTransactionsIntoWorkbook(
+  workbook: AmlakWorkbook,
+  building: Building,
+  transactions: Transaction[],
+  accountBuildings: Building[],
+  syncLog?: AmlakSyncLogEntry[],
+): AmlakWorkbook {
   const today = dateToLocalStr(new Date());
   let changed = false;
   const sheets = workbook.sheets.map(sheet => ({ ...sheet }));
+
+  const logEntry = (entry: AmlakSyncLogEntry) => {
+    if (syncLog) syncLog.push(entry);
+    if (entry.result === 'skipped') {
+      console.log(`[AmlakSync] SKIPPED tx ${entry.txId} (${entry.txDate}, ${entry.txType}, ${entry.txAmount}): ${entry.skipReason}`);
+    } else if (entry.result === 'imported') {
+      console.log(`[AmlakSync] IMPORTED tx ${entry.txId} (${entry.txDate}) → ${entry.targetKinds?.join(', ')}`);
+    } else if (entry.result === 'updated') {
+      console.log(`[AmlakSync] UPDATED tx ${entry.txId} (${entry.txDate}) → ${entry.targetKinds?.join(', ')}`);
+    } else if (entry.result === 'stale-cleared') {
+      console.log(`[AmlakSync] STALE-CLEARED tx ${entry.txId} from sheet`);
+    }
+  };
+
+  const skippedByFilter = transactions.filter((tx: any) =>
+    tx.deleted || tx.status === 'REJECTED' || !itemMatchesSelectedBuilding(tx, building) || (tx.date && tx.date > today)
+  );
+  skippedByFilter.forEach((tx: any) => {
+    const reason = tx.deleted ? 'deleted' :
+      tx.status === 'REJECTED' ? 'rejected' :
+      !itemMatchesSelectedBuilding(tx, building) ? 'not matching building' :
+      `future date (${tx.date})`;
+    logEntry({
+      txId: tx.id || '?',
+      txDate: tx.date || '',
+      txType: tx.type || '',
+      txAmount: Number(tx.amount) || 0,
+      result: 'skipped',
+      skipReason: reason,
+    });
+  });
+
   const activeTransactions = transactions
     .filter((tx: any) => !tx.deleted && tx.status !== 'REJECTED' && itemMatchesSelectedBuilding(tx, building) && (!tx.date || tx.date <= today));
   const activeTransactionIds = new Set(
@@ -2230,6 +2279,7 @@ function syncExistingTransactionsIntoWorkbook(workbook: AmlakWorkbook, building:
       const activeKinds = activeTransactionKindsById.get(meta.postedTransactionId);
       if (!activeTransactionIds.has(meta.postedTransactionId) || (activeKinds && !activeKinds.includes(kind))) {
         next = clearStalePostedTransactionRow(next, kind, Number(rowKey));
+        logEntry({ txId: meta.postedTransactionId, txDate: '', txType: '', txAmount: 0, result: 'stale-cleared' });
       }
     });
     if (next !== sheet) {
@@ -2240,14 +2290,45 @@ function syncExistingTransactionsIntoWorkbook(workbook: AmlakWorkbook, building:
 
   activeTransactions
     .forEach(tx => {
-      transactionSheetKinds(tx, building).forEach(kind => {
+      const kinds = transactionSheetKinds(tx, building);
+      if (!kinds.length) {
+        logEntry({
+          txId: tx.id || '?',
+          txDate: tx.date || '',
+          txType: tx.type || '',
+          txAmount: Number(tx.amount) || 0,
+          result: 'skipped',
+          skipReason: `no sheet kind matched (type=${tx.type}, incomeSubType=${(tx as any).incomeSubType}, expenseCategory=${tx.expenseCategory})`,
+        });
+        return;
+      }
+      kinds.forEach(kind => {
         const index = sheets.findIndex(sheet => (sheet.sheetKind === 'income' ? 'rentalIncome' : sheet.sheetKind) === kind);
-        if (index < 0) return;
+        if (index < 0) {
+          logEntry({
+            txId: tx.id || '?',
+            txDate: tx.date || '',
+            txType: tx.type || '',
+            txAmount: Number(tx.amount) || 0,
+            result: 'skipped',
+            skipReason: `sheet kind '${kind}' not found in workbook`,
+          });
+          return;
+        }
         const before = sheets[index];
+        const wasAlreadyImported = !!Object.values(before.rowsMeta || {}).find((m: any) => m?.postedTransactionId === tx.id);
         const after = importTransactionIntoSheet(before, tx, kind, accountBuildings);
         if (after !== before) {
           sheets[index] = after;
           changed = true;
+          logEntry({
+            txId: tx.id || '?',
+            txDate: tx.date || '',
+            txType: tx.type || '',
+            txAmount: Number(tx.amount) || 0,
+            result: wasAlreadyImported ? 'updated' : 'imported',
+            targetKinds: [kind],
+          });
         }
       });
     });
@@ -2312,6 +2393,9 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
   const [gridScrollEdges, setGridScrollEdges] = useState({ canLeft: false, canRight: false });
   const [installPrompt, setInstallPrompt] = useState<BeforeInstallPromptEvent | null>(null);
   const [isInstalledApp, setIsInstalledApp] = useState(() => isAmlakSheetsInstalledMode());
+  const [syncLogEntries, setSyncLogEntries] = useState<AmlakSyncLogEntry[]>([]);
+  const [syncLogOpen, setSyncLogOpen] = useState(false);
+  const [resyncing, setResyncing] = useState(false);
   const autosaveTimer = useRef<number | null>(null);
   const autosaveInFlight = useRef(false);
   const autosaveQueued = useRef(false);
@@ -2744,14 +2828,28 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
       }
     }
 
-    const imported = syncExistingTransactionsIntoWorkbook(nextWorkbook, selectedBuilding, selectedBuildingTransactions, treasuryBuildings);
+    const log: AmlakSyncLogEntry[] = [];
+    const imported = syncExistingTransactionsIntoWorkbook(nextWorkbook, selectedBuilding, selectedBuildingTransactions, treasuryBuildings, log);
     if (imported !== nextWorkbook) {
       nextWorkbook = imported;
       changed = true;
     }
+    if (log.length > 0) {
+      setSyncLogEntries(prev => {
+        const merged = [...log, ...prev].slice(0, 500);
+        return merged;
+      });
+    }
 
     if (changed) updateWorkbook(nextWorkbook);
   }, [selectedBuilding?.id, activeWorkbook?.id, activeMonth, currentUser, selectedBuildingAllContracts, selectedBuildingTransactions, treasuryBuildings, customers]);
+
+  useEffect(() => {
+    const unsub = listenTransactions((incoming) => {
+      setTransactions(incoming || []);
+    });
+    return () => unsub?.();
+  }, [activeBookId]);
 
   useEffect(() => {
     if (!selectedBuilding || !activeWorkbook) return;
@@ -2991,6 +3089,34 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
         }
       }
       if (!silent) setSaving(false);
+    }
+  };
+
+  const handleResyncTransactions = async () => {
+    if (!selectedBuilding || !activeWorkbook) return;
+    setResyncing(true);
+    setSyncLogEntries([]);
+    try {
+      const freshTransactions = await getTransactions();
+      setTransactions(freshTransactions || []);
+      const log: AmlakSyncLogEntry[] = [];
+      const buildingTxs = (freshTransactions || []).filter((tx: any) => itemMatchesSelectedBuilding(tx, selectedBuilding));
+      const synced = syncExistingTransactionsIntoWorkbook(activeWorkbook, selectedBuilding, buildingTxs, treasuryBuildings, log);
+      setSyncLogEntries(log);
+      setSyncLogOpen(true);
+      const imported = log.filter(e => e.result === 'imported').length;
+      const updated = log.filter(e => e.result === 'updated').length;
+      const skipped = log.filter(e => e.result === 'skipped').length;
+      if (synced !== activeWorkbook) {
+        updateWorkbook(synced);
+        showSuccess(`Re-sync complete: ${imported} imported, ${updated} updated, ${skipped} skipped`);
+      } else {
+        showInfo(`Re-sync complete: all ${buildingTxs.length} transactions already in sync (${skipped} skipped)`);
+      }
+    } catch (err: any) {
+      showError(err?.message || 'Re-sync failed');
+    } finally {
+      setResyncing(false);
     }
   };
 
@@ -4408,6 +4534,27 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
             <button onClick={() => void saveWorkbook(false)} disabled={saving} className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-emerald-600 to-green-600 text-white px-3 sm:px-4 py-2.5 text-sm font-black shadow-lg shadow-emerald-100 disabled:opacity-60 active:scale-[0.98]">
               <Save size={16} /> {saving ? 'Saving...' : dirty ? 'Save draft' : 'Saved'}
             </button>
+            <button
+              type="button"
+              onClick={() => void handleResyncTransactions()}
+              disabled={resyncing || !selectedBuilding || !activeWorkbook}
+              title="Re-import all transactions from Transaction History into this sheet"
+              className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl border border-sky-200 bg-sky-50 px-3 sm:px-4 py-2.5 text-sm font-black text-sky-700 shadow-sm disabled:opacity-60 active:scale-[0.98]"
+            >
+              {resyncing ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+              {resyncing ? 'Syncing...' : 'Re-sync'}
+            </button>
+            {syncLogEntries.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setSyncLogOpen(v => !v)}
+                className="inline-flex min-h-[44px] items-center justify-center gap-2 rounded-2xl border border-amber-200 bg-amber-50 px-3 sm:px-4 py-2.5 text-sm font-black text-amber-700 shadow-sm active:scale-[0.98]"
+                title="View sync log"
+              >
+                <AlertCircle size={16} />
+                Log ({syncLogEntries.filter(e => e.result === 'skipped').length} skipped)
+              </button>
+            )}
             <div className="col-span-2 sm:col-span-1 inline-flex min-h-[44px] overflow-hidden rounded-2xl border border-emerald-200 bg-white shadow-sm">
               <select
                 value={addRowsCount}
@@ -4874,6 +5021,67 @@ const AmlakSheets: React.FC<Props> = ({ currentUser }) => {
             <CircleDollarSign size={18} /> Post selected
           </button>
         </footer>
+      )}
+
+      {syncLogOpen && syncLogEntries.length > 0 && (
+        <div className="fixed inset-0 z-[100] flex items-end sm:items-center justify-center p-3 sm:p-6 bg-black/40 backdrop-blur-sm" onClick={() => setSyncLogOpen(false)}>
+          <div className="relative w-full max-w-2xl max-h-[85vh] flex flex-col rounded-3xl border border-slate-200 bg-white shadow-2xl shadow-slate-400/30" onClick={e => e.stopPropagation()}>
+            <div className="flex items-center justify-between gap-3 px-5 py-4 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-sky-50 text-sky-700 grid place-items-center shrink-0">
+                  <RefreshCw size={18} />
+                </div>
+                <div>
+                  <div className="text-base font-black text-slate-900">Transaction Sync Log</div>
+                  <div className="text-xs font-bold text-slate-500">
+                    {syncLogEntries.filter(e => e.result === 'imported').length} imported · {syncLogEntries.filter(e => e.result === 'updated').length} updated · {syncLogEntries.filter(e => e.result === 'skipped').length} skipped · {syncLogEntries.filter(e => e.result === 'stale-cleared').length} stale cleared
+                  </div>
+                </div>
+              </div>
+              <button type="button" onClick={() => setSyncLogOpen(false)} className="w-8 h-8 rounded-xl border border-slate-200 bg-slate-50 grid place-items-center text-slate-500 hover:bg-slate-100">
+                <X size={16} />
+              </button>
+            </div>
+            <div className="flex gap-2 px-5 py-3 border-b border-slate-100 overflow-x-auto">
+              {(['imported', 'updated', 'skipped', 'stale-cleared'] as const).map(result => {
+                const count = syncLogEntries.filter(e => e.result === result).length;
+                if (!count) return null;
+                const color = result === 'imported' ? 'emerald' : result === 'updated' ? 'sky' : result === 'skipped' ? 'amber' : 'slate';
+                return (
+                  <span key={result} className={`shrink-0 inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-black bg-${color}-50 text-${color}-700 border border-${color}-100`}>
+                    {result === 'imported' && <CheckCircle size={12} />}
+                    {result === 'skipped' && <AlertCircle size={12} />}
+                    {count} {result}
+                  </span>
+                );
+              })}
+            </div>
+            <div className="overflow-y-auto flex-1 px-4 py-3 space-y-1.5">
+              {syncLogEntries.map((entry, i) => (
+                <div key={i} className={`rounded-xl border px-3 py-2 text-xs font-bold ${
+                  entry.result === 'imported' ? 'border-emerald-100 bg-emerald-50 text-emerald-900' :
+                  entry.result === 'updated' ? 'border-sky-100 bg-sky-50 text-sky-900' :
+                  entry.result === 'skipped' ? 'border-amber-100 bg-amber-50 text-amber-900' :
+                  'border-slate-100 bg-slate-50 text-slate-700'
+                }`}>
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <span className="font-black uppercase tracking-wide text-[10px]">{entry.result}</span>
+                    {entry.txDate && <span className="text-slate-500">{entry.txDate}</span>}
+                    {entry.txType && <span className="opacity-70">{entry.txType}</span>}
+                    {entry.txAmount > 0 && <span className="tabular-nums">{entry.txAmount.toLocaleString()}</span>}
+                  </div>
+                  {entry.targetKinds && <div className="mt-0.5 text-emerald-700">→ {entry.targetKinds.join(', ')}</div>}
+                  {entry.skipReason && <div className="mt-0.5 text-amber-700">Reason: {entry.skipReason}</div>}
+                  <div className="mt-0.5 text-[10px] text-slate-400 truncate">ID: {entry.txId}</div>
+                </div>
+              ))}
+            </div>
+            <div className="px-5 py-4 border-t border-slate-100 flex justify-between items-center gap-3">
+              <button type="button" onClick={() => setSyncLogEntries([])} className="text-xs font-black text-slate-500 hover:text-rose-600">Clear log</button>
+              <button type="button" onClick={() => setSyncLogOpen(false)} className="inline-flex items-center gap-2 rounded-2xl bg-slate-900 text-white px-4 py-2.5 text-sm font-black">Close</button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   );

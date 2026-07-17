@@ -1,6 +1,6 @@
 import React from 'react';
 import { NavLink } from 'react-router-dom';
-import { LayoutDashboard, PlusCircle, History, Briefcase, FileSignature, Users } from 'lucide-react';
+import { LayoutDashboard, PlusCircle, History, Briefcase, FileSignature, Users, Phone } from 'lucide-react';
 import SoundService from '../services/soundService';
 import HapticService from '../services/hapticService';
 import { User, UserRole } from '../types';
@@ -28,10 +28,10 @@ const BottomNav: React.FC<BottomNavProps> = ({ user }) => {
       ]
     : [
         { to: '/', icon: LayoutDashboard, label: t('nav.home') },
-        { to: '/history', icon: History, label: t('nav.history') },
+        { to: '/calls', icon: Phone, label: t('nav.calls') },
         { to: '/entry', icon: PlusCircle, label: t('nav.entry'), primary: true },
         { to: '/contracts', icon: FileSignature, label: t('nav.contracts') },
-        { to: '/customers', icon: Users, label: t('nav.customers') },
+        { to: '/history', icon: History, label: t('nav.history') },
       ];
 
   return (

@@ -23,7 +23,7 @@ import { Transaction, User, UserRole, TransactionType, TransactionStatus, Expens
 import { Filter, Download, Search, AlertOctagon, ChevronDown, AlertTriangle, Trash2, Printer, MessageCircle, Home, X, CheckCircle, Calendar, RefreshCcw, SlidersHorizontal, FileText, RotateCcw, Pencil, PenLine, Building2, Check, Copy } from 'lucide-react';
 import SavedFilters from './SavedFilters';
 import { Bank } from '../types';
-import { useNavigate, useLocation } from 'react-router-dom';
+import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
@@ -77,6 +77,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const historyShellRef = useRef<HTMLDivElement | null>(null);
     const lastHapticAtRef = useRef(0);
     const location = useLocation();
+    const [searchParams, setSearchParams] = useSearchParams();
+    const openedTxIdRef = useRef<string | null>(null);
     const { showSuccess, showInfo, showError, showToast } = useToast();
     const { t, language } = useLanguage();
     const isPostedFromAmlakSheets = (tx: Transaction | any) =>
@@ -431,53 +433,87 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
     // Load Data
     const loadData = async () => {
-        // Self-heal: make sure every inter-building transfer has BOTH source and
-        // destination transaction records in Firestore before we read them below.
-        // Admins & Managers only — staff users shouldn't trigger schema writes.
-        if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) {
-            try { await backfillInterBuildingTransactions(); } catch { /* non-fatal */ }
+        // Self-heal Firestore books only — skip on Mac Mini backend (backfill uses Firestore and can hang).
+        if (
+            (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) &&
+            (import.meta as any).env?.VITE_DATA_BACKEND !== 'mac'
+        ) {
+            try {
+                await Promise.race([
+                    backfillInterBuildingTransactions(),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error('backfill timeout')), 8000)),
+                ]);
+            } catch { /* non-fatal */ }
         }
 
         const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
-        let txs = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds, includeDeleted: true });
+        let txs: any[] = [];
+        try {
+            txs = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds, includeDeleted: true });
+        } catch (e) {
+            console.error('History getTransactions failed', e);
+            txs = [];
+        }
 
         // Fallback: if scoped fetch is empty (e.g. no building assignment), load broader data
         // and safely narrow for non-admin users so History doesn't appear blank.
         if ((!txs || txs.length === 0)) {
-            // Force broad fetch for fallback; we'll apply safe client-side filtering below.
-            const allTxs = await getTransactions({ role: UserRole.ADMIN as any, includeDeleted: true });
-            if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) {
-                txs = allTxs;
-            } else {
-                txs = (allTxs || []).filter((t: any) => t.createdBy === currentUser.id);
+            try {
+                const allTxs = await getTransactions({ role: UserRole.ADMIN as any, includeDeleted: true });
+                if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) {
+                    txs = allTxs;
+                } else {
+                    txs = (allTxs || []).filter((t: any) => t.createdBy === currentUser.id);
+                }
+            } catch (e) {
+                console.error('History fallback getTransactions failed', e);
             }
         }
 
-        const [allBuildings, allCustomers, allBanks, appSettings, allUsers, allTransfers, allVendors, allContracts] = await Promise.all([
-            getBuildings(),
-            getCustomers(),
-            getBanks(),
-            getSettings().catch(() => null),
-            getUsers(),
-            getTransfers({}),
-            getVendors(),
-            getContracts({ includeDeleted: true }).catch(() => [] as Contract[]),
-        ]);
-        // IMPORTANT: VAT purchase/import entries (`vatReportOnly`) must still appear in History.
-        // The VAT Report tab can provide specialized views/filters, but History is the full ledger.
+        // Show ledger as soon as transactions arrive — don't wait on secondary collections.
         setTransactions(txs || []);
-        setContracts((allContracts as Contract[]) || []);
-        setBuildings(allBuildings || []);
-        setCustomers(allCustomers || []);
-        setBanks(allBanks || []);
-        setVendors(allVendors || []);
-        setTransfers(allTransfers || []);
-        setOpeningBalancesByBuilding(((appSettings as any)?.openingBalancesByBuilding || {}) as Record<string, { cash: number; bank: number; date?: string }>);
-        setStaff((allUsers || []).filter((u: any) => u.role === 'STAFF' || u.role === 'EMPLOYEE'));
-        setOwners((allUsers || []).filter((u: any) => u.role === 'OWNER'));
+
+        try {
+            const [allBuildings, allCustomers, allBanks, appSettings, allUsers, allTransfers, allVendors, allContracts] = await Promise.all([
+                getBuildings().catch(() => []),
+                getCustomers().catch(() => []),
+                getBanks().catch(() => []),
+                getSettings().catch(() => null),
+                getUsers().catch(() => []),
+                getTransfers({}).catch(() => []),
+                getVendors().catch(() => []),
+                getContracts({ includeDeleted: true }).catch(() => [] as Contract[]),
+            ]);
+            setContracts((allContracts as Contract[]) || []);
+            setBuildings(allBuildings || []);
+            setCustomers(allCustomers || []);
+            setBanks(allBanks || []);
+            setVendors(allVendors || []);
+            setTransfers(allTransfers || []);
+            setOpeningBalancesByBuilding(((appSettings as any)?.openingBalancesByBuilding || {}) as Record<string, { cash: number; bank: number; date?: string }>);
+            setStaff((allUsers || []).filter((u: any) => u.role === 'STAFF' || u.role === 'EMPLOYEE'));
+            setOwners((allUsers || []).filter((u: any) => u.role === 'OWNER'));
+        } catch (e) {
+            console.error('History secondary load failed', e);
+        }
     };
 
     useEffect(() => { loadData(); }, []);
+
+    // Open linked transaction detail when arriving via ?txId= (e.g. from Record Payment coverage links)
+    useEffect(() => {
+        const txId = searchParams.get('txId');
+        if (!txId || transactions.length === 0) return;
+        if (openedTxIdRef.current === txId && showViewModal) return;
+        const tx = transactions.find((t) => t.id === txId);
+        if (!tx) return;
+        openedTxIdRef.current = txId;
+        openView(tx);
+        // Clear query so refresh/back doesn't keep re-opening; keep history path clean
+        const next = new URLSearchParams(searchParams);
+        next.delete('txId');
+        setSearchParams(next, { replace: true });
+    }, [searchParams, transactions, showViewModal, setSearchParams]);
 
     // Tablet/mobile touch polish: haptic on interactive taps with event delegation.
     useEffect(() => {
@@ -740,8 +776,15 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             if (!Number.isNaN(n)) {
                 const base = Number(tx.amount || 0);
                 const vat = Number(tx.vatAmount || 0);
-                // Old data guard: some rows stored "amountIncludingVAT" but it equals the exclusive/base.
-                if (tx.type === TransactionType.EXPENSE && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
+                // Old data guard: some expense rows stored amountIncludingVAT equal to the exclusive
+                // base. Newer rows store `amount` as inclusive (same as amountIncludingVAT) — do NOT
+                // add VAT again (that wrongly turns 517.5 into 585 = 517.5 + 67.5).
+                if (tx.type === TransactionType.EXPENSE && vat > 0 && base > 0 && n > 0 && Math.abs(n - base) <= 0.01) {
+                    const excl = Number((tx as any).amountExcludingVAT);
+                    const amountLooksInclusive =
+                        Number.isFinite(excl) && excl > 0 && Math.abs(excl - base) > 0.5;
+                    if (!amountLooksInclusive) return base + vat;
+                }
                 return n;
             }
         }
@@ -749,7 +792,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
         // and some rows may be missing `isVATApplicable` even though VAT was entered.
         if (tx.type === TransactionType.EXPENSE && Number(tx.vatAmount || 0) > 0) {
-            return base + Number(tx.vatAmount || 0);
+            const excl = Number((tx as any).amountExcludingVAT);
+            // If amount already matches excl+vat (or differs from excl), treat amount as inclusive.
+            const vat = Number(tx.vatAmount || 0);
+            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - excl) > 0.5) return base;
+            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - (excl + vat)) <= 0.05) return base;
+            return base + vat;
         }
         return base;
     };

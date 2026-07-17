@@ -2,7 +2,7 @@
 // Handles: caching, offline support, background sync, AND Firebase Cloud Messaging
 
 // ─── Cache Configuration ───
-const CACHE_VERSION = 'v4';
+const CACHE_VERSION = 'v5';
 const STATIC_CACHE  = `amlak-static-${CACHE_VERSION}`;
 const DYNAMIC_CACHE = `amlak-dynamic-${CACHE_VERSION}`;
 const CDN_CACHE     = `amlak-cdn-${CACHE_VERSION}`;
@@ -69,6 +69,22 @@ try {
   messaging.onBackgroundMessage((payload) => {
     console.log('[SW] Background message received:', payload);
     const data = payload.data || {};
+
+    if (data.type === 'incoming-call' && data.sessionId) {
+      let session = null;
+      try {
+        session = data.sessionJson ? JSON.parse(data.sessionJson) : null;
+      } catch {
+        session = null;
+      }
+      return startIncomingCallRing(session || {
+        id: data.sessionId,
+        callerId: data.callerId,
+        callerName: data.callerName || 'Someone',
+        callType: data.callType || 'audio',
+      });
+    }
+
     const title = payload.notification?.title || data.title || '📬 Approval Required';
     const body = payload.notification?.body || data.body || 'A staff member needs your approval';
     const typeMeta = TYPE_META[data.type] || { emoji: '📋', label: data.type || 'Request', urgency: 'normal' };
@@ -482,6 +498,34 @@ self.addEventListener('notificationclick', (event) => {
 
   notification.close();
 
+  // Incoming call — Answer / Decline / tap to open
+  if (data.type === 'incoming-call' && data.sessionId) {
+    const ringUrl = data.url || `/#/calls?ring=${encodeURIComponent(data.sessionId)}`;
+    const actionSuffix = action === 'answer' ? '&action=answer' : action === 'decline' ? '&action=decline' : '';
+    const targetUrl = ringUrl.includes('?') ? `${ringUrl}${actionSuffix}` : `${ringUrl}?action=${action || 'open'}`;
+
+    stopIncomingCallRing(data.sessionId);
+
+    event.waitUntil(
+      clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
+        for (const client of windowClients) {
+          if (client.url.includes(self.location.origin)) {
+            client.focus();
+            client.postMessage({
+              type: action === 'answer' ? 'ANSWER_CALL' : action === 'decline' ? 'DECLINE_CALL' : 'INCOMING_CALL',
+              sessionId: data.sessionId,
+              sessionJson: data.sessionJson,
+              action,
+            });
+            return;
+          }
+        }
+        return clients.openWindow(self.location.origin + '/' + targetUrl.replace(/^\//, ''));
+      })
+    );
+    return;
+  }
+
   // If an action button was clicked AND we have an approvalId, handle directly without opening app
   if (action && data.approvalId && (action === 'approve' || action === 'reject')) {
     event.waitUntil(
@@ -537,9 +581,99 @@ self.addEventListener('notificationclick', (event) => {
   );
 });
 
-// ─── Message handler for FCM ───
+// ─── Mac Mini incoming call background watch ───
+let callWatchConfig = null;
+let callWatchTimer = null;
+const seenCallRings = new Set();
+let activeCallRing = null;
+
+function stopIncomingCallRing(sessionId) {
+  if (activeCallRing && (!sessionId || activeCallRing.sessionId === sessionId)) {
+    clearInterval(activeCallRing.timer);
+    activeCallRing = null;
+  }
+}
+
+async function showIncomingCallNotification(session) {
+  if (!session?.id) return;
+  const callType = session.callType === 'video' ? 'Video' : 'Voice';
+  const callerName = session.callerName || 'Someone';
+  const sessionJson = JSON.stringify(session);
+  await self.registration.showNotification(`📞 ${callerName}`, {
+    body: `Incoming ${callType} call — tap to answer`,
+    icon: '/images/logo-192.png',
+    badge: '/images/logo-192.png',
+    tag: `incoming-call-${session.id}`,
+    renotify: true,
+    vibrate: [400, 200, 400, 200, 400, 200, 400, 200, 400],
+    requireInteraction: true,
+    silent: false,
+    data: {
+      type: 'incoming-call',
+      sessionId: session.id,
+      callerId: session.callerId || '',
+      callerName,
+      callType: session.callType || 'audio',
+      sessionJson,
+      url: `/#/calls?ring=${encodeURIComponent(session.id)}`,
+    },
+    actions: [
+      { action: 'answer', title: '📞 Answer' },
+      { action: 'decline', title: '❌ Decline' },
+    ],
+  });
+}
+
+function startIncomingCallRing(session) {
+  if (!session?.id) return Promise.resolve();
+  stopIncomingCallRing(session.id);
+  seenCallRings.add(session.id);
+  showIncomingCallNotification(session);
+  activeCallRing = {
+    sessionId: session.id,
+    timer: setInterval(() => showIncomingCallNotification(session), 4000),
+  };
+  // Auto-stop ring after 45s (matches call timeout)
+  setTimeout(() => stopIncomingCallRing(session.id), 45000);
+  return Promise.resolve();
+}
+
 self.addEventListener('message', (event) => {
-  if (event.data && event.data.type === 'SKIP_WAITING') {
+  if (event.data?.type === 'SKIP_WAITING') {
     self.skipWaiting();
+    return;
+  }
+  if (event.data?.type === 'STOP_CALL_RING') {
+    stopIncomingCallRing(event.data.sessionId);
+    return;
+  }
+  if (event.data?.type === 'AMLAK_CALL_WATCH') {
+    callWatchConfig = {
+      userId: event.data.userId,
+      apiBase: event.data.apiBase || self.location.origin,
+      token: event.data.token || '',
+    };
+    if (callWatchTimer) clearInterval(callWatchTimer);
+    callWatchTimer = setInterval(pollIncomingCalls, 4000);
+    pollIncomingCalls();
   }
 });
+
+async function pollIncomingCalls() {
+  if (!callWatchConfig?.userId) return;
+  try {
+    const url = `${callWatchConfig.apiBase}/api/calls/pending?userId=${encodeURIComponent(callWatchConfig.userId)}`;
+    const headers = callWatchConfig.token ? { Authorization: `Bearer ${callWatchConfig.token}` } : {};
+    const res = await fetch(url, { headers });
+    if (!res.ok) return;
+    const data = await res.json();
+    const rings = data.rings || [];
+    for (const ring of rings) {
+      const session = ring.session;
+      if (!session?.id || seenCallRings.has(session.id)) continue;
+      await startIncomingCallRing(session);
+    }
+  } catch (e) {
+    // ignore network errors in SW
+  }
+}
