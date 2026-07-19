@@ -24,6 +24,100 @@ export const isLedgerOpeningBalanceRow = (r: Transaction): boolean =>
   (r as any).isOwnerOpeningBalance === true ||
   r.expenseCategory === 'Owner Opening Balance';
 
+export const NO_SOURCE_BUILDING_FILTER = '__NO_SOURCE_BUILDING__';
+
+type BuildingLike = { id: string; name?: string; _id?: string } & Record<string, any>;
+
+const buildingNameFor = (buildings: BuildingLike[], id?: string): string => {
+  if (!id) return '';
+  if (id.includes(',')) return '';
+  const b = buildings.find((x) => x.id === id || (x as any)._id === id);
+  return b ? (b as any).name || '' : '';
+};
+
+const transactionHasNoSourceBuilding = (tx: Transaction): boolean => {
+  const explicitBuilding = [
+    tx.buildingId,
+    (tx as any).building,
+    (tx as any).building_id,
+    (tx as any).targetBuildingId,
+  ].some((v) => String(v || '').trim());
+  if (explicitBuilding) return false;
+  if ((tx as any).source === 'treasury') return false;
+  const fromType = String((tx as any).fromType || '').toUpperCase();
+  const toType = String((tx as any).toType || '').toUpperCase();
+  return fromType !== 'BUILDING' && toType !== 'BUILDING';
+};
+
+/**
+ * Building matcher shared by Dashboard and History so both scope ledger rows identically.
+ * Mirrors History's matchTransactionBuilding (treasury rows match strictly by own buildingId,
+ * with raw/composite id tolerance).
+ */
+export const makeBuildingMatcher = (buildings: BuildingLike[]) => {
+  return (tx: Transaction, buildingId: string): boolean => {
+    if (buildingId === NO_SOURCE_BUILDING_FILTER) return transactionHasNoSourceBuilding(tx);
+    const targetId = normalize(buildingId);
+    const targetRaw = normalize(rawBuildingId(buildingId));
+    const targetName = normalize(buildingNameFor(buildings, buildingId));
+    if (!targetId) return false;
+
+    if ((tx as any).source === 'treasury') {
+      if (!tx.buildingId) return false;
+      const txB = normalize(String(tx.buildingId));
+      const txRaw = normalize(rawBuildingId(String(tx.buildingId)));
+      return txB === targetId || txRaw === targetId || txRaw === targetRaw;
+    }
+
+    const rawIds = [
+      tx.buildingId,
+      (tx as any).building,
+      (tx as any).building_id,
+      (tx as any).targetBuildingId,
+      (tx as any).fromId,
+      (tx as any).toId,
+    ]
+      .flatMap((v) => String(v || '').split(','))
+      .map((v) => normalize(v))
+      .filter(Boolean);
+    if (rawIds.includes(targetId)) return true;
+    if (targetRaw && rawIds.map((v) => normalize(rawBuildingId(v))).includes(targetRaw)) return true;
+
+    const rawNames = [
+      tx.buildingName,
+      typeof (tx as any).building === 'string' ? (tx as any).building : '',
+      (tx as any).building_name,
+    ]
+      .flatMap((v) => String(v || '').split(','))
+      .map((v) => normalize(v))
+      .filter(Boolean);
+    if (targetName && rawNames.includes(targetName)) return true;
+    return false;
+  };
+};
+
+/**
+ * Building-scope ledger rows the same way on Dashboard and History.
+ * Owner expenses are matched strictly by their own source buildingId.
+ */
+export const filterLedgerByBuildings = (
+  rows: Transaction[],
+  buildingIds: string[],
+  buildings: BuildingLike[],
+): Transaction[] => {
+  if (!buildingIds || buildingIds.length === 0) return rows;
+  const match = makeBuildingMatcher(buildings);
+  return rows.filter((t) => {
+    const ownerCat = (t.expenseCategory || '').trim();
+    if (ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal') {
+      const bId = String((t as any).buildingId || '');
+      if (!bId) return buildingIds.includes(NO_SOURCE_BUILDING_FILTER);
+      return buildingIds.includes(bId) || buildingIds.includes(rawBuildingId(bId));
+    }
+    return buildingIds.some((id) => match(t, id));
+  });
+};
+
 /**
  * Inject Building↔Owner and missing same-book inter-building legs, then dedupe
  * duplicate (transferId, building, type) rows. Used by Dashboard and History.

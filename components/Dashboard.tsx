@@ -82,7 +82,7 @@ import {
   computeLedgerSummary,
   enrichLedgerTransactions,
   filterApprovedLedgerTransactions,
-  rawBuildingId,
+  filterLedgerByBuildings,
 } from '../utils/ledgerSummary';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
@@ -454,68 +454,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
   );
 
   const filteredApproved = useMemo(
-    () => {
-      if (selectedBuildingIds.length === 0) {
-        return approved;
-      }
-
-      const normalize = (v?: string) => String(v || '').trim().toLowerCase();
-      const getBuildingName = (id?: string) => {
-        if (!id) return '';
-        if (id.includes(',')) return '';
-        const b = allBuildings.find(x => x.id === id || (x as any)._id === id);
-        return b ? (b as any).name || '' : '';
-      };
-      const matchTransactionBuilding = (tx: Transaction, buildingId: string) => {
-        const targetId = normalize(buildingId);
-        const targetRaw = normalize(rawBuildingId(buildingId));
-        const targetName = normalize(getBuildingName(buildingId));
-        if (!targetId) return false;
-
-        // Same rule as History.tsx: for treasury-sourced rows, match STRICTLY by tx.buildingId
-        if ((tx as any).source === 'treasury') {
-          if (!tx.buildingId) return false;
-          const txB = normalize(String(tx.buildingId));
-          const txRaw = normalize(rawBuildingId(String(tx.buildingId)));
-          return txB === targetId || txRaw === targetId || txRaw === targetRaw;
-        }
-
-        const rawIds = [
-          (tx as any).buildingId,
-          (tx as any).building,
-          (tx as any).building_id,
-          (tx as any).targetBuildingId,
-          (tx as any).fromId,
-          (tx as any).toId,
-        ]
-          .flatMap(v => String(v || '').split(','))
-          .map(v => normalize(v))
-          .filter(Boolean);
-        if (rawIds.includes(targetId) || rawIds.map(rawBuildingId).map(normalize).includes(targetRaw)) return true;
-
-        const rawNames = [
-          (tx as any).buildingName,
-          typeof (tx as any).building === 'string' ? (tx as any).building : '',
-          (tx as any).building_name,
-        ]
-          .flatMap(v => String(v || '').split(','))
-          .map(v => normalize(v))
-          .filter(Boolean);
-        if (targetName && rawNames.includes(targetName)) return true;
-        return false;
-      };
-
-      // Match History summary: owner expenses only for their exact source buildingId.
-      return approved.filter(t => {
-        const ownerCat = (t.expenseCategory || '').trim();
-        if (ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal') {
-          const bId = String((t as any).buildingId || '');
-          if (!bId) return false;
-          return selectedBuildingIds.includes(bId) || selectedBuildingIds.includes(rawBuildingId(bId));
-        }
-        return selectedBuildingIds.some(id => matchTransactionBuilding(t, id));
-      });
-    },
+    () => filterLedgerByBuildings(approved, selectedBuildingIds, allBuildings as any),
     [approved, selectedBuildingIds, allBuildings]
   );
 

@@ -36,6 +36,7 @@ import {
   computeLedgerSummary,
   enrichLedgerTransactions,
   filterApprovedLedgerTransactions,
+  filterLedgerByBuildings,
   isLedgerOpeningBalanceRow,
 } from '../utils/ledgerSummary';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
@@ -2327,19 +2328,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             enrichLedgerTransactions(transactions, transfers),
         );
 
-        // Apply building filter if set
-        // Owner expenses: only include for their specific source building
-        const buildingFiltered = filterBuildingIds.length > 0 
-            ? approved.filter(t => {
-                const ownerCat = (t.expenseCategory || '').trim();
-                if (ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal') {
-                  const bId = String((t as any).buildingId || '');
-                  if (!bId) return filterBuildingIds.includes(NO_SOURCE_BUILDING_FILTER);
-                  return filterBuildingIds.includes(bId);
-                }
-                return filterBuildingIds.some(id => matchTransactionBuilding(t, id));
-              })
-            : approved;
+        // Apply building filter if set (shared with Dashboard for identical scoping)
+        const buildingFiltered = filterLedgerByBuildings(approved, filterBuildingIds, buildings as any);
 
         const ledger = computeLedgerSummary({
             ledgerRows: buildingFiltered,
@@ -2357,10 +2347,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         const periodTxns = hasDateFilter
             ? buildingFiltered.filter(t => t.date && t.date >= effectiveDateFrom && t.date <= effectiveDateTo)
             : buildingFiltered.filter(t => t.date && t.date >= _currentMonthStart);
-        const normalizeType = (type: any) => String(type || '').toUpperCase();
         const incomeRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.INCOME && !isLedgerOpeningBalanceRow(r));
         const expenseRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.EXPENSE && !isLedgerOpeningBalanceRow(r));
-        const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + displayAmount(r), 0);
         const chequeIncome = sumAmount(incomeRows.filter(r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'));
         const chequeExpense = sumAmount(expenseRows.filter(r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'));
 
@@ -2385,21 +2373,11 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             totalInputVAT: expenseRows.reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
             netVATPayable: (incomeRows.filter(r => !(r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0) - incomeRows.filter(r => (r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0)) - expenseRows.reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
         };
+        // Net / opening / cash / bank balances always reflect the true ledger (base).
+        // movementOverride only adjusts the income/expense/VAT/cheque movement cards
+        // when list-only filters (category, search, etc.) are active.
         if (!movementOverride) return base;
-        // Keep Net / cash / bank balances consistent with the (possibly filtered) movement totals.
-        const incomeTotal = movementOverride.incomeTotal;
-        const expenseTotal = movementOverride.expenseTotal;
-        const cashIncome = movementOverride.cashIncome;
-        const bankIncome = movementOverride.bankIncome;
-        const cashExpense = movementOverride.cashExpense;
-        const bankExpense = movementOverride.bankExpense;
-        return {
-            ...base,
-            ...movementOverride,
-            cashBalance: base.openingCash + cashIncome - cashExpense,
-            bankBalance: base.openingBank + bankIncome - bankExpense,
-            totalNet: base.openingTotal + incomeTotal - expenseTotal,
-        };
+        return { ...base, ...movementOverride };
     }, [filteredData, transactions, filterBuildingIds, filterDateFrom, filterDateTo, filterTillDate, matchTransactionBuilding, transfers, openingBalancesByBuilding, filterType, filterMethod, filterStatus, filterCategory, filterBankName, filterCustomer, filterEmployee, filterOwner, filterUnit, searchTerm, filterVat]);
 
     // CSV Export
