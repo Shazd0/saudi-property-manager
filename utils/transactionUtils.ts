@@ -50,10 +50,54 @@ export const normalizeTransactionType = (type: any): TransactionType => {
 };
 
 /**
+ * VAT-inclusive (gross) amount for History rows and Dashboard/Reports ledger totals.
+ * Matches History displayAmount so KPI cards stay in sync with transaction history.
+ *
+ * Handles mixed legacy data:
+ * - Newer EntryForm rows store `amount` as inclusive (same as amountIncludingVAT).
+ * - Some older rows stored amountIncludingVAT equal to the exclusive base.
+ * - Some VAT purchases stored vatAmount without amountIncludingVAT.
+ */
+export const getTransactionInclusiveAmount = (tx: Partial<Transaction> | null | undefined): number => {
+    if (!tx) return 0;
+    const isExpense = normalizeTransactionType(tx.type) === TransactionType.EXPENSE;
+    const inclRaw = (tx as any).amountIncludingVAT ?? (tx as any).totalWithVat;
+    if (inclRaw != null && inclRaw !== '') {
+        const n = Number(inclRaw);
+        if (!Number.isNaN(n)) {
+            const base = Number(tx.amount || 0);
+            const vat = Number(tx.vatAmount || 0);
+            // Old data guard: some expense rows stored amountIncludingVAT equal to the exclusive
+            // base. Newer rows store `amount` as inclusive (same as amountIncludingVAT) — do NOT
+            // add VAT again (that wrongly turns 517.5 into 585 = 517.5 + 67.5).
+            if (isExpense && vat > 0 && base > 0 && n > 0 && Math.abs(n - base) <= 0.01) {
+                const excl = Number((tx as any).amountExcludingVAT);
+                const amountLooksInclusive =
+                    Number.isFinite(excl) && excl > 0 && Math.abs(excl - base) > 0.5;
+                if (!amountLooksInclusive) return base + vat;
+            }
+            return n;
+        }
+    }
+    const base = Number(tx.amount || 0);
+    // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
+    // and some rows may be missing `isVATApplicable` even though VAT was entered.
+    if (isExpense && Number(tx.vatAmount || 0) > 0) {
+        const excl = Number((tx as any).amountExcludingVAT);
+        const vat = Number(tx.vatAmount || 0);
+        // If amount already matches excl+vat (or differs from excl), treat amount as inclusive.
+        if (Number.isFinite(excl) && excl > 0 && Math.abs(base - excl) > 0.5) return base;
+        if (Number.isFinite(excl) && excl > 0 && Math.abs(base - (excl + vat)) <= 0.05) return base;
+        return base + vat;
+    }
+    return base;
+};
+
+/**
  * Calculates summary totals from a list of transactions
  */
 export const calculateTransactionTotals = (transactions: Transaction[]) => {
-    const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + (Number(r.amount) || 0), 0);
+    const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + getTransactionInclusiveAmount(r), 0);
     
     const incomeRows = transactions.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME);
     const expenseRows = transactions.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE);

@@ -31,7 +31,7 @@ import HapticService from '../services/hapticService';
 import { fmtDate, fmtDateTime, isDateInCurrentMonth } from '../utils/dateFormat';
 import { addMoneyFingerprint, buildTransactionSearchHaystack, buildVendorSearchHaystack, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
-import { transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import { getTransactionInclusiveAmount, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { createVatReportSnapshot } from '../utils/vatSnapshot';
 import SearchableSelect from './SearchableSelect';
@@ -769,38 +769,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         return parts.join(' · ') || undefined;
     };
 
-    const displayAmount = (tx: Transaction): number => {
-        const inclRaw = (tx as any).amountIncludingVAT ?? (tx as any).totalWithVat;
-        if (inclRaw != null && inclRaw !== '') {
-            const n = Number(inclRaw);
-            if (!Number.isNaN(n)) {
-                const base = Number(tx.amount || 0);
-                const vat = Number(tx.vatAmount || 0);
-                // Old data guard: some expense rows stored amountIncludingVAT equal to the exclusive
-                // base. Newer rows store `amount` as inclusive (same as amountIncludingVAT) — do NOT
-                // add VAT again (that wrongly turns 517.5 into 585 = 517.5 + 67.5).
-                if (tx.type === TransactionType.EXPENSE && vat > 0 && base > 0 && n > 0 && Math.abs(n - base) <= 0.01) {
-                    const excl = Number((tx as any).amountExcludingVAT);
-                    const amountLooksInclusive =
-                        Number.isFinite(excl) && excl > 0 && Math.abs(excl - base) > 0.5;
-                    if (!amountLooksInclusive) return base + vat;
-                }
-                return n;
-            }
-        }
-        const base = Number(tx.amount || 0);
-        // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
-        // and some rows may be missing `isVATApplicable` even though VAT was entered.
-        if (tx.type === TransactionType.EXPENSE && Number(tx.vatAmount || 0) > 0) {
-            const excl = Number((tx as any).amountExcludingVAT);
-            // If amount already matches excl+vat (or differs from excl), treat amount as inclusive.
-            const vat = Number(tx.vatAmount || 0);
-            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - excl) > 0.5) return base;
-            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - (excl + vat)) <= 0.05) return base;
-            return base + vat;
-        }
-        return base;
-    };
+    const displayAmount = (tx: Transaction): number => getTransactionInclusiveAmount(tx);
 
     const buildDetailItems = (tx: Transaction): Array<{ label: string; value: string }> => {
         const amountExcl = Number(tx.amountExcludingVAT ?? tx.amount ?? 0);
@@ -2494,7 +2463,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             // Skip borrowing opening balance entries (tracked separately in BorrowingTracker/OwnerPortal)
             if (isOpeningBalance(t)) continue;
             // Include owner expenses in opening balance (they represent real cash outflows)
-            const amt = Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+            const amt = getTransactionInclusiveAmount(t);
             const isIncome = normalizeType(t.type) === TransactionType.INCOME;
             const netAmt = isIncome ? amt : -amt;
             openingAll += netAmt;

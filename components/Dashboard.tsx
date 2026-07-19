@@ -77,7 +77,7 @@ import { getTransactions, getContracts, getApprovals, getBuildings, getSettings,
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
-import { normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import { getTransactionInclusiveAmount, normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -592,28 +592,8 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
   const effectiveDateFrom = fromDate || '';
   const effectiveDateTo = tillDate || toDate || '9999-12-31';
 
-  /** Amount to use in dashboard totals (prefer VAT-inclusive when available). */
-  const txDisplayAmount = useCallback((t: Transaction): number => {
-    const inclRaw = (t as any).amountIncludingVAT ?? (t as any).totalWithVat;
-    if (inclRaw != null && inclRaw !== '') {
-      const n = Number(inclRaw);
-      if (!Number.isNaN(n)) {
-        const base = Number((t as any).amount) || 0;
-        const vat = Number((t as any).vatAmount) || 0;
-        const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-        // Old data guard: some rows stored "amountIncludingVAT" but it equals the exclusive/base.
-        if (isExpense && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
-        return n;
-      }
-    }
-    const base = Number((t as any).amount) || 0;
-    const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-    const vat = Number((t as any).vatAmount) || 0;
-    // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
-    // and some rows may be missing `isVATApplicable` even though VAT was entered.
-    if (isExpense && vat > 0) return base + vat;
-    return base;
-  }, []);
+  /** Same amount helper as History — keeps Dashboard KPI cards in sync with transaction history. */
+  const txDisplayAmount = getTransactionInclusiveAmount;
 
   const dashLedgerSummary = useMemo(() => {
     const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + txDisplayAmount(r), 0);
@@ -740,7 +720,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       .reduce((sum: number, t: any) => sum + (Number(t.amount) || 0), 0);
     const priorHeadExpenses = filteredApproved
       .filter((t: Transaction) => t.expenseCategory === 'Head Office Expense' && (t.date || '') < openingCutoff)
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      .reduce((sum, t) => sum + txDisplayAmount(t), 0);
     const openingTotal = officeOpeningBalance + priorIn - priorOut - priorHeadExpenses;
 
     const totalIn = buildingFilteredTransfers
@@ -753,7 +733,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     const headOfficeExpenses = filteredApproved
       .filter((t: Transaction) => t.expenseCategory === 'Head Office Expense' && (t.date || '') >= periodStart && (t.date || '') <= periodEnd)
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      .reduce((sum, t) => sum + txDisplayAmount(t), 0);
 
     const netBalance = openingTotal + totalIn - totalOut - headOfficeExpenses;
 
