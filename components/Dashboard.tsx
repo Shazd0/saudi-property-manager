@@ -273,7 +273,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       ? (currentUser as any).buildingIds
       : (currentUser?.buildingId ? [currentUser.buildingId] : []);
 
-    if (userBuildingIds.length > 0 && selectedBuildingIds.length === 0) {
+    // Mirror History: assigned users always scope to their building(s) so both
+    // screens compute Net Balance over the exact same building set.
+    if (userBuildingIds.length > 0) {
       setSelectedBuildingIds(userBuildingIds);
     }
   }, [currentUser?.id]);
