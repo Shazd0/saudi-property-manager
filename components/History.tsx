@@ -2366,9 +2366,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             if (isCrossBook) return;
             const fromRaw = rawOfBal(tr.fromId);
             const toRaw = rawOfBal(tr.toId);
-            const linked = transactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
-            const hasSource = linked.some(tx => normalize((tx as any).buildingId) === normalize(fromRaw));
-            const hasDest   = linked.some(tx => normalize((tx as any).buildingId) === normalize(toRaw));
+            const linked = transactions.filter(tx => String((tx as any).transferId || '') === String(tr.id || '') && (tx as any).buildingId);
+            const hasSource = linked.some(tx => normalize(rawOfBal((tx as any).buildingId)) === normalize(fromRaw));
+            const hasDest   = linked.some(tx => normalize(rawOfBal((tx as any).buildingId)) === normalize(toRaw));
             const base = {
                 date: tr.date || '',
                 amount: Number(tr.amount) || 0,

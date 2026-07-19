@@ -398,10 +398,14 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const userBuildingIds = (currentUser as any)?.buildingIds || ((currentUser as any)?.buildingId ? [(currentUser as any).buildingId] : []);
       const norm = (v: any) => String(v || '').trim().toLowerCase();
 
-      const existingTreasuryIds = new Set(allTransactions.filter(t => (t as any).transferId).map(tx => (t as any).transferId));
+      const existingTreasuryIds = new Set(
+        allTransactions
+          .filter(tx => (tx as any).transferId)
+          .map(tx => String((tx as any).transferId)),
+      );
       const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
         ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-        && !tr.deleted && !existingTreasuryIds.has(tr.id)
+        && !tr.deleted && !existingTreasuryIds.has(String(tr.id))
       ).map((tr: any) => ({
         id: `pseudo_${tr.id}`,
         date: tr.date || '',
@@ -443,9 +447,11 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         if (isCrossBook) return;
         const fromRaw = rawOf(tr.fromId);
         const toRaw = rawOf(tr.toId);
-        const linked = allTransactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
-        const hasSource = linked.some(tx => norm((tx as any).buildingId) === norm(fromRaw));
-        const hasDest = linked.some(tx => norm((tx as any).buildingId) === norm(toRaw));
+        const trId = String(tr.id || '');
+        const linked = allTransactions.filter(tx => String((tx as any).transferId || '') === trId && (tx as any).buildingId);
+        // Compare raw building ids: txs may store `bookId:rawId` while transfer uses composite or raw.
+        const hasSource = linked.some(tx => norm(rawOf((tx as any).buildingId)) === norm(fromRaw));
+        const hasDest = linked.some(tx => norm(rawOf((tx as any).buildingId)) === norm(toRaw));
         const base = {
           date: tr.date || '',
           amount: Number(tr.amount) || 0,
@@ -465,7 +471,36 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         if (!hasDest) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME', buildingId: toRaw, interBuildingRole: 'DEST' });
       });
 
-      const allTxns = [...allTransactions, ...buildingOwnerPseudo, ...interBuildingPseudo];
+      let allTxns = [...allTransactions, ...buildingOwnerPseudo, ...interBuildingPseudo];
+
+      // Same treasury transfer leg can appear twice (pseudo backfill + real row). Keep one per (transferId, building, type).
+      const legDedupeKey = (r: any): string => {
+        const tid = String(r?.transferId || '').trim();
+        if (!tid) return '';
+        return `${tid}::${norm(rawOf(String(r.buildingId || '')))}::${String(r?.type || '').toUpperCase()}`;
+      };
+      const byLeg = new Map<string, any[]>();
+      for (const r of allTxns) {
+        const k = legDedupeKey(r);
+        if (!k) continue;
+        const arr = byLeg.get(k);
+        if (arr) arr.push(r);
+        else byLeg.set(k, [r]);
+      }
+      const dropRowIds = new Set<string>();
+      for (const [, arr] of byLeg) {
+        if (arr.length <= 1) continue;
+        arr.sort((a: any, b: any) => {
+          const ap = String(a.id || '').startsWith('pseudo_') ? 1 : 0;
+          const bp = String(b.id || '').startsWith('pseudo_') ? 1 : 0;
+          if (ap !== bp) return ap - bp;
+          return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
+        });
+        for (let i = 1; i < arr.length; i++) dropRowIds.add(String(arr[i].id));
+      }
+      if (dropRowIds.size > 0) {
+        allTxns = allTxns.filter(r => !dropRowIds.has(String(r.id)));
+      }
 
       let approvedTxns = allTxns.filter(t => {
         if ((t as any).deleted) return false;
@@ -597,6 +632,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
   const dashLedgerSummary = useMemo(() => {
     const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + txDisplayAmount(r), 0);
+    const normalizeType = (type: any) => String(type || '').toUpperCase();
     const isOpeningBalance = (t: Transaction) =>
       t.borrowingType === 'OPENING_BALANCE' ||
       (t as any).isOwnerOpeningBalance === true ||
@@ -617,8 +653,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       ? filteredApproved.filter(t => t.date && t.date >= effectiveDateFrom && t.date <= effectiveDateTo)
       : filteredApproved.filter(t => t.date && t.date >= currentMonthStart);
 
-    const incomeRows = periodTxns.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
-    const expenseRows = periodTxns.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
+    // Match History: exact INCOME / EXPENSE only (do not coerce unknown types into expense).
+    const incomeRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
+    const expenseRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
 
     const cashIncome = sumAmt(incomeRows.filter(r => transactionCountsAsCashForSplit(r)));
     const bankIncome = sumAmt(incomeRows.filter(r => transactionCountsAsBankForSplit(r)));
@@ -634,7 +671,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
     for (const t of priorTxns) {
       if (isOpeningBalance(t)) continue;
       const amt = txDisplayAmount(t);
-      const isInc = normalizeTransactionType(t.type) === TransactionType.INCOME;
+      const isInc = normalizeType(t.type) === TransactionType.INCOME;
       const netAmt = isInc ? amt : -amt;
       openingAll += netAmt;
       if (transactionCountsAsCashForSplit(t)) openingCash += netAmt;
