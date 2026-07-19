@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { Transaction, TransactionType, TransactionStatus, ExpenseCategory, PaymentMethod, Building, Customer, Vendor, Bank } from '../types';
 import { getTransactions, saveTransaction, getBuildings, getCustomers, getActiveContract, getVendors, createCreditNote, deleteTransaction, getContracts, saveContract, getBanks } from '../services/firestoreService';
 import { isValidSaudiVAT } from '../utils/validators';
+import { getTransactionExclusiveAmount, getTransactionInclusiveAmount } from '../utils/transactionUtils';
 import SearchableSelect from './SearchableSelect';
 import AddVendorDialog from './AddVendorDialog';
 import ConfirmDialog from './ConfirmDialog';
@@ -374,7 +375,8 @@ const VATReport: React.FC = () => {
           id: crypto.randomUUID(),
           type: qeType === 'SALES' ? TransactionType.INCOME : TransactionType.EXPENSE,
           date: qeDate,
-          amount: Math.round(amountExcl * 100) / 100,
+          // Store inclusive amount (matches EntryForm) so history always shows VAT-inclusive
+          amount: Math.round(amountIncl * 100) / 100,
           vatAmount: Math.round(vatAmt * 100) / 100,
           amountExcludingVAT: Math.round(amountExcl * 100) / 100,
           amountIncludingVAT: Math.round(amountIncl * 100) / 100,
@@ -659,8 +661,8 @@ const VATReport: React.FC = () => {
   const netVATPayable = salesVAT - purchaseVAT;
 
   const totalVAT = filteredVATTransactions.reduce((sum, t) => sum + (t.vatAmount || 0), 0);
-  const totalExcludingVAT = filteredVATTransactions.reduce((sum, t) => sum + (t.amountExcludingVAT || t.amount || 0), 0);
-  const totalIncludingVAT = filteredVATTransactions.reduce((sum, t) => sum + (t.amountIncludingVAT || t.totalWithVat || t.amount || 0), 0);
+  const totalExcludingVAT = filteredVATTransactions.reduce((sum, t) => sum + getTransactionExclusiveAmount(t), 0);
+  const totalIncludingVAT = filteredVATTransactions.reduce((sum, t) => sum + getTransactionInclusiveAmount(t), 0);
   const totalDebit = filteredVATTransactions.reduce((sum, tx) => {
     const amount = tx.vatAmount || 0;
     if (tx.type === TransactionType.INCOME) return sum + (tx.isCreditNote ? amount : 0);
@@ -1115,13 +1117,13 @@ const VATReport: React.FC = () => {
                     {tx.type === TransactionType.INCOME ? (tx.customerVATNumber || '-') : (tx.vendorVATNumber || '-')}
                   </td>
                   <td className="px-4 py-4 text-xs font-bold text-slate-600 text-right">
-                    {(tx.amountExcludingVAT || tx.amount || 0).toLocaleString()}
+                    {getTransactionExclusiveAmount(tx).toLocaleString()}
                   </td>
                   <td className="px-4 py-4 text-xs font-bold text-blue-600 text-right">
                     {(tx.vatAmount || 0).toLocaleString()}
                   </td>
                   <td className="px-4 py-4 text-xs font-black text-slate-900 text-right">
-                    {(tx.totalWithVat || tx.amountIncludingVAT || tx.amount || 0).toLocaleString()}
+                    {getTransactionInclusiveAmount(tx).toLocaleString()}
                   </td>
                   <td className="px-4 py-4 align-top">
                     <select
@@ -1372,19 +1374,19 @@ const VATReport: React.FC = () => {
                      <div className="text-lg font-black text-slate-800">{invoiceModal.details || 'Property Services & Management'}</div>
                      <p className="text-[11px] text-slate-400 font-bold mt-1 uppercase tracking-tight">{invoiceModal.buildingName} · {invoiceModal.type === 'INCOME' ? 'Income Transaction' : 'Business Expense'}</p>
                    </div>
-                   <div className="text-xl font-black text-slate-800">{(invoiceModal.amountExcludingVAT || invoiceModal.amount || 0).toLocaleString()} <span className="text-[10px] font-bold text-slate-400">SAR</span></div>
+                   <div className="text-xl font-black text-slate-800">{getTransactionExclusiveAmount(invoiceModal).toLocaleString()} <span className="text-[10px] font-bold text-slate-400">SAR</span></div>
                 </div>
               </div>
 
               <div className="flex justify-end pt-4">
                 <div className="w-80 space-y-4">
                   <div className="space-y-2 px-6">
-                    <div className="flex justify-between text-xs font-bold text-slate-400 uppercase"><span>Subtotal</span><span className="text-slate-700">{(invoiceModal.amountExcludingVAT || invoiceModal.amount || 0).toLocaleString()}</span></div>
+                    <div className="flex justify-between text-xs font-bold text-slate-400 uppercase"><span>Subtotal</span><span className="text-slate-700">{getTransactionExclusiveAmount(invoiceModal).toLocaleString()}</span></div>
                     <div className="flex justify-between text-xs font-bold text-slate-400 uppercase"><span>VAT (15%)</span><span className="text-blue-600">{(invoiceModal.vatAmount || 0).toLocaleString()}</span></div>
                   </div>
                   <div className="bg-emerald-600 rounded-[1.5rem] px-8 py-6 flex justify-between items-center text-white shadow-xl shadow-emerald-900/10 hover:scale-[1.02] transition-all cursor-default">
                     <span className="text-sm font-black uppercase tracking-[0.2em]">Total</span>
-                    <span className="text-3xl font-black tracking-tight">{(invoiceModal.amountIncludingVAT || invoiceModal.totalWithVat || 0).toLocaleString()} <span className="text-xs font-normal opacity-70">SAR</span></span>
+                    <span className="text-3xl font-black tracking-tight">{getTransactionInclusiveAmount(invoiceModal).toLocaleString()} <span className="text-xs font-normal opacity-70">SAR</span></span>
                   </div>
                 </div>
               </div>

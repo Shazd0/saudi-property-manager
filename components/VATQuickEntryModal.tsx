@@ -358,7 +358,8 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
           id: crypto.randomUUID(),
           type: qeType === 'SALES' ? TransactionType.INCOME : TransactionType.EXPENSE,
           date: qeDate,
-          amount: Math.round(amountExcl * 100) / 100,
+          // Store inclusive amount (matches EntryForm) so history always shows VAT-inclusive
+          amount: Math.round(amountIncl * 100) / 100,
           vatAmount: Math.round(vatAmt * 100) / 100,
           amountExcludingVAT: Math.round(amountExcl * 100) / 100,
           amountIncludingVAT: Math.round(amountIncl * 100) / 100,

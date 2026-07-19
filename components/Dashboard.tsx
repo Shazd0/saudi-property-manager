@@ -66,7 +66,7 @@ import { getTransactions, getContracts, getApprovals, getBuildings, getSettings,
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
-import { normalizePaymentMethod, normalizeTransactionType } from '../utils/transactionUtils';
+import { normalizePaymentMethod, normalizeTransactionType, getTransactionInclusiveAmount } from '../utils/transactionUtils';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -560,7 +560,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       r.expenseCategory === 'Owner Opening Balance';
     const incomeRows = txns.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
     const expenseRows = txns.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
-    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + (Number(r.amountIncludingVAT || (r as any).totalWithVat || r.amount) || 0), 0);
+    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + getTransactionInclusiveAmount(r), 0);
     // Use originalPaymentMethod for treasury-linked transactions so BANK/CHEQUE
     // treasury transfers are classified correctly instead of falling into Cash.
     const effM = (r: any) => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase();
@@ -714,8 +714,8 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       if (!months[key]) return;
       const ownerCat = (t.expenseCategory || '').trim();
       const isOwnerExp = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal';
-      if (t.type === TransactionType.INCOME) months[key].income += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
-      if (t.type === TransactionType.EXPENSE && !isOwnerExp) months[key].expense += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+      if (t.type === TransactionType.INCOME) months[key].income += getTransactionInclusiveAmount(t);
+      if (t.type === TransactionType.EXPENSE && !isOwnerExp) months[key].expense += getTransactionInclusiveAmount(t);
       months[key].net = months[key].income - months[key].expense;
     });
 
@@ -731,9 +731,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const ownerCat = (t.expenseCategory || '').trim();
       const isOwnerExp = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal';
       if (isIncome) {
-        methods[method].income += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+        methods[method].income += getTransactionInclusiveAmount(t);
       } else if (!isOwnerExp) {
-        methods[method].expense += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+        methods[method].expense += getTransactionInclusiveAmount(t);
       }
     });
     return Object.entries(methods)
@@ -1513,7 +1513,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
                     </div>
                   </div>
                   <div className={`text-right flex-shrink-0 ${isIncome ? 'text-emerald-600' : 'text-rose-600'}`}>
-                    <div className="font-black text-xs">{isIncome ? '+' : '-'}{Number(tx.amountIncludingVAT || (tx as any).totalWithVat || tx.amount).toLocaleString()}</div>
+                    <div className="font-black text-xs">{isIncome ? '+' : '-'}{getTransactionInclusiveAmount(tx).toLocaleString()}</div>
                     <div className="text-[9px] font-medium text-slate-400">{t('common.sar')}</div>
                   </div>
                 </div>

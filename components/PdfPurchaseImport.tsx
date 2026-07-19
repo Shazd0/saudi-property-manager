@@ -355,7 +355,8 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
       const tx: Omit<Transaction, 'id'> = {
         type: TransactionType.EXPENSE,
         date: inv.date,
-        amount: inv.amountExcl,
+        // Store inclusive amount (matches EntryForm) so history always shows VAT-inclusive
+        amount: inv.amountIncl,
         paymentMethod: inv.paymentMethod,
         details: inv.description,
         status: TransactionStatus.APPROVED,

@@ -31,6 +31,7 @@ import { fmtDate, fmtDateTime } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { zatcaSignAndReportPath } from '../config/zatcaServiceUrl';
 import SearchableSelect from './SearchableSelect';
+import { getTransactionInclusiveAmount, getTransactionExclusiveAmount } from '../utils/transactionUtils';
 
 interface HistoryProps {
   currentUser: User;
@@ -209,6 +210,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 isVATApplicable: true,
                 vatInvoiceNumber: inv,
                 vatRate: 15,
+                // Always persist the inclusive total as the main amount (history shows inclusive)
+                amount: vatBreakdown.inclusive,
                 vatAmount: vatBreakdown.vat,
                 amountExcludingVAT: vatBreakdown.exclusive,
                 amountIncludingVAT: vatBreakdown.inclusive,
@@ -1024,9 +1027,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                         ${tx.vatAmount ? `
                         <div class="vat-section">
                           <div class="vat-title">Tax Breakdown / تفاصيل الضريبة</div>
-                          <div class="vat-row"><span class="vr-label">Amount Excl. VAT / المبلغ قبل الضريبة</span><span class="vr-val">${(tx.amountExcludingVAT || tx.amount).toLocaleString('en-US', {minimumFractionDigits: 2})} SAR</span></div>
+                          <div class="vat-row"><span class="vr-label">Amount Excl. VAT / المبلغ قبل الضريبة</span><span class="vr-val">${(tx.amountExcludingVAT != null ? tx.amountExcludingVAT : (tx.isVATApplicable ? Number((getTransactionInclusiveAmount(tx) / 1.15).toFixed(2)) : tx.amount)).toLocaleString('en-US', {minimumFractionDigits: 2})} SAR</span></div>
                           <div class="vat-row"><span class="vr-label">VAT 15% / ضريبة القيمة المضافة</span><span class="vr-val">${tx.vatAmount.toLocaleString('en-US', {minimumFractionDigits: 2})} SAR</span></div>
-                          <div class="vat-row total"><span class="vr-label">Total / الإجمالي</span><span class="vr-val">${(tx.amountIncludingVAT || tx.totalWithVat || tx.amount).toLocaleString('en-US', {minimumFractionDigits: 2})} SAR</span></div>
+                          <div class="vat-row total"><span class="vr-label">Total / الإجمالي</span><span class="vr-val">${getTransactionInclusiveAmount(tx).toLocaleString('en-US', {minimumFractionDigits: 2})} SAR</span></div>
                         </div>` : ''}
                       </div>
                       <div class="signatures">
@@ -1401,7 +1404,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
     const summary = useMemo(() => {
         const normalizeType = (type: any) => String(type || '').toUpperCase();
-        const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + (Number(r.amountIncludingVAT || (r as any).totalWithVat || r.amount) || 0), 0);
+        const sumAmount = (rows: Transaction[]) => rows.reduce((s, r) => s + getTransactionInclusiveAmount(r), 0);
 
         // Include configured opening balances from Settings (these are always part of the historical balance)
         // They are also displayed as synthetic rows in the list but not stored as transactions
@@ -1562,7 +1565,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             // Skip borrowing opening balance entries (tracked separately in BorrowingTracker/OwnerPortal)
             if (isOpeningBalance(t)) continue;
             // Include owner expenses in opening balance (they represent real cash outflows)
-            const amt = Number(t.amount) || 0;
+            const amt = getTransactionInclusiveAmount(t);
             const isIncome = normalizeType(t.type) === TransactionType.INCOME;
             const effM = String((t as any).originalPaymentMethod || t.paymentMethod || '').toUpperCase();
             const isCash = effM === 'CASH' || effM === 'TREASURY';
@@ -1614,8 +1617,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 const bName = getBuildingName(tx.buildingId || (tx as any).building) || tx.buildingName || '';
                 details = `Sale to ${custName || custId || '-'}${bName ? '  -  ' + bName : ''}`;
             }
-            const income = tx.type === TransactionType.INCOME ? tx.amount : '';
-            const expense = tx.type === TransactionType.EXPENSE ? tx.amount : '';
+            const income = tx.type === TransactionType.INCOME ? getTransactionInclusiveAmount(tx) : '';
+            const expense = tx.type === TransactionType.EXPENSE ? getTransactionInclusiveAmount(tx) : '';
             return [tx.date, tx.type, income, expense, tx.expenseCategory || 'Rent', getBuildingName(tx.buildingId || (tx as any).building) || tx.buildingName || '-', tx.unitNumber || '-', details, tx.status || 'APPROVED', tx.createdByName];
         });
         
@@ -1679,8 +1682,8 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                                 if ((r as any).source === 'treasury') {
                                     details = getTreasuryLabel(r);
                                 }
-                                const income = r.type === 'INCOME' ? Number(r.amount) : 0;
-                                const expense = r.type === 'EXPENSE' ? Number(r.amount) : 0;
+                                const income = r.type === 'INCOME' ? getTransactionInclusiveAmount(r) : 0;
+                                const expense = r.type === 'EXPENSE' ? getTransactionInclusiveAmount(r) : 0;
                                 return `<tr>
                                     <td>${fmtDate(r.date)}</td>
                                     <td><span class="type-badge ${r.type === 'INCOME' ? 'income' : 'expense'}">${r.type}</span></td>
@@ -1879,11 +1882,11 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         const creditNotes  = vatTxns.filter(t => String(t.type).toUpperCase() === 'INCOME'  &&  (t as any).isCreditNote);
         const purchaseTxns = vatTxns.filter(t => String(t.type).toUpperCase() === 'EXPENSE');
 
-        const salesBase  = salesTxns.reduce((s, r)   => s + (Number(r.amountExcludingVAT  || r.amount) || 0), 0);
+        const salesBase  = salesTxns.reduce((s, r)   => s + getTransactionExclusiveAmount(r), 0);
         const salesVat   = salesTxns.reduce((s, r)   => s + (Number(r.vatAmount)           || 0),             0);
-        const cnBase     = creditNotes.reduce((s, r)  => s + (Number(r.amountExcludingVAT  || r.amount) || 0), 0);
+        const cnBase     = creditNotes.reduce((s, r)  => s + getTransactionExclusiveAmount(r), 0);
         const cnVat      = creditNotes.reduce((s, r)  => s + (Number(r.vatAmount)           || 0),             0);
-        const purchBase  = purchaseTxns.reduce((s, r) => s + (Number(r.amountExcludingVAT  || r.amount) || 0), 0);
+        const purchBase  = purchaseTxns.reduce((s, r) => s + getTransactionExclusiveAmount(r), 0);
         const purchVat   = purchaseTxns.reduce((s, r) => s + (Number(r.vatAmount)           || 0),             0);
 
         const netSalesBase = salesBase - cnBase;
@@ -2282,9 +2285,9 @@ const canDelete = useCallback((tx: Transaction) => {
                                     </div>
                                     <div className="flex items-center gap-2">
                                         {row.type === TransactionType.INCOME ? (
-                                            <div className={`amount-pill amount-income ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                            <div className={`amount-pill amount-income ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{getTransactionInclusiveAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                         ) : row.type === TransactionType.EXPENSE ? (
-                                            <div className={`amount-pill amount-expense ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                            <div className={`amount-pill amount-expense ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{getTransactionInclusiveAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                         ) : (
                                             <div className="amount-pill amount-neutral"><span className="amt-value">-</span></div>
                                         )}
@@ -2526,7 +2529,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                         <td className="px-4 py-3 text-sm text-slate-500 text-right align-middle">
                                             <div className="text-right">
                                                 {row.type === TransactionType.INCOME ? (
-                                                    <div className={`amount-pill amount-income amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                                    <div className={`amount-pill amount-income amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{getTransactionInclusiveAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                                 ) : (
                                                     <div className="amount-pill amount-neutral amount-pill-right"><span className="amt-value">-</span></div>
                                                 )}
@@ -2540,7 +2543,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                         <td className="px-4 py-3 text-right text-sm text-slate-500 align-middle">
                                             <div className="text-right">
                                                 {row.type === TransactionType.EXPENSE ? (
-                                                    <div className={`amount-pill amount-expense amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{Number(row.amountIncludingVAT || row.totalWithVat || row.amount).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
+                                                    <div className={`amount-pill amount-expense amount-pill-right ${showDeleted ? 'line-through' : ''}`}><span className="amt-value">{getTransactionInclusiveAmount(row).toLocaleString()}</span><span className="amt-curr">{t('common.sar')}</span></div>
                                                 ) : (
                                                     <div className="amount-pill amount-neutral amount-pill-right"><span className="amt-value">-</span></div>
                                                 )}
@@ -2958,7 +2961,7 @@ const canDelete = useCallback((tx: Transaction) => {
                             <div className="mb-4 space-y-2 text-xs text-slate-700">
                                 <div><b>Date:</b> {txToDelete.date}</div>
                                 <div><b>Type:</b> {txToDelete.type}</div>
-                                <div><b>Amount:</b> {txToDelete.amount?.toLocaleString()} SAR</div>
+                                <div><b>Amount:</b> {getTransactionInclusiveAmount(txToDelete).toLocaleString()} SAR</div>
                                 <div><b>Payment Method:</b> {fmtPaymentMethod(txToDelete)}</div>
                                 {txToDelete.chequeNo && <div><b>Cheque No:</b> {txToDelete.chequeNo}</div>}
                                 {txToDelete.chequeDueDate && <div><b>Cheque Due Date:</b> {txToDelete.chequeDueDate}</div>}
@@ -3080,7 +3083,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                 </div>
                                 <div className="p-3 bg-emerald-50 rounded-lg border border-emerald-200">
                                     <div className="text-[11px] text-emerald-800 font-bold">{t('common.amount')}</div>
-                                    <div className="text-xl font-black text-emerald-900">{Number(selectedTx.amountIncludingVAT || selectedTx.totalWithVat || selectedTx.amount || 0).toLocaleString()} SAR</div>
+                                    <div className="text-xl font-black text-emerald-900">{getTransactionInclusiveAmount(selectedTx).toLocaleString()} SAR</div>
                                     {selectedTx.isVATApplicable && selectedTx.vatAmount && selectedTx.vatAmount > 0 && (
                                         <div className="text-[11px] text-emerald-700 mt-1">incl. VAT {Number(selectedTx.vatAmount).toLocaleString()} SAR</div>
                                     )}
