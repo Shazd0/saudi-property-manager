@@ -10,6 +10,7 @@ import SoundService from '../services/soundService';
 import { fmtDate } from '../utils/dateFormat';
 import { getInstallmentRange } from '../utils/installmentSchedule';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
+import { getTransactionInclusiveAmount } from '../utils/transactionUtils';
 import LoadingOverlay from './LoadingOverlay';
 import ConfirmDialog from './ConfirmDialog';
 import VATQuickEntryModal, { VATQuickEntryType } from './VATQuickEntryModal';
@@ -19,7 +20,7 @@ const generateZATCAQR = (tx: Partial<Transaction>, contract?: Contract, customer
   const sellerName = 'شركة ارار ميلينيوم المحدودة';
   const sellerVAT = '312610089400003'; // Company VAT number
   const timestamp = new Date(tx.date || Date.now()).toISOString();
-  const totalWithVAT = tx.amountIncludingVAT || tx.totalWithVat || tx.amount || 0;
+  const totalWithVAT = getTransactionInclusiveAmount(tx);
   const vatAmount = tx.vatAmount || 0;
   
   // Convert string to UTF-8 bytes then to hex

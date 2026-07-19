@@ -589,7 +589,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                         const contract = allContracts.find((c: any) => c.id === contractId);
                         if (contract) {
                             const paidSoFar = Number((contract as any).upfrontPaid || 0);
-                            const invoiceAmt = Math.abs(Number(txToDelete.amountIncludingVAT || txToDelete.totalWithVat || txToDelete.amount || 0));
+                            const invoiceAmt = Math.abs(getTransactionInclusiveAmount(txToDelete));
                             await saveContract({ ...contract, upfrontPaid: Math.max(0, paidSoFar - invoiceAmt) });
                         }
                     } catch { /* non-fatal */ }
