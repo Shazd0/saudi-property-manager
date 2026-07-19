@@ -2388,7 +2388,36 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             if (!hasDest)   interBuildingPseudoBal.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME',  buildingId: toRaw,   interBuildingRole: 'DEST' });
         });
 
-        const allTxns = [...transactions, ...buildingOwnerPseudoBal, ...interBuildingPseudoBal];
+        const allTxnsRaw = [...transactions, ...buildingOwnerPseudoBal, ...interBuildingPseudoBal];
+
+        // Same treasury transfer leg can appear twice (pseudo + real). Keep one per (transferId, building, type).
+        const legDedupeKeyBal = (r: any): string => {
+            const tid = String(r?.transferId || '').trim();
+            if (!tid) return '';
+            return `${tid}::${normalize(rawOfBal(String(r.buildingId || '')))}::${String(r?.type || '').toUpperCase()}`;
+        };
+        const byLegBal = new Map<string, any[]>();
+        for (const r of allTxnsRaw) {
+            const k = legDedupeKeyBal(r);
+            if (!k) continue;
+            const arr = byLegBal.get(k);
+            if (arr) arr.push(r);
+            else byLegBal.set(k, [r]);
+        }
+        const dropBalIds = new Set<string>();
+        for (const [, arr] of byLegBal) {
+            if (arr.length <= 1) continue;
+            arr.sort((a: any, b: any) => {
+                const ap = String(a.id || '').startsWith('pseudo_') ? 1 : 0;
+                const bp = String(b.id || '').startsWith('pseudo_') ? 1 : 0;
+                if (ap !== bp) return ap - bp;
+                return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
+            });
+            for (let i = 1; i < arr.length; i++) dropBalIds.add(String(arr[i].id));
+        }
+        const allTxns = dropBalIds.size > 0
+            ? allTxnsRaw.filter(r => !dropBalIds.has(String(r.id)))
+            : allTxnsRaw;
 
         // Base approved transactions (not deleted) - use transactions directly, not filteredData
         // Include transactions without status (legacy data) as approved
