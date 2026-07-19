@@ -73,11 +73,17 @@ import {
 } from 'recharts';
 
 import { Transaction, TransactionType, TransactionStatus, PaymentMethod, Contract, User, Building, UserRole } from '../types';
-import { getTransactions, getContracts, getApprovals, getBuildings, getSettings, getCustomers, getTransfers, getDataFromBook } from '../services/firestoreService';
+import { getTransactions, getContracts, getApprovals, getBuildings, getSettings, getCustomers, getTransfers, getDataFromBook, backfillInterBuildingTransactions } from '../services/firestoreService';
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
 import { getTransactionInclusiveAmount, normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import {
+  computeLedgerSummary,
+  enrichLedgerTransactions,
+  filterApprovedLedgerTransactions,
+  rawBuildingId,
+} from '../utils/ledgerSummary';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -205,11 +211,25 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
           ? [currentUser.buildingId]
           : [];
 
+      // Same self-heal as History so inter-building legs exist before totals are computed.
+      if (
+        (actorRoleKey === UserRole.ADMIN || actorRoleKey === UserRole.MANAGER) &&
+        (import.meta as any).env?.VITE_DATA_BACKEND !== 'mac'
+      ) {
+        try {
+          await Promise.race([
+            backfillInterBuildingTransactions(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('backfill timeout')), 8000)),
+          ]);
+        } catch { /* non-fatal */ }
+      }
+
       const [txs, cons, apprs, blds, appSettings, trsf] = await Promise.all([
         getTransactions({
           userId: actorId,
           role: actorRoleKey,
           buildingIds: userBuildingIds,
+          includeDeleted: true,
         } as any),
         getContracts(),
         getApprovals(),
@@ -393,127 +413,13 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
   const approved = useMemo(
     () => {
-      const isAdmin = (currentUser as any)?.role === UserRole.ADMIN;
       const isAdminOrManager = (currentUser as any)?.role === UserRole.ADMIN || (currentUser as any)?.role === UserRole.MANAGER;
       const userBuildingIds = (currentUser as any)?.buildingIds || ((currentUser as any)?.buildingId ? [(currentUser as any).buildingId] : []);
-      const norm = (v: any) => String(v || '').trim().toLowerCase();
 
-      const existingTreasuryIds = new Set(
-        allTransactions
-          .filter(tx => (tx as any).transferId)
-          .map(tx => String((tx as any).transferId)),
+      // Same transfer-leg enrichment + approval filter as History (shared helper).
+      let approvedTxns = filterApprovedLedgerTransactions(
+        enrichLedgerTransactions(allTransactions, transfers),
       );
-      const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
-        ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-        && !tr.deleted && !existingTreasuryIds.has(String(tr.id))
-      ).map((tr: any) => ({
-        id: `pseudo_${tr.id}`,
-        date: tr.date || '',
-        type: tr.fromType === 'BUILDING' ? 'EXPENSE' : 'INCOME',
-        amount: Number(tr.amount) || 0,
-        paymentMethod: 'TREASURY',
-        // Preserve the user-selected flow (CASH/BANK/CHEQUE) for proper cash/bank split.
-        originalPaymentMethod: tr.paymentMethod,
-        fromType: tr.fromType,
-        toType: tr.toType,
-        fromId: tr.fromId,
-        toId: tr.toId,
-        source: 'treasury',
-        buildingId: tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : undefined),
-        status: tr.status || 'APPROVED',
-        expenseCategory: '',
-        borrowingType: undefined,
-        transferId: tr.id,
-      } as any));
-      // Inter-building pseudo legs (match History.tsx): fill missing source/dest transaction legs
-      // for same-book transfers that lack one side in older data.
-      const interBuildingPseudo: any[] = [];
-      const rawOf = (compositeId: string | undefined): string => {
-        if (!compositeId) return '';
-        const s = String(compositeId);
-        return s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
-      };
-      const bookOf = (compositeId: string | undefined): string => {
-        if (!compositeId) return '';
-        const s = String(compositeId);
-        return s.includes(':') ? s.slice(0, s.indexOf(':')) : '';
-      };
-      (transfers || []).forEach((tr: any) => {
-        if (tr.deleted) return;
-        if (!(tr.fromType === 'BUILDING' && tr.toType === 'BUILDING' && tr.fromId && tr.toId && tr.fromId !== tr.toId)) return;
-        const isCrossBook =
-          (tr.sourceBookId && tr.destBookId && tr.sourceBookId !== tr.destBookId)
-          || (!!bookOf(tr.fromId) && !!bookOf(tr.toId) && bookOf(tr.fromId) !== bookOf(tr.toId));
-        if (isCrossBook) return;
-        const fromRaw = rawOf(tr.fromId);
-        const toRaw = rawOf(tr.toId);
-        const trId = String(tr.id || '');
-        const linked = allTransactions.filter(tx => String((tx as any).transferId || '') === trId && (tx as any).buildingId);
-        // Compare raw building ids: txs may store `bookId:rawId` while transfer uses composite or raw.
-        const hasSource = linked.some(tx => norm(rawOf((tx as any).buildingId)) === norm(fromRaw));
-        const hasDest = linked.some(tx => norm(rawOf((tx as any).buildingId)) === norm(toRaw));
-        const base = {
-          date: tr.date || '',
-          amount: Number(tr.amount) || 0,
-          paymentMethod: 'TREASURY',
-          originalPaymentMethod: tr.paymentMethod,
-          fromType: tr.fromType,
-          toType: tr.toType,
-          fromId: tr.fromId,
-          toId: tr.toId,
-          source: 'treasury',
-          status: tr.status || 'APPROVED',
-          expenseCategory: '',
-          borrowingType: undefined,
-          transferId: tr.id,
-        };
-        if (!hasSource) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_src`, type: 'EXPENSE', buildingId: fromRaw, interBuildingRole: 'SOURCE' });
-        if (!hasDest) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME', buildingId: toRaw, interBuildingRole: 'DEST' });
-      });
-
-      let allTxns = [...allTransactions, ...buildingOwnerPseudo, ...interBuildingPseudo];
-
-      // Same treasury transfer leg can appear twice (pseudo backfill + real row). Keep one per (transferId, building, type).
-      const legDedupeKey = (r: any): string => {
-        const tid = String(r?.transferId || '').trim();
-        if (!tid) return '';
-        return `${tid}::${norm(rawOf(String(r.buildingId || '')))}::${String(r?.type || '').toUpperCase()}`;
-      };
-      const byLeg = new Map<string, any[]>();
-      for (const r of allTxns) {
-        const k = legDedupeKey(r);
-        if (!k) continue;
-        const arr = byLeg.get(k);
-        if (arr) arr.push(r);
-        else byLeg.set(k, [r]);
-      }
-      const dropRowIds = new Set<string>();
-      for (const [, arr] of byLeg) {
-        if (arr.length <= 1) continue;
-        arr.sort((a: any, b: any) => {
-          const ap = String(a.id || '').startsWith('pseudo_') ? 1 : 0;
-          const bp = String(b.id || '').startsWith('pseudo_') ? 1 : 0;
-          if (ap !== bp) return ap - bp;
-          return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
-        });
-        for (let i = 1; i < arr.length; i++) dropRowIds.add(String(arr[i].id));
-      }
-      if (dropRowIds.size > 0) {
-        allTxns = allTxns.filter(r => !dropRowIds.has(String(r.id)));
-      }
-
-      let approvedTxns = allTxns.filter(t => {
-        if ((t as any).deleted) return false;
-        if (t.paymentMethod === 'TREASURY_REVERSAL') return false;
-        if ((t as any).source === 'treasury') {
-          const ft = (t as any).fromType, tt = (t as any).toType;
-          if ((ft === 'OWNER' && tt === 'HEAD_OFFICE') || (ft === 'HEAD_OFFICE' && tt === 'OWNER')) return false;
-        }
-        const status = String(t.status || TransactionStatus.APPROVED).toUpperCase();
-        return status === TransactionStatus.APPROVED || status === 'COMPLETED' || !t.status;
-      });
-
-      // All staff can view owner expenses
 
       // Filter borrowing opening balances: Admin/Manager see all, Staff see only their building's
       approvedTxns = approvedTxns.filter(t => {
@@ -562,13 +468,16 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       };
       const matchTransactionBuilding = (tx: Transaction, buildingId: string) => {
         const targetId = normalize(buildingId);
+        const targetRaw = normalize(rawBuildingId(buildingId));
         const targetName = normalize(getBuildingName(buildingId));
         if (!targetId) return false;
 
         // Same rule as History.tsx: for treasury-sourced rows, match STRICTLY by tx.buildingId
         if ((tx as any).source === 'treasury') {
           if (!tx.buildingId) return false;
-          return normalize(tx.buildingId) === targetId;
+          const txB = normalize(String(tx.buildingId));
+          const txRaw = normalize(rawBuildingId(String(tx.buildingId)));
+          return txB === targetId || txRaw === targetId || txRaw === targetRaw;
         }
 
         const rawIds = [
@@ -582,7 +491,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
           .flatMap(v => String(v || '').split(','))
           .map(v => normalize(v))
           .filter(Boolean);
-        if (rawIds.includes(targetId)) return true;
+        if (rawIds.includes(targetId) || rawIds.map(rawBuildingId).map(normalize).includes(targetRaw)) return true;
 
         const rawNames = [
           (tx as any).buildingName,
@@ -596,7 +505,16 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         return false;
       };
 
-      return approved.filter(t => selectedBuildingIds.some(id => matchTransactionBuilding(t, id)));
+      // Match History summary: owner expenses only for their exact source buildingId.
+      return approved.filter(t => {
+        const ownerCat = (t.expenseCategory || '').trim();
+        if (ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal') {
+          const bId = String((t as any).buildingId || '');
+          if (!bId) return false;
+          return selectedBuildingIds.includes(bId) || selectedBuildingIds.includes(rawBuildingId(bId));
+        }
+        return selectedBuildingIds.some(id => matchTransactionBuilding(t, id));
+      });
     },
     [approved, selectedBuildingIds, allBuildings]
   );
@@ -630,82 +548,27 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
   /** Same amount helper as History — keeps Dashboard KPI cards in sync with transaction history. */
   const txDisplayAmount = getTransactionInclusiveAmount;
 
-  const dashLedgerSummary = useMemo(() => {
-    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + txDisplayAmount(r), 0);
-    const normalizeType = (type: any) => String(type || '').toUpperCase();
-    const isOpeningBalance = (t: Transaction) =>
-      t.borrowingType === 'OPENING_BALANCE' ||
-      (t as any).isOwnerOpeningBalance === true ||
-      t.expenseCategory === 'Owner Opening Balance';
-
-    // Settings opening balances
-    let settingsOpeningCash = 0;
-    let settingsOpeningBank = 0;
-    Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
-      if (selectedBuildingIds.length > 0 && !selectedBuildingIds.includes(buildingId)) return;
-      settingsOpeningCash += Number((row as any).cash) || 0;
-      settingsOpeningBank += Number((row as any).bank) || 0;
-    });
-    const settingsOpeningAll = settingsOpeningCash + settingsOpeningBank;
-
-    const openingCutoff = hasDateFilter ? (fromDate || currentMonthStart) : currentMonthStart;
-    const periodTxns = hasDateFilter
-      ? filteredApproved.filter(t => t.date && t.date >= effectiveDateFrom && t.date <= effectiveDateTo)
-      : filteredApproved.filter(t => t.date && t.date >= currentMonthStart);
-
-    // Match History: exact INCOME / EXPENSE only (do not coerce unknown types into expense).
-    const incomeRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
-    const expenseRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
-
-    const cashIncome = sumAmt(incomeRows.filter(r => transactionCountsAsCashForSplit(r)));
-    const bankIncome = sumAmt(incomeRows.filter(r => transactionCountsAsBankForSplit(r)));
-    const incomeTotal = sumAmt(incomeRows);
-
-    const cashExpense = sumAmt(expenseRows.filter(r => transactionCountsAsCashForSplit(r)));
-    const bankExpense = sumAmt(expenseRows.filter(r => transactionCountsAsBankForSplit(r)));
-    const expenseTotal = sumAmt(expenseRows);
-
-    // Opening balances from prior txns
-    let openingCash = 0, openingBank = 0, openingAll = 0;
-    const priorTxns = filteredApproved.filter(t => t.date && t.date < openingCutoff);
-    for (const t of priorTxns) {
-      if (isOpeningBalance(t)) continue;
-      const amt = txDisplayAmount(t);
-      const isInc = normalizeType(t.type) === TransactionType.INCOME;
-      const netAmt = isInc ? amt : -amt;
-      openingAll += netAmt;
-      if (transactionCountsAsCashForSplit(t)) openingCash += netAmt;
-      else if (transactionCountsAsBankForSplit(t)) openingBank += netAmt;
-    }
-
-    const cashBalance = openingCash + settingsOpeningCash + cashIncome - cashExpense;
-    const bankBalance = openingBank + settingsOpeningBank + bankIncome - bankExpense;
-    const totalNet = openingAll + settingsOpeningAll + incomeTotal - expenseTotal;
-
-    return {
-      openingCash: openingCash + settingsOpeningCash,
-      openingBank: openingBank + settingsOpeningBank,
-      openingTotal: openingAll + settingsOpeningAll,
-      cashIncome,
-      bankIncome,
-      incomeTotal,
-      cashExpense,
-      bankExpense,
-      expenseTotal,
-      cashBalance,
-      bankBalance,
-      totalNet,
-    };
-  }, [
-    filteredApproved,
-    openingBalancesByBuilding,
-    selectedBuildingIds,
-    hasDateFilter,
-    fromDate,
-    currentMonthStart,
-    effectiveDateFrom,
-    effectiveDateTo,
-  ]);
+  const dashLedgerSummary = useMemo(
+    () =>
+      computeLedgerSummary({
+        ledgerRows: filteredApproved,
+        openingBalancesByBuilding,
+        buildingIds: selectedBuildingIds,
+        dateFrom: fromDate,
+        dateTo: toDate,
+        tillDate,
+        currentMonthStart,
+      }),
+    [
+      filteredApproved,
+      openingBalancesByBuilding,
+      selectedBuildingIds,
+      fromDate,
+      toDate,
+      tillDate,
+      currentMonthStart,
+    ],
+  );
 
   const prevMonthClosing = useMemo(
     () => ({ cash: dashLedgerSummary.openingCash, bank: dashLedgerSummary.openingBank, total: dashLedgerSummary.openingTotal }),
