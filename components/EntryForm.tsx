@@ -10,6 +10,7 @@ import SoundService from '../services/soundService';
 import { fmtDate } from '../utils/dateFormat';
 import { getInstallmentRange } from '../utils/installmentSchedule';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
+import { getTransactionInclusiveAmount } from '../utils/transactionUtils';
 import LoadingOverlay from './LoadingOverlay';
 import ConfirmDialog from './ConfirmDialog';
 import VATQuickEntryModal, { VATQuickEntryType } from './VATQuickEntryModal';
@@ -19,7 +20,7 @@ const generateZATCAQR = (tx: Partial<Transaction>, contract?: Contract, customer
   const sellerName = 'شركة ارار ميلينيوم المحدودة';
   const sellerVAT = '312610089400003'; // Company VAT number
   const timestamp = new Date(tx.date || Date.now()).toISOString();
-  const totalWithVAT = tx.amountIncludingVAT || tx.totalWithVat || tx.amount || 0;
+  const totalWithVAT = getTransactionInclusiveAmount(tx);
   const vatAmount = tx.vatAmount || 0;
   
   // Convert string to UTF-8 bytes then to hex
@@ -498,7 +499,18 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
     useEffect(() => {
         if (location.state && location.state.transaction) {
             const transaction = location.state.transaction as Transaction;
-            setId(transaction.id); setType(transaction.type); setDate(transaction.date); setAmount(transaction.amount.toString());
+            setId(transaction.id); setType(transaction.type); setDate(transaction.date);
+            // Expense VAT form expects inclusive; income VAT form expects exclusive
+            const editAmount = transaction.isVATApplicable
+                ? (transaction.type === TransactionType.EXPENSE
+                    ? (transaction.amountIncludingVAT || transaction.totalWithVat || transaction.amount)
+                    : (transaction.amountExcludingVAT ?? (
+                        transaction.amountIncludingVAT || transaction.totalWithVat
+                            ? Number(((transaction.amountIncludingVAT || transaction.totalWithVat || 0) / 1.15).toFixed(2))
+                            : transaction.amount
+                    )))
+                : transaction.amount;
+            setAmount(String(editAmount ?? ''));
             setDetails(transaction.details); setPaymentMethod(transaction.paymentMethod);
             setExtraAmount(transaction.extraAmount?.toString() || '0');
             setDiscountAmount(transaction.discountAmount?.toString() || '0');
@@ -1056,7 +1068,7 @@ const EntryForm: React.FC<EntryFormProps> = ({ currentUser, prefillCategory: pro
       isVATApplicable: isVATApplicable,
       vatInvoiceNumber: isVATApplicable ? autoInvoiceNumber : undefined,
       amountExcludingVAT: isVATApplicable ? finalBase : undefined,
-      amountIncludingVAT: isVATApplicable ? (inclusiveAmount || totalWithVat) : undefined,
+      amountIncludingVAT: isVATApplicable ? totalWithVat : undefined,
       vatRate: isVATApplicable ? 15 : undefined,
       vendorVATNumber: (isVATApplicable && type === TransactionType.EXPENSE && targetVendorId) ? vendors.find(v => v.id === targetVendorId)?.vatNumber || vendors.find(v => v.id === targetVendorId)?.vatNo : undefined,
       customerVATNumber: (isVATApplicable && type === TransactionType.INCOME && activeContract) ? customers.find(c => c.id === activeContract.customerId)?.vatNumber : undefined,

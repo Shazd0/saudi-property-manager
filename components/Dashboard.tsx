@@ -66,7 +66,7 @@ import { getTransactions, getContracts, getApprovals, getBuildings, getSettings,
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
-import { normalizePaymentMethod, normalizeTransactionType } from '../utils/transactionUtils';
+import { normalizePaymentMethod, normalizeTransactionType, getTransactionInclusiveAmount } from '../utils/transactionUtils';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -400,6 +400,8 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         type: tr.fromType === 'BUILDING' ? 'EXPENSE' : 'INCOME',
         amount: Number(tr.amount) || 0,
         paymentMethod: 'TREASURY',
+        originalPaymentMethod: tr.paymentMethod || 'TREASURY',
+        transferId: tr.id,
         fromType: tr.fromType,
         toType: tr.toType,
         source: 'treasury',
@@ -408,7 +410,43 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         expenseCategory: '',
         borrowingType: undefined,
       } as any));
-      const allTxns = [...allTransactions, ...buildingOwnerPseudo];
+
+      // Inter-building pseudo legs (same-book) — match History summary so totals align
+      const interBuildingPseudo: any[] = [];
+      const rawOf = (v?: string) => (v && String(v).includes(':')) ? String(v).slice(String(v).indexOf(':') + 1) : (v || '');
+      const bookOf = (v?: string) => (v && String(v).includes(':')) ? String(v).slice(0, String(v).indexOf(':')) : '';
+      const normId = (v: any) => String(v || '').trim().toLowerCase();
+      (transfers || []).forEach((tr: any) => {
+        if (tr.deleted) return;
+        if (!(tr.fromType === 'BUILDING' && tr.toType === 'BUILDING' && tr.fromId && tr.toId && tr.fromId !== tr.toId)) return;
+        const isCrossBook = (tr.sourceBookId && tr.destBookId && tr.sourceBookId !== tr.destBookId)
+          || (!!bookOf(tr.fromId) && !!bookOf(tr.toId) && bookOf(tr.fromId) !== bookOf(tr.toId));
+        if (isCrossBook) return;
+        const fromRaw = rawOf(tr.fromId);
+        const toRaw = rawOf(tr.toId);
+        const linked = allTransactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
+        const hasSource = linked.some(tx => normId((tx as any).buildingId) === normId(fromRaw));
+        const hasDest = linked.some(tx => normId((tx as any).buildingId) === normId(toRaw));
+        const base = {
+          date: tr.date || '',
+          amount: Number(tr.amount) || 0,
+          paymentMethod: 'TREASURY',
+          originalPaymentMethod: tr.paymentMethod || 'TREASURY',
+          fromType: tr.fromType,
+          toType: tr.toType,
+          fromId: tr.fromId,
+          toId: tr.toId,
+          source: 'treasury',
+          status: tr.status || 'APPROVED',
+          expenseCategory: '',
+          borrowingType: undefined,
+          transferId: tr.id,
+        };
+        if (!hasSource) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_src`, type: 'EXPENSE', buildingId: fromRaw, interBuildingRole: 'SOURCE' });
+        if (!hasDest) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME', buildingId: toRaw, interBuildingRole: 'DEST' });
+      });
+
+      const allTxns = [...allTransactions, ...buildingOwnerPseudo, ...interBuildingPseudo];
 
       let approvedTxns = allTxns.filter(t => {
         if ((t as any).deleted) return false;
@@ -535,9 +573,10 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       t.expenseCategory === 'Owner Opening Balance';
     for (const t of prevTxns) {
       if (isOpeningBalance(t)) continue;
-      const amt = Number(t.amount) || 0;
+      // Match History: VAT-inclusive amounts + originalPaymentMethod for treasury-linked txs
+      const amt = getTransactionInclusiveAmount(t);
       const isIncome = normalizeTransactionType(t.type) === TransactionType.INCOME;
-      const rawMethod = String(t.paymentMethod || '').toUpperCase();
+      const rawMethod = String((t as any).originalPaymentMethod || t.paymentMethod || '').toUpperCase();
       const isCash = rawMethod === 'CASH' || rawMethod === 'TREASURY';
       const isBank = rawMethod === 'BANK' || rawMethod === 'CHEQUE';
       const netAmt = isIncome ? amt : -amt;
@@ -560,14 +599,15 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       r.expenseCategory === 'Owner Opening Balance';
     const incomeRows = txns.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
     const expenseRows = txns.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
-    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + (Number(r.amountIncludingVAT || (r as any).totalWithVat || r.amount) || 0), 0);
+    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + getTransactionInclusiveAmount(r), 0);
     // Use originalPaymentMethod for treasury-linked transactions so BANK/CHEQUE
     // treasury transfers are classified correctly instead of falling into Cash.
     const effM = (r: any) => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase();
     const ci = sumAmt(incomeRows.filter(r => { const m = effM(r); return m === 'CASH' || m === 'TREASURY'; }));
     const bi = sumAmt(incomeRows.filter(r => { const m = effM(r); return m === 'BANK' || m === 'CHEQUE'; }));
-    const ce = Math.abs(sumAmt(expenseRows.filter(r => { const m = effM(r); return m === 'CASH' || m === 'TREASURY'; })));
-    const be = Math.abs(sumAmt(expenseRows.filter(r => { const m = effM(r); return m === 'BANK' || m === 'CHEQUE'; })));
+    // Match History: do not abs() — credit-note style negatives stay signed
+    const ce = sumAmt(expenseRows.filter(r => { const m = effM(r); return m === 'CASH' || m === 'TREASURY'; }));
+    const be = sumAmt(expenseRows.filter(r => { const m = effM(r); return m === 'BANK' || m === 'CHEQUE'; }));
     const it = sumAmt(incomeRows);
     const et = sumAmt(expenseRows);
     const cashBal = prevMonthClosing.cash + ci - ce;
@@ -611,7 +651,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       .reduce((sum: number, t: any) => sum + (Number(t.amount) || 0), 0);
     const priorHeadExpenses = filteredApproved
       .filter((t: Transaction) => t.expenseCategory === 'Head Office Expense' && (t.date || '') < openingCutoff)
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      .reduce((sum, t) => sum + getTransactionInclusiveAmount(t), 0);
     const openingTotal = officeOpeningBalance + priorIn - priorOut - priorHeadExpenses;
 
     const totalIn = buildingFilteredTransfers
@@ -624,7 +664,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     const headOfficeExpenses = filteredApproved
       .filter((t: Transaction) => t.expenseCategory === 'Head Office Expense' && (t.date || '') >= periodStart && (t.date || '') <= periodEnd)
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      .reduce((sum, t) => sum + getTransactionInclusiveAmount(t), 0);
 
     const netBalance = openingTotal + totalIn - totalOut - headOfficeExpenses;
 
@@ -651,7 +691,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     ownerExpenses.forEach(t => {
       const txDate = t.date || '';
-      const amt = Number(t.amount) || 0;
+      const amt = getTransactionInclusiveAmount(t);
       if (txDate >= periodStart && txDate <= periodEnd) {
         thisMonth += amt;
       } else if (txDate < openingCutoff) {
@@ -714,8 +754,8 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       if (!months[key]) return;
       const ownerCat = (t.expenseCategory || '').trim();
       const isOwnerExp = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal';
-      if (t.type === TransactionType.INCOME) months[key].income += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
-      if (t.type === TransactionType.EXPENSE && !isOwnerExp) months[key].expense += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+      if (t.type === TransactionType.INCOME) months[key].income += getTransactionInclusiveAmount(t);
+      if (t.type === TransactionType.EXPENSE && !isOwnerExp) months[key].expense += getTransactionInclusiveAmount(t);
       months[key].net = months[key].income - months[key].expense;
     });
 
@@ -731,9 +771,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const ownerCat = (t.expenseCategory || '').trim();
       const isOwnerExp = ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal';
       if (isIncome) {
-        methods[method].income += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+        methods[method].income += getTransactionInclusiveAmount(t);
       } else if (!isOwnerExp) {
-        methods[method].expense += Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+        methods[method].expense += getTransactionInclusiveAmount(t);
       }
     });
     return Object.entries(methods)
@@ -1513,7 +1553,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
                     </div>
                   </div>
                   <div className={`text-right flex-shrink-0 ${isIncome ? 'text-emerald-600' : 'text-rose-600'}`}>
-                    <div className="font-black text-xs">{isIncome ? '+' : '-'}{Number(tx.amountIncludingVAT || (tx as any).totalWithVat || tx.amount).toLocaleString()}</div>
+                    <div className="font-black text-xs">{isIncome ? '+' : '-'}{getTransactionInclusiveAmount(tx).toLocaleString()}</div>
                     <div className="text-[9px] font-medium text-slate-400">{t('common.sar')}</div>
                   </div>
                 </div>

@@ -1,0 +1,19 @@
+# Netlify SPA + multi-page (main / owner / tenant) hosting
+[build]
+  command = "npm run build"
+  publish = "dist"
+
+[[redirects]]
+  from = "/owner"
+  to = "/owner.html"
+  status = 200
+
+[[redirects]]
+  from = "/tenant"
+  to = "/tenant.html"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
