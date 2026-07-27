@@ -5,7 +5,7 @@ import { isValidSaudiVAT } from '../utils/validators';
 import SearchableSelect from './SearchableSelect';
 import AddVendorDialog from './AddVendorDialog';
 import ConfirmDialog from './ConfirmDialog';
-import { FileText, Download, Calendar, Receipt, TrendingUp, TrendingDown, X, QrCode, FileDown, Search, Send, CheckCircle, AlertCircle, Loader, Eye, Plus, User, Sparkles, RotateCcw, FileUp, Trash2, ArrowLeftRight } from 'lucide-react';
+import { FileText, Download, Calendar, Receipt, TrendingUp, TrendingDown, X, QrCode, FileDown, Search, Send, CheckCircle, AlertCircle, Loader, Eye, Plus, User, Sparkles, RotateCcw, FileUp, Trash2, ArrowLeftRight, History, ChevronDown, ChevronRight } from 'lucide-react';
 import PdfPurchaseImport from './PdfPurchaseImport';
 import { fmtDate, dateToLocalStr } from '../utils/dateFormat';
 import { buildTransactionSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
@@ -23,6 +23,17 @@ import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 
 const ZATCA_SERVICE_URL = (import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022';
+/** Sentinel for building filter: invoices with no linked property. */
+const NO_BUILDING_FILTER = '__no_building__';
+
+const hasLinkedBuilding = (t: { buildingId?: string | null }) =>
+  Boolean(String(t.buildingId || '').trim());
+
+const matchesBuildingFilter = (t: { buildingId?: string | null }, filterBuildingId: string) => {
+  if (!filterBuildingId) return true;
+  if (filterBuildingId === NO_BUILDING_FILTER) return !hasLinkedBuilding(t);
+  return t.buildingId === filterBuildingId;
+};
 
 const companyName = 'شركة ارار ميلينيوم المحدودة';
 const companyNameEn = 'RR MILLENNIUM CO. LTD';
@@ -73,7 +84,7 @@ const VATReport: React.FC = () => {
   const [filterBuildingId, setFilterBuildingId] = useState('');
   const [filterUnit, setFilterUnit] = useState('');
   const [filteredVATTransactions, setFilteredVATTransactions] = useState<Transaction[]>([]);
-  const [reportView, setReportView] = useState<'SALES' | 'PURCHASE' | 'CREDIT_NOTE' | 'COMBINED' | 'COMPARE'>('SALES');
+  const [reportView, setReportView] = useState<'SALES' | 'PURCHASE' | 'CREDIT_NOTE' | 'COMBINED' | 'COMPARE' | 'IMPORT_HISTORY'>('SALES');
   const [selectedQRCode, setSelectedQRCode] = useState<string | null>(null);
   const [zatcaSending, setZatcaSending] = useState<Record<string, boolean>>({});
   const [zatcaStatus, setZatcaStatus] = useState<Record<string, { ok: boolean; msg: string }>>({});
@@ -131,6 +142,8 @@ const VATReport: React.FC = () => {
   const [compareSearchTerm, setCompareSearchTerm] = useState('');
   const [comparePreview, setComparePreview] = useState<Transaction | null>(null);
   const [showDuplicateInspector, setShowDuplicateInspector] = useState(false);
+  const [expandedImportBatchId, setExpandedImportBatchId] = useState<string | null>(null);
+  const [importHistorySearch, setImportHistorySearch] = useState('');
 
   useEffect(() => {
     let cancelled = false;
@@ -987,8 +1000,10 @@ const VATReport: React.FC = () => {
     if (filterToDate) filtered = filtered.filter(t => t.date <= filterToDate);
     
     // New Search & Building Filters
-    if (filterBuildingId) filtered = filtered.filter(t => t.buildingId === filterBuildingId);
-    if (filterUnit) filtered = filtered.filter(t => t.unitNumber === filterUnit);
+    if (filterBuildingId) filtered = filtered.filter(t => matchesBuildingFilter(t, filterBuildingId));
+    if (filterUnit && filterBuildingId !== NO_BUILDING_FILTER) {
+      filtered = filtered.filter(t => t.unitNumber === filterUnit);
+    }
     if (searchTerm.trim()) {
       filtered = filtered.filter((t) => {
         const h = `${buildTransactionSearchHaystack(t)} ${resolveSalesCustomerName(t) || ''}`;
@@ -1078,6 +1093,126 @@ const VATReport: React.FC = () => {
         items: list.sort((a, b) => (a.date || '').localeCompare(b.date || '') || ((a.createdAt || 0) - (b.createdAt || 0))),
       }));
   }, [importedExpenses]);
+
+  const importHistoryBatches = useMemo(() => {
+    const imported = transactions.filter((t) =>
+      (t as any).vatReportOnly &&
+      t.type === TransactionType.EXPENSE
+    );
+
+    const byBatch = new Map<string, Transaction[]>();
+    const unbatched: Transaction[] = [];
+
+    for (const tx of imported) {
+      const batchId = String((tx as any).pdfImportBatchId || '').trim();
+      if (batchId) {
+        const list = byBatch.get(batchId) || [];
+        list.push(tx);
+        byBatch.set(batchId, list);
+      } else {
+        unbatched.push(tx);
+      }
+    }
+
+    type ImportBatch = {
+      id: string;
+      fileName: string;
+      importedAt: number;
+      invoices: Transaction[];
+      invoiceCount: number;
+      totalExcl: number;
+      totalVat: number;
+      totalIncl: number;
+      isLegacy: boolean;
+    };
+
+    const batches: ImportBatch[] = [];
+
+    const summarize = (
+      id: string,
+      invoices: Transaction[],
+      fileName: string,
+      isLegacy: boolean,
+    ): ImportBatch => {
+      const sorted = [...invoices].sort(
+        (a, b) => (a.date || '').localeCompare(b.date || '') || ((a.createdAt || 0) - (b.createdAt || 0)),
+      );
+      const importedAt = Math.max(...sorted.map((t) => t.createdAt || 0), 0);
+      return {
+        id,
+        fileName,
+        importedAt,
+        invoices: sorted,
+        invoiceCount: sorted.length,
+        totalExcl: sorted.reduce((s, t) => s + (t.amountExcludingVAT ?? t.amount ?? 0), 0),
+        totalVat: sorted.reduce((s, t) => s + (t.vatAmount || 0), 0),
+        totalIncl: sorted.reduce((s, t) => s + (t.totalWithVat ?? t.amountIncludingVAT ?? 0), 0),
+        isLegacy,
+      };
+    };
+
+    for (const [id, invoices] of byBatch) {
+      const named = invoices.find((t) => (t as any).pdfImportFileName);
+      batches.push(summarize(id, invoices, (named as any)?.pdfImportFileName || 'PDF Import', false));
+    }
+
+    // Group older imports (no batch id) by createdAt proximity (~2 minutes).
+    const WINDOW_MS = 2 * 60 * 1000;
+    const legacySorted = [...unbatched].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+    let current: Transaction[] = [];
+    let groupStart = 0;
+    const flushLegacy = () => {
+      if (!current.length) return;
+      const label = current.length === 1 ? 'VAT purchase entry' : 'Import session (legacy)';
+      batches.push(summarize(`legacy-${groupStart}-${current.length}`, current, label, true));
+      current = [];
+    };
+    for (const tx of legacySorted) {
+      const ts = tx.createdAt || 0;
+      if (!current.length) {
+        current = [tx];
+        groupStart = ts;
+        continue;
+      }
+      const lastTs = current[current.length - 1].createdAt || 0;
+      if (ts - lastTs <= WINDOW_MS) {
+        current.push(tx);
+      } else {
+        flushLegacy();
+        current = [tx];
+        groupStart = ts;
+      }
+    }
+    flushLegacy();
+
+    return batches.sort((a, b) => b.importedAt - a.importedAt);
+  }, [transactions]);
+
+  const filteredImportHistoryBatches = useMemo(() => {
+    const term = importHistorySearch.trim().toLowerCase();
+    if (!term) return importHistoryBatches;
+    return importHistoryBatches.filter((batch) => {
+      if (batch.fileName.toLowerCase().includes(term)) return true;
+      if (String(batch.invoiceCount).includes(term)) return true;
+      return batch.invoices.some((tx) => {
+        const hay = [
+          tx.vendorName,
+          tx.vatInvoiceNumber,
+          (tx as any).vendorRefNo,
+          tx.details,
+          tx.vendorVATNumber,
+          fmtDate(tx.date),
+        ].filter(Boolean).join(' ').toLowerCase();
+        return hay.includes(term);
+      });
+    });
+  }, [importHistoryBatches, importHistorySearch]);
+
+  const importHistoryTotals = useMemo(() => ({
+    sessions: filteredImportHistoryBatches.length,
+    invoices: filteredImportHistoryBatches.reduce((s, b) => s + b.invoiceCount, 0),
+    totalIncl: filteredImportHistoryBatches.reduce((s, b) => s + b.totalIncl, 0),
+  }), [filteredImportHistoryBatches]);
 
   const handleCreateReversal = async () => {
     if (!reversalTarget) return;
@@ -1452,8 +1587,10 @@ const VATReport: React.FC = () => {
     let rows = vatReportTransactions.filter(t => t.isVATApplicable === true);
     if (filterFromDate) rows = rows.filter(t => t.date >= filterFromDate);
     if (filterToDate) rows = rows.filter(t => t.date <= filterToDate);
-    if (filterBuildingId) rows = rows.filter(t => t.buildingId === filterBuildingId);
-    if (filterUnit) rows = rows.filter(t => t.unitNumber === filterUnit);
+    if (filterBuildingId) rows = rows.filter(t => matchesBuildingFilter(t, filterBuildingId));
+    if (filterUnit && filterBuildingId !== NO_BUILDING_FILTER) {
+      rows = rows.filter(t => t.unitNumber === filterUnit);
+    }
     if (searchTerm.trim()) {
       rows = rows.filter((t) => {
         const h = `${buildTransactionSearchHaystack(t)} ${resolveSalesCustomerName(t) || ''}`;
@@ -2055,6 +2192,17 @@ const VATReport: React.FC = () => {
           >
             <ArrowLeftRight size={16} /> Compare
           </button>
+          <button
+            onClick={() => setReportView('IMPORT_HISTORY')}
+            className={`px-4 py-2 rounded-xl font-bold text-sm transition-all flex items-center gap-2 whitespace-nowrap ${reportView === 'IMPORT_HISTORY' ? 'bg-amber-600 text-white shadow-lg' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+          >
+            <History size={16} /> Import History
+            {importHistoryBatches.length > 0 && (
+              <span className={`text-[10px] px-1.5 py-0.5 rounded-full font-black ${reportView === 'IMPORT_HISTORY' ? 'bg-white/20 text-white' : 'bg-amber-100 text-amber-700'}`}>
+                {importHistoryBatches.reduce((s, b) => s + b.invoiceCount, 0)}
+              </span>
+            )}
+          </button>
         </div>
 
         {reportView === 'COMBINED' && (
@@ -2082,7 +2230,7 @@ const VATReport: React.FC = () => {
           </div>
         )}
 
-        {reportView !== 'COMPARE' && (
+        {reportView !== 'COMPARE' && reportView !== 'IMPORT_HISTORY' && (
           <div className="flex flex-wrap gap-4 items-center mt-6 pt-6 border-t border-slate-100">
             <div className="flex-1 min-w-[240px] relative">
               <Search size={18} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
@@ -2153,10 +2301,11 @@ const VATReport: React.FC = () => {
                 className="px-3 py-2 border border-slate-300 rounded-xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none bg-white"
               >
                 <option value="">All Buildings</option>
+                <option value={NO_BUILDING_FILTER}>No Building (unlinked)</option>
                 {buildings.map(b => <option key={b.id} value={b.id}>{b.name}</option>)}
               </select>
 
-              {filterBuildingId && (
+              {filterBuildingId && filterBuildingId !== NO_BUILDING_FILTER && (
                 <select 
                   value={filterUnit} 
                   onChange={e => setFilterUnit(e.target.value)}
@@ -2187,7 +2336,7 @@ const VATReport: React.FC = () => {
         )}
       </div>
 
-      {reportView !== 'COMPARE' && (
+      {reportView !== 'COMPARE' && reportView !== 'IMPORT_HISTORY' && (
       <div className="premium-card p-4 sm:p-5 relative">
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0 opacity-[0.03]">
           <img src="/images/logo.png" alt="" className="w-80 h-80 object-contain" />
@@ -2513,6 +2662,186 @@ const VATReport: React.FC = () => {
               })}
               {importedExpenses.length === 0 && <div className="py-16 text-center text-slate-400 font-black italic">Import purchase invoices to begin audit.</div>}
            </div>
+        </div>
+      )}
+
+      {/* Import History Tab */}
+      {reportView === 'IMPORT_HISTORY' && (
+        <div className="premium-card p-5 sm:p-6 animate-slide-up">
+          <div className="flex flex-wrap items-center justify-between gap-4 mb-6 pb-6 border-b border-slate-100">
+            <div>
+              <h3 className="text-xl font-black text-slate-800 flex items-center gap-2">
+                <History size={20} className="text-amber-600" />
+                Imported Invoice History
+              </h3>
+              <p className="text-sm text-slate-500 mt-1">
+                View each PDF import session and how many invoices were brought in.
+              </p>
+            </div>
+            <div className="flex gap-3 flex-wrap">
+              <div className="px-4 py-3 bg-amber-50 rounded-2xl border border-amber-100 text-center shadow-sm min-w-[110px]">
+                <div className="text-[10px] font-bold text-amber-600 uppercase tracking-widest mb-1">Import Sessions</div>
+                <div className="text-2xl font-black text-amber-800">{importHistoryTotals.sessions}</div>
+              </div>
+              <div className="px-4 py-3 bg-violet-50 rounded-2xl border border-violet-100 text-center shadow-sm min-w-[110px]">
+                <div className="text-[10px] font-bold text-violet-600 uppercase tracking-widest mb-1">Invoices Imported</div>
+                <div className="text-2xl font-black text-violet-800">{importHistoryTotals.invoices}</div>
+              </div>
+              <div className="px-4 py-3 bg-emerald-50 rounded-2xl border border-emerald-100 text-center shadow-sm min-w-[130px]">
+                <div className="text-[10px] font-bold text-emerald-600 uppercase tracking-widest mb-1">Total Incl. VAT</div>
+                <div className="text-2xl font-black text-emerald-800">{formatAmount(importHistoryTotals.totalIncl)}</div>
+              </div>
+            </div>
+          </div>
+
+          <div className="mb-6 flex flex-wrap gap-3 items-center">
+            <div className="flex-1 min-w-[260px] relative">
+              <Search size={16} className="absolute left-3 top-1/2 -translate-y-1/2 text-amber-400" />
+              <input
+                type="text"
+                value={importHistorySearch}
+                onChange={(e) => setImportHistorySearch(e.target.value)}
+                placeholder="Search imports by file name, vendor, invoice #, date..."
+                className="w-full pl-9 pr-4 py-2.5 bg-white border border-amber-200 rounded-xl text-sm font-semibold text-slate-700 outline-none focus:ring-2 focus:ring-amber-200"
+              />
+            </div>
+            <button
+              onClick={() => setImportHistorySearch('')}
+              className="px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-sm font-bold"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => setShowPdfImport(true)}
+              className="px-4 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-sm font-bold flex items-center gap-2"
+            >
+              <FileUp size={16} /> Import PDF
+            </button>
+          </div>
+
+          <div className="space-y-3">
+            {filteredImportHistoryBatches.map((batch) => {
+              const isOpen = expandedImportBatchId === batch.id;
+              const importedDate = batch.importedAt
+                ? fmtDate(new Date(batch.importedAt).toISOString().slice(0, 10))
+                : '—';
+              const importedTime = batch.importedAt
+                ? new Date(batch.importedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                : '';
+              return (
+                <div key={batch.id} className="rounded-2xl border border-amber-100 bg-white overflow-hidden shadow-sm">
+                  <button
+                    type="button"
+                    onClick={() => setExpandedImportBatchId(isOpen ? null : batch.id)}
+                    className="w-full px-4 py-3.5 flex flex-wrap items-center gap-3 text-left hover:bg-amber-50/50 transition-colors"
+                  >
+                    <div className="p-2 rounded-xl bg-amber-100 text-amber-700 shrink-0">
+                      {isOpen ? <ChevronDown size={18} /> : <ChevronRight size={18} />}
+                    </div>
+                    <div className="flex-1 min-w-[180px]">
+                      <div className="font-black text-slate-800 text-sm flex items-center gap-2 flex-wrap">
+                        <FileText size={14} className="text-amber-600 shrink-0" />
+                        {batch.fileName}
+                        {batch.isLegacy && (
+                          <span className="text-[9px] font-bold uppercase tracking-widest px-1.5 py-0.5 rounded bg-slate-100 text-slate-500">
+                            Legacy
+                          </span>
+                        )}
+                      </div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        Imported {importedDate}{importedTime ? ` · ${importedTime}` : ''}
+                      </div>
+                    </div>
+                    <div className="flex gap-2 flex-wrap">
+                      <div className="px-3 py-1.5 rounded-xl bg-violet-50 border border-violet-100 text-center min-w-[88px]">
+                        <div className="text-[9px] font-bold text-violet-500 uppercase tracking-widest">Invoices</div>
+                        <div className="text-lg font-black text-violet-800">{batch.invoiceCount}</div>
+                      </div>
+                      <div className="px-3 py-1.5 rounded-xl bg-slate-50 border border-slate-100 text-center min-w-[100px]">
+                        <div className="text-[9px] font-bold text-slate-400 uppercase tracking-widest">Excl. VAT</div>
+                        <div className="text-sm font-black text-slate-700">{formatAmount(batch.totalExcl)}</div>
+                      </div>
+                      <div className="px-3 py-1.5 rounded-xl bg-emerald-50 border border-emerald-100 text-center min-w-[100px]">
+                        <div className="text-[9px] font-bold text-emerald-500 uppercase tracking-widest">Incl. VAT</div>
+                        <div className="text-sm font-black text-emerald-700">{formatAmount(batch.totalIncl)}</div>
+                      </div>
+                    </div>
+                  </button>
+
+                  {isOpen && (
+                    <div className="border-t border-amber-100 bg-slate-50/40">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="text-[10px] font-bold text-slate-500 uppercase tracking-widest border-b border-slate-100">
+                              <th className="px-4 py-2.5 text-left">Date</th>
+                              <th className="px-4 py-2.5 text-left">Invoice #</th>
+                              <th className="px-4 py-2.5 text-left">Vendor</th>
+                              <th className="px-4 py-2.5 text-right">Excl.</th>
+                              <th className="px-4 py-2.5 text-right">VAT</th>
+                              <th className="px-4 py-2.5 text-right">Incl.</th>
+                              <th className="px-4 py-2.5 text-right">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {batch.invoices.map((tx) => (
+                              <tr key={tx.id} className="bg-white hover:bg-amber-50/30">
+                                <td className="px-4 py-2.5 text-slate-600 whitespace-nowrap">{fmtDate(tx.date)}</td>
+                                <td className="px-4 py-2.5 font-bold text-slate-800">{tx.vatInvoiceNumber || '—'}</td>
+                                <td className="px-4 py-2.5 text-slate-700">
+                                  <div className="font-semibold">{tx.vendorName || tx.details || '—'}</div>
+                                  {tx.vendorVATNumber && (
+                                    <div className="text-[10px] text-slate-400">VAT: {tx.vendorVATNumber}</div>
+                                  )}
+                                </td>
+                                <td className="px-4 py-2.5 text-right tabular-nums">{formatAmount(tx.amountExcludingVAT ?? tx.amount ?? 0)}</td>
+                                <td className="px-4 py-2.5 text-right tabular-nums text-blue-600">{formatAmount(tx.vatAmount || 0)}</td>
+                                <td className="px-4 py-2.5 text-right tabular-nums font-bold text-emerald-700">{formatAmount(tx.totalWithVat ?? tx.amountIncludingVAT ?? 0)}</td>
+                                <td className="px-4 py-2.5 text-right">
+                                  <div className="inline-flex gap-1">
+                                    <button
+                                      onClick={() => setComparePreview(tx)}
+                                      className="px-2.5 py-1 rounded-lg bg-violet-50 text-violet-700 text-[10px] font-bold hover:bg-violet-100"
+                                    >
+                                      View
+                                    </button>
+                                    <button
+                                      onClick={() => handleCompareDelete(tx)}
+                                      className="px-2.5 py-1 rounded-lg bg-rose-50 text-rose-700 text-[10px] font-bold hover:bg-rose-100"
+                                    >
+                                      Delete
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {filteredImportHistoryBatches.length === 0 && (
+              <div className="py-16 text-center">
+                <History size={40} className="mx-auto text-slate-300 mb-3" />
+                <div className="text-slate-400 font-black italic mb-1">
+                  {importHistorySearch.trim() ? 'No import sessions match your search.' : 'No imported invoices yet.'}
+                </div>
+                <p className="text-sm text-slate-400 mb-4">Use Import PDF to bring in purchase invoices.</p>
+                {!importHistorySearch.trim() && (
+                  <button
+                    onClick={() => setShowPdfImport(true)}
+                    className="px-5 py-2.5 bg-amber-600 text-white rounded-xl font-bold hover:bg-amber-700 inline-flex items-center gap-2"
+                  >
+                    <FileUp size={16} /> Import PDF
+                  </button>
+                )}
+              </div>
+            )}
+          </div>
         </div>
       )}
 

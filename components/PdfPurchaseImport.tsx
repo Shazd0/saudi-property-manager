@@ -419,6 +419,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
   const [parsing, setParsing]     = useState(false);
   const [parseStatus, setParseStatus] = useState('');
   const [parseError, setParseError] = useState('');
+  const [sourceFileName, setSourceFileName] = useState('');
   const fileRef = useRef<HTMLInputElement>(null);
 
   // Parsed data
@@ -474,6 +475,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
     }
     setParsing(true);
     setParseError('');
+    setSourceFileName(file.name);
     setAiNotes('');
     setExtractMethod(null);
     setParseStatus('Reading PDF…');
@@ -611,6 +613,8 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
     setImporting(true);
     let count = 0;
     const uid = auth.currentUser?.uid || 'pdf-import';
+    const batchId = `pdf-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+    const fileName = sourceFileName || 'purchase-import.pdf';
     for (const inv of toImport) {
       const tx: Omit<Transaction, 'id'> = {
         type: TransactionType.EXPENSE,
@@ -632,6 +636,9 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
         vendorVATNumber: inv.vendorVAT,
         expenseCategory: defaultCategory,
         vatReportOnly: true,
+        source: 'pdf_purchase_import',
+        pdfImportBatchId: batchId,
+        pdfImportFileName: fileName,
       } as Transaction;
       await saveTransaction(tx);
       count++;
@@ -640,7 +647,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
     setImporting(false);
     setStep('done');
     onImported();
-  }, [invoices, defaultCategory, onImported]);
+  }, [invoices, defaultCategory, onImported, sourceFileName]);
 
   // ── Derived values ──────────────────────────────────────────────────
   const dataRows      = allRows.filter(r => r.length >= colCount - 1 && r.length <= colCount + 1);

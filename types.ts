@@ -171,6 +171,10 @@ export interface Transaction {
 
   // VAT Report only — transactions imported from PDF that should ONLY appear in the VAT Report tab
   vatReportOnly?: boolean;
+  /** Groups invoices from one PDF import session. */
+  pdfImportBatchId?: string;
+  /** Original PDF file name for the import batch. */
+  pdfImportFileName?: string;
   /** Non-residential fee entry stored separately from VAT rent/sales. */
   feesEntry?: boolean;
   feeInvoiceNo?: string;
