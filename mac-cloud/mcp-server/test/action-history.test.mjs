@@ -5,7 +5,7 @@ import { createCommandCore, createCriticalReauthProofForTest } from '../command-
 import { createCommandTargetRouter, MacCommandTargetAdapter } from '../command-target-adapters.mjs';
 import { loadConfig } from '../config.mjs';
 import { FirebaseBuyerCommandAdapter } from '../firebase-command-adapter.mjs';
-import { createCloudflareAccessVerifier } from '../owner-access.mjs';
+import { createCloudflareAccessVerifier, readCloudflareAccessJwt } from '../owner-access.mjs';
 import { createApp } from '../server.mjs';
 
 const servers = [];
@@ -328,6 +328,28 @@ describe('Cloudflare Access owner auth', () => {
     });
     assert.equal(allowed.status, 200);
     assert.equal(allowed.headers.get('cache-control'), 'no-store');
+  });
+
+  test('reads Access JWT from CF_Authorization cookie and allows missing Origin for direct URL debug', async () => {
+    const req = { get(name) {
+      if (name === 'cf-access-jwt-assertion') return undefined;
+      if (name === 'cookie') return 'other=1; CF_Authorization=cookie-jwt-token';
+      return undefined;
+    } };
+    assert.equal(readCloudflareAccessJwt(req), 'cookie-jwt-token');
+    assert.equal(readCloudflareAccessJwt({ get: () => 'header-jwt' }), 'header-jwt');
+
+    const { base } = await serve();
+    const cookieAllowed = await fetch(`${base}/owner/actions`, {
+      headers: { cookie: 'CF_Authorization=valid-access' },
+    });
+    assert.equal(cookieAllowed.status, 200);
+
+    const cors = await fetch(`${base}/owner/actions`, {
+      headers: { origin: OWNER_ORIGIN, 'cf-access-jwt-assertion': 'valid-access' },
+    });
+    assert.equal(cors.headers.get('access-control-allow-credentials'), 'true');
+    assert.equal(cors.headers.get('access-control-allow-origin'), OWNER_ORIGIN);
   });
 });
 

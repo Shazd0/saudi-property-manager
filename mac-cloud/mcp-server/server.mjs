@@ -21,7 +21,7 @@ import {
 import { loadConfig } from './config.mjs';
 import { FirebaseBuyerCommandAdapter, parseBuyerCommandProjects } from './firebase-command-adapter.mjs';
 import { createRepository } from './repository.mjs';
-import { createCloudflareAccessVerifier } from './owner-access.mjs';
+import { createCloudflareAccessVerifier, readCloudflareAccessJwt } from './owner-access.mjs';
 import {
   normalizeOwnerListFilters,
   presentBuyerActionDetail,
@@ -245,10 +245,13 @@ export function createApp({
 
   function ownerCors(req, res, next) {
     const origin = req.get('origin');
-    if (!origin || !config.ownerWebOrigins?.includes(origin)) {
-      return next(statusError(403, 'ORIGIN_DENIED', 'Origin is not allowed'));
+    if (origin) {
+      if (!config.ownerWebOrigins?.includes(origin)) {
+        return next(statusError(403, 'ORIGIN_DENIED', 'Origin is not allowed'));
+      }
+      res.set('access-control-allow-origin', origin).set('vary', 'Origin');
+      res.set('access-control-allow-credentials', 'true');
     }
-    res.set('access-control-allow-origin', origin).set('vary', 'Origin');
     res.set('access-control-allow-methods', 'GET, POST, OPTIONS');
     res.set('access-control-allow-headers', 'Content-Type, Cf-Access-Jwt-Assertion, X-Request-Id');
     if (req.method === 'OPTIONS') return res.status(204).end();
@@ -258,7 +261,7 @@ export function createApp({
   async function requireOwnerAccess(req, _res, next) {
     try {
       if (!ownerAccessVerifier?.available) throw statusError(503, 'OWNER_AUTH_UNAVAILABLE', 'Owner web authentication is not configured');
-      req.principal = await ownerAccessVerifier.verify(req.get('cf-access-jwt-assertion'));
+      req.principal = await ownerAccessVerifier.verify(readCloudflareAccessJwt(req));
       if (!ownerLimiter.consume(`owner-web:${req.principal.actorId}`).allowed) {
         throw statusError(429, 'RATE_LIMITED', 'Too many requests');
       }

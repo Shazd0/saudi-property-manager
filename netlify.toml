@@ -2,12 +2,30 @@
   command = "npm run build"
   publish = "dist"
 
+[build.environment]
+  VITE_OWNER_AUTOMATION_URL = "https://mcp.amlak-app.com/owner"
+
 # Proxy Mac API through Netlify so the browser avoids cross-origin preflight.
 [[redirects]]
   from = "/api/*"
   to = "https://api.amlak-app.com/api/:splat"
   status = 200
   force = true
+
+[[redirects]]
+  from = "/owner"
+  to = "/owner.html"
+  status = 200
+
+[[redirects]]
+  from = "/tenant"
+  to = "/tenant.html"
+  status = 200
+
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
 
 [[headers]]
   for = "/*"

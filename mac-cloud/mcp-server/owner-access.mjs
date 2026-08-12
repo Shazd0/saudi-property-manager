@@ -3,6 +3,21 @@ import { createRemoteJWKSet, jwtVerify } from 'jose';
 const denied = (message = 'Owner authentication failed') =>
   Object.assign(new Error(message), { status: 401, code: 'UNAUTHORIZED' });
 
+/** Cloudflare Access JWT from header (API clients) or CF_Authorization cookie (browser login). */
+export function readCloudflareAccessJwt(req) {
+  const header = req?.get?.('cf-access-jwt-assertion');
+  if (header) return header;
+  const cookie = req?.get?.('cookie');
+  if (!cookie) return undefined;
+  const match = cookie.match(/(?:^|;\s*)CF_Authorization=([^;]+)/);
+  if (!match) return undefined;
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
 export function createCloudflareAccessVerifier({
   teamDomain,
   issuer,
