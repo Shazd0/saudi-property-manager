@@ -22,7 +22,6 @@ import {
 import { useToast } from './Toast';
 import { fmtDate } from '../utils/dateFormat';
 import { useLanguage } from '../i18n';
-import OwnerAutomationActions from './OwnerAutomationActions';
 
 interface OwnerPortalProps {
   currentUser?: User;
@@ -75,7 +74,7 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
   const { t, isRTL } = useLanguage();
   const [loading, setLoading] = useState(true);
   const [dateRange, setDateRange] = useState<'all' | 'year' | 'quarter' | 'month'>('year');
-  const [activeSection, setActiveSection] = useState<'overview' | 'report' | 'automation'>('overview');
+  const [activeSection, setActiveSection] = useState<'overview' | 'report'>('overview');
   const [expandedReportSection, setExpandedReportSection] = useState<'opening' | 'thisMonth' | null>(null);
 
   // Owner Opening Balance modal state
@@ -457,7 +456,6 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
                 {([
                   { key: 'overview', label: t('ownerPortal.tab.overview') },
                   { key: 'report', label: t('ownerPortal.tab.expenseReport') },
-                  { key: 'automation', label: t('ownerPortal.tab.actionHistory') },
                 ] as const).map(tab => (
                   <button
                     key={tab.key}
@@ -485,7 +483,6 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
                   </div>
                 )}
 
-                {activeSection !== 'automation' && (
                 <div className="flex rounded-xl overflow-hidden bg-white border border-slate-100 shadow-sm w-full sm:w-auto">
                   {(['month', 'quarter', 'year', 'all'] as const).map(range => (
                     <button
@@ -499,7 +496,6 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
                     </button>
                   ))}
                 </div>
-                )}
               </div>
             </div>
 
@@ -1174,8 +1170,6 @@ const OwnerPortal: React.FC<OwnerPortalProps> = ({ currentUser }) => {
           )}
         </div>
       )}
-
-      {activeSection === 'automation' && <OwnerAutomationActions />}
 
       {/* Footer */}
       <div className="text-center pb-4">

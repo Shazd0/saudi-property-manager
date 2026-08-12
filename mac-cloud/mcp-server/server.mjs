@@ -10,6 +10,7 @@ import { createAutomationRepository } from '../automation-worker/repository.mjs'
 import {
   AUTOMATION_TOOL_NAMES, AUTOMATION_TOOL_SCHEMAS, executeAutomationTool,
 } from './automation-tools.mjs';
+import { createAdminAutomationProvider } from './admin-automation-provider.mjs';
 import { createBuyerIdentityProvider } from './buyer-provider.mjs';
 import {
   COMMAND_ANNOTATIONS, COMMAND_TOOL_NAMES, COMMAND_TOOL_SCHEMAS, createCommandCore, executeCommandTool,
@@ -182,7 +183,7 @@ function createOwnerMcp(principal, repository, commandRepository, commandCore, a
 
 export function createApp({
   config, repository, commandRepository, commandCore, automationRepository,
-  buyerProvider, ownerAccessVerifier, now, buyerIdByProject = {},
+  buyerProvider, ownerAccessVerifier, adminAutomationProvider, now, buyerIdByProject = {},
 } = {}) {
   const app = express();
   const ownerLimiter = createRateLimiter({ limit: config.rateLimit, now });
@@ -260,8 +261,18 @@ export function createApp({
 
   async function requireOwnerAccess(req, _res, next) {
     try {
-      if (!ownerAccessVerifier?.available) throw statusError(503, 'OWNER_AUTH_UNAVAILABLE', 'Owner web authentication is not configured');
-      req.principal = await ownerAccessVerifier.verify(readCloudflareAccessJwt(req));
+      const cfJwt = readCloudflareAccessJwt(req);
+      if (cfJwt && ownerAccessVerifier?.available) {
+        req.principal = await ownerAccessVerifier.verify(cfJwt);
+      } else if (adminAutomationProvider?.available) {
+        const idToken = bearerToken(req.get('authorization'));
+        if (!idToken) throw statusError(401, 'UNAUTHORIZED', 'Owner authentication failed');
+        req.principal = await adminAutomationProvider.verify(idToken);
+      } else if (!ownerAccessVerifier?.available) {
+        throw statusError(503, 'OWNER_AUTH_UNAVAILABLE', 'Owner web authentication is not configured');
+      } else {
+        throw statusError(401, 'UNAUTHORIZED', 'Owner authentication failed');
+      }
       if (!ownerLimiter.consume(`owner-web:${req.principal.actorId}`).allowed) {
         throw statusError(429, 'RATE_LIMITED', 'Too many requests');
       }
@@ -468,6 +479,7 @@ export function createApp({
     ok: true,
     service: 'amlak-mcp',
     buyerAuthConfigured: buyerProvider.available,
+    adminAutomationConfigured: adminAutomationProvider.available,
     aiConfigured: Boolean(config.ai),
   }));
 
@@ -505,6 +517,7 @@ export async function start(env = process.env) {
     criticalReauthMaxAgeMs: config.criticalReauthMaxAgeMs,
   });
   const buyerProvider = createBuyerIdentityProvider(config.buyerProjectsJson);
+  const adminAutomationProvider = createAdminAutomationProvider(config.adminFirebaseServiceAccountJson);
   const ownerAccessVerifier = createCloudflareAccessVerifier({
     teamDomain: config.ownerAccessTeamDomain,
     issuer: config.ownerAccessIssuer,
@@ -513,7 +526,7 @@ export async function start(env = process.env) {
   });
   const app = createApp({
     config, repository, commandRepository, commandCore, automationRepository,
-    buyerProvider, ownerAccessVerifier, buyerIdByProject,
+    buyerProvider, ownerAccessVerifier, adminAutomationProvider, buyerIdByProject,
   });
   const server = app.listen(config.port, config.host, () => {
     console.log(`Amlak MCP listening on http://${config.host}:${config.port}`);

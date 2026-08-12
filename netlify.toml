@@ -3,7 +3,14 @@
   publish = "dist"
 
 [build.environment]
-  VITE_OWNER_AUTOMATION_URL = "https://mcp.amlak-app.com/owner"
+  VITE_OWNER_AUTOMATION_URL = "/owner-api"
+
+# Same-origin proxy for admin action history (avoids Cloudflare Access CORS on cross-origin fetch).
+[[redirects]]
+  from = "/owner-api/*"
+  to = "https://mcp.amlak-app.com/owner/:splat"
+  status = 200
+  force = true
 
 # Proxy Mac API through Netlify so the browser avoids cross-origin preflight.
 [[redirects]]

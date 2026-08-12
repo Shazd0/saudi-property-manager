@@ -13,8 +13,9 @@ import type {
   RollbackPreview,
   RollbackSupport,
 } from './ownerAutomationTypes';
+import { auth } from '../firebase';
 
-const API_BASE = String((import.meta as any).env?.VITE_OWNER_AUTOMATION_URL || '/owner').trim();
+const API_BASE = String((import.meta as any).env?.VITE_OWNER_AUTOMATION_URL || '/owner-api').trim();
 const REQUEST_TIMEOUT_MS = 12_000;
 const FILTER_KEYS = new Set<keyof OwnerActionFilters>([
   'tenantId', 'projectId', 'buyerId', 'bookId', 'adapter', 'status',
@@ -158,10 +159,17 @@ function responseItems(payload: unknown, context: string): { items: unknown[]; n
 }
 
 function resolveBase(): string {
-  const base = API_BASE || '/owner';
+  const base = API_BASE || '/owner-api';
   if (/^https?:\/\//i.test(base)) return base.replace(/\/+$/, '');
   const normalized = `/${base.replace(/^\/+|\/+$/g, '')}`;
   return typeof window === 'undefined' ? normalized : `${window.location.origin}${normalized}`;
+}
+
+async function authHeaders(): Promise<Record<string, string>> {
+  const user = auth.currentUser;
+  if (!user) throw new OwnerAutomationError('Sign in as an admin to view action history.', 'SIGN_IN_REQUIRED');
+  const token = await user.getIdToken();
+  return { Authorization: `Bearer ${token}` };
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<unknown> {
@@ -170,10 +178,11 @@ async function request(path: string, init: RequestInit = {}): Promise<unknown> {
   try {
     const response = await fetch(`${resolveBase()}${path}`, {
       ...init,
-      credentials: 'include',
+      credentials: 'omit',
       signal: controller.signal,
       headers: {
         Accept: 'application/json',
+        ...(await authHeaders()),
         ...(init.body ? { 'Content-Type': 'application/json' } : {}),
         ...init.headers,
       },
@@ -186,7 +195,7 @@ async function request(path: string, init: RequestInit = {}): Promise<unknown> {
       } catch { /* Do not surface raw server bodies or confirmation tokens. */ }
       throw new OwnerAutomationError(
         response.status === 401 || response.status === 403
-          ? 'Owner automation access was denied.'
+          ? 'Admin automation access was denied.'
           : response.status === 404
             ? 'The requested owner automation record was not found.'
             : 'The owner automation request could not be completed.',

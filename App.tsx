@@ -89,6 +89,7 @@ const SheetsImport = React.lazy(() => import('./components/SheetsImport'));
 const StaffChat = React.lazy(() => import('./components/StaffChat'));
 const AmlakCalls = React.lazy(() => import('./components/AmlakCalls'));
 const AccountingModule = React.lazy(() => import('./components/AccountingModule'));
+const OwnerAutomationActions = React.lazy(() => import('./components/OwnerAutomationActions'));
 
 SoundService.init();
 
@@ -771,7 +772,7 @@ const AppContent: React.FC = () => {
                     <Route path="/municipality-licenses" element={<MunicipalityLicenseTracker />} />
                     <Route path="/civil-defense" element={<CivilDefenseCompliance />} />
                     <Route path="/absher" element={<AbsherIntegration />} />
-                    <Route path="/vat-report" element={<VATReport />} />
+                    <Route path="/vat-report" element={<VATReport currentUser={user} />} />
                     <Route path="/accounting" element={<AccountingModule />} />
                     <Route path="/accounting/:tab" element={<AccountingModule />} />
                     <Route path="/invoice/:invoiceId" element={<Invoice />} />
@@ -790,6 +791,7 @@ const AppContent: React.FC = () => {
                         <Route path="/admin/sheets-import" element={<SheetsImport currentUser={user} />} />
                         <Route path="/admin/books" element={<BookManager currentUser={user} />} />
                         <Route path="/admin/remote-support" element={<AdminRemoteSupport currentUser={user} />} />
+                        <Route path="/admin/action-history" element={<OwnerAutomationActions />} />
                       </>
                     )}
                     <Route path="*" element={<Navigate to="/" />} />

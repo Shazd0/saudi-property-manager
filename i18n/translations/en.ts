@@ -220,8 +220,8 @@ const en = {
   'ownerPortal.tab.overview': 'Overview',
   'ownerPortal.tab.expenseReport': 'Expense Report',
   'ownerPortal.tab.actionHistory': 'Action History',
-  'ownerAutomation.title': 'Owner Action History',
-  'ownerAutomation.subtitle': 'Review protected automation actions and prepare explicit reversals.',
+  'ownerAutomation.title': 'Admin Action History',
+  'ownerAutomation.subtitle': 'Review automation actions and prepare explicit reversals (admin only).',
   'ownerAutomation.refresh': 'Refresh',
   'ownerAutomation.list': 'Actions',
   'ownerAutomation.empty': 'No actions match these filters.',
@@ -271,6 +271,7 @@ const en = {
   'nav.staffChat': 'Amlak Chat',
   'nav.calls': 'Amlak Calls',
   'nav.remoteSupport': 'Remote Support',
+  'nav.actionHistory': 'Action History',
   'nav.chat': 'Chat',
 
   // Chat

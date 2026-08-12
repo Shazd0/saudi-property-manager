@@ -70,6 +70,7 @@ services:
       MCP_OWNER_ACCESS_AUD: "${MCP_OWNER_ACCESS_AUD:?Set the owner-web Cloudflare Access application audience}"
       MCP_OWNER_ACCESS_EMAILS: "${MCP_OWNER_ACCESS_EMAILS:?Set allowlisted owner emails}"
       MCP_OWNER_WEB_CORS_ORIGINS: "${MCP_OWNER_WEB_CORS_ORIGINS:?Set exact owner web origins}"
+      AMLAK_ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON: "${AMLAK_ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON:-}"
       BUYER_FIREBASE_PROJECTS_JSON: "${BUYER_FIREBASE_PROJECTS_JSON:-}"
       AI_BASE_URL: "${AI_BASE_URL:-}"
       AI_API_KEY: "${AI_API_KEY:-}"

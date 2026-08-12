@@ -282,6 +282,7 @@ async function serve(options = {}) {
     commandRepository,
     commandCore,
     buyerProvider: options.buyerProvider || { available: false },
+    adminAutomationProvider: options.adminAutomationProvider || { available: false },
     ownerAccessVerifier: verifier,
   });
   const server = app.listen(0, '127.0.0.1');
@@ -350,6 +351,30 @@ describe('Cloudflare Access owner auth', () => {
     });
     assert.equal(cors.headers.get('access-control-allow-credentials'), 'true');
     assert.equal(cors.headers.get('access-control-allow-origin'), OWNER_ORIGIN);
+  });
+
+  test('accepts Firebase ADMIN bearer when admin automation provider is configured', async () => {
+    const adminAutomationProvider = {
+      available: true,
+      async verify(token) {
+        if (token !== 'admin-firebase-token') throw Object.assign(new Error('denied'), { code: 'UNAUTHORIZED' });
+        return {
+          actorType: 'owner',
+          actorId: 'admin@example.com',
+          bookId: '*',
+          accessIssuedAt: nowMs,
+        };
+      },
+    };
+    const { base } = await serve({ adminAutomationProvider });
+    const allowed = await fetch(`${base}/owner/actions`, {
+      headers: { authorization: 'Bearer admin-firebase-token', origin: OWNER_ORIGIN },
+    });
+    assert.equal(allowed.status, 200);
+    const denied = await fetch(`${base}/owner/actions`, {
+      headers: { origin: OWNER_ORIGIN },
+    });
+    assert.equal(denied.status, 401);
   });
 });
 

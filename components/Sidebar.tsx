@@ -204,6 +204,7 @@ const ALL_NAV_ITEMS: { to: string; labelKey: string; icon: any }[] = [
   { to: '/admin/backup',              labelKey: 'nav.localBackup',        icon: FolderOpen },
   { to: '/admin/cloud-backup',        labelKey: 'nav.cloudBackup',        icon: FolderOpen },
   { to: '/admin/books',               labelKey: 'nav.booksPartitions',    icon: BookOpen },
+  { to: '/admin/action-history',      labelKey: 'nav.actionHistory',      icon: History },
   { to: '/help',                      labelKey: 'nav.helpGuide',          icon: Info },
   { to: '/about',                     labelKey: 'nav.about',              icon: Info },
 ];
@@ -1006,6 +1007,7 @@ const Sidebar: React.FC<SidebarProps> = ({ user, onLogout, onToggleCollapse, pen
                   <NavItem to="/admin/backup" icon={FolderOpen} label={t('nav.localBackup')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/cloud-backup" icon={FolderOpen} label={t('nav.cloudBackup')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/books" icon={BookOpen} label={t('nav.booksPartitions')} isCollapsed={isCollapsed} />
+                  <NavItem to="/admin/action-history" icon={History} label={t('nav.actionHistory')} isCollapsed={isCollapsed} />
                   <NavItem to="/admin/remote-support" icon={ScreenShare} label={t('nav.remoteSupport')} isCollapsed={isCollapsed} />
                 </>
               )}

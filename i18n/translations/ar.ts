@@ -117,8 +117,8 @@ const ar: Record<string, string> = {
   'ownerPortal.tab.overview': 'نظرة عامة',
   'ownerPortal.tab.expenseReport': 'تقرير المصروفات',
   'ownerPortal.tab.actionHistory': 'سجل الإجراءات',
-  'ownerAutomation.title': 'سجل إجراءات المالك',
-  'ownerAutomation.subtitle': 'راجع إجراءات الأتمتة المحمية وحضّر عمليات العكس بشكل صريح.',
+  'ownerAutomation.title': 'سجل إجراءات الإدارة',
+  'ownerAutomation.subtitle': 'مراجعة إجراءات الأتمتة وإعداد التراجعات الصريحة (للمسؤول فقط).',
   'ownerAutomation.refresh': 'تحديث',
   'ownerAutomation.list': 'الإجراءات',
   'ownerAutomation.empty': 'لا توجد إجراءات تطابق عوامل التصفية.',
@@ -168,6 +168,7 @@ const ar: Record<string, string> = {
   'nav.staffChat': 'دردشة أملاك',
   'nav.calls': 'مكالمات أملاك',
   'nav.remoteSupport': 'الدعم عن بُعد',
+  'nav.actionHistory': 'سجل الإجراءات',
   'nav.chat': 'المحادثة',
 
   // Common

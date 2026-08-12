@@ -21,6 +21,7 @@ const EnvSchema = z.object({
   MCP_OWNER_WEB_CORS_ORIGINS: z.string().trim().min(1),
   ASSISTANT_CORS_ORIGINS: z.string().min(1),
   BUYER_FIREBASE_PROJECTS_JSON: optional(z.string()),
+  AMLAK_ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON: optional(z.string()),
   AI_BASE_URL: optional(z.string().url()),
   AI_API_KEY: optional(z.string().min(1)),
   AI_MODEL: optional(z.string().min(1)),
@@ -83,6 +84,7 @@ export function loadConfig(env = process.env) {
     ownerWebOrigins,
     assistantOrigins,
     buyerProjectsJson: value.BUYER_FIREBASE_PROJECTS_JSON,
+    adminFirebaseServiceAccountJson: value.AMLAK_ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON,
     ai: value.AI_BASE_URL && value.AI_MODEL ? {
       baseUrl: value.AI_BASE_URL.replace(/\/$/, ''),
       apiKey: value.AI_API_KEY,
