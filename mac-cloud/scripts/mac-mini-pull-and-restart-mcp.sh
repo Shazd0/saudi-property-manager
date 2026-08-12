@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Run on the Mac Mini after git pull to rebuild MCP with latest fixes.
 set -euo pipefail
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"
 ENV_FILE="${ENV_FILE:-$ROOT/.env}"
 [[ -f "$ENV_FILE" ]] || ENV_FILE="$ROOT/.env.mac.local"
