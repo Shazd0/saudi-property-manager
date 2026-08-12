@@ -2,6 +2,14 @@
 
 This guide exposes only the Amlak API from the Mac mini through Cloudflare Tunnel. Your landing page can stay on the root domain, while the backend uses a subdomain such as `api.yourdomain.com`.
 
+## Owner MCP and automation
+
+For the owner full-control MCP, durable worker, existing-volume schema/role
+deployment, Streamable HTTP client setup, and security runbook, follow
+[`mac-cloud/MCP.md`](mac-cloud/MCP.md). The MCP is a separate protected endpoint;
+do not expose its local ports or PostgreSQL through the API tunnel described
+below.
+
 ## Recommended Domain Layout
 
 Keep your existing landing page unchanged:

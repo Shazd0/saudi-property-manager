@@ -8,7 +8,7 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-amlak}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-amlak_local_password}
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
     volumes:
       - amlak_postgres_data:/var/lib/postgresql/data
       - ./mac-cloud/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
@@ -36,6 +36,73 @@ services:
       FCM_PUSH_URL: ${FCM_PUSH_URL:-http://fcm-push:3200}
     ports:
       - "${AMLAK_API_PORT:-8787}:${AMLAK_API_PORT:-8787}"
+
+  # Owner MCP (/mcp bearer), owner action-history (/owner Cloudflare Access JWT),
+  # and buyer assistant APIs. Image: mac-cloud/Dockerfile; command overrides start:mcp.
+  # Publish on loopback only; expose remotely via Tailscale or Cloudflare Tunnel+Access.
+  # See mac-cloud/MCP.md, mac-cloud/DEPLOY_CHECKLIST.md, mac-cloud/.env.example.
+  mcp:
+    build:
+      context: ./mac-cloud
+    container_name: amlak-mcp
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["npm", "run", "start:mcp"]
+    environment:
+      MCP_HOST: 0.0.0.0
+      MCP_PORT: 8791
+      MCP_OWNER_TOKEN: "${MCP_OWNER_TOKEN:?Set a generated 32+ character MCP owner token}"
+      MCP_OWNER_ID: "${MCP_OWNER_ID:?Set the authenticated owner identity}"
+      MCP_ALLOWED_HOSTS: "${MCP_ALLOWED_HOSTS:-127.0.0.1,localhost}"
+      # Use the limited amlak_mcp role documented in mac-cloud/schema.sql / MCP.md.
+      MCP_DATABASE_URL: "${MCP_DATABASE_URL:?Set the read-only MCP database URL}"
+      MCP_COMMAND_DATABASE_URL: "${MCP_COMMAND_DATABASE_URL:?Set the command database URL}"
+      MCP_MAC_TENANT_ID: "${MCP_MAC_TENANT_ID:?Set the stable Mac tenant ID}"
+      MCP_CRITICAL_ACTION_SECRET: "${MCP_CRITICAL_ACTION_SECRET:?Set the critical action secret}"
+      MCP_CONFIRMATION_TTL_MS: "${MCP_CONFIRMATION_TTL_MS:-120000}"
+      MCP_CRITICAL_REAUTH_MAX_AGE_MS: "${MCP_CRITICAL_REAUTH_MAX_AGE_MS:-300000}"
+      ASSISTANT_CORS_ORIGINS: "${ASSISTANT_CORS_ORIGINS:?Set exact buyer application origins}"
+      # Owner-web Access app AUD (JWT). Separate /mcp Access AUD is console-only.
+      MCP_OWNER_ACCESS_TEAM_DOMAIN: "${MCP_OWNER_ACCESS_TEAM_DOMAIN:?Set the Cloudflare Access team domain}"
+      MCP_OWNER_ACCESS_ISSUER: "${MCP_OWNER_ACCESS_ISSUER:?Set the Cloudflare Access issuer}"
+      MCP_OWNER_ACCESS_AUD: "${MCP_OWNER_ACCESS_AUD:?Set the owner-web Cloudflare Access application audience}"
+      MCP_OWNER_ACCESS_EMAILS: "${MCP_OWNER_ACCESS_EMAILS:?Set allowlisted owner emails}"
+      MCP_OWNER_WEB_CORS_ORIGINS: "${MCP_OWNER_WEB_CORS_ORIGINS:?Set exact owner web origins}"
+      BUYER_FIREBASE_PROJECTS_JSON: "${BUYER_FIREBASE_PROJECTS_JSON:-}"
+      AI_BASE_URL: "${AI_BASE_URL:-}"
+      AI_API_KEY: "${AI_API_KEY:-}"
+      AI_MODEL: "${AI_MODEL:-}"
+      MCP_QUERY_TIMEOUT_MS: "${MCP_QUERY_TIMEOUT_MS:-5000}"
+      MCP_RATE_LIMIT: "${MCP_RATE_LIMIT:-60}"
+    ports:
+      - "127.0.0.1:${MCP_PORT:-8791}:8791"
+
+  # Same mac-cloud image; command overrides start:automation. Keep dispatcher maps
+  # empty ({}) until real credentials exist (fail closed / dead-letter).
+  automation-worker:
+    build:
+      context: ./mac-cloud
+    container_name: amlak-automation-worker
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["npm", "run", "start:automation"]
+    environment:
+      AUTOMATION_DATABASE_URL: "${AUTOMATION_DATABASE_URL:?Set the automation worker database URL}"
+      AUTOMATION_EVENT_TOKEN: "${AUTOMATION_EVENT_TOKEN:?Set a generated 43+ character event token}"
+      AUTOMATION_EVENT_PORT: 8792
+      AUTOMATION_CONTAINER_MODE: "true"
+      AUTOMATION_POLL_MS: "${AUTOMATION_POLL_MS:-5000}"
+      AUTOMATION_REQUEST_TIMEOUT_MS: "${AUTOMATION_REQUEST_TIMEOUT_MS:-10000}"
+      AUTOMATION_OUTBOX_ENDPOINTS_JSON: "${AUTOMATION_OUTBOX_ENDPOINTS_JSON:-{}}"
+      AUTOMATION_JOB_ENDPOINTS_JSON: "${AUTOMATION_JOB_ENDPOINTS_JSON:-{}}"
+      AUTOMATION_SERVICE_TOKENS_JSON: "${AUTOMATION_SERVICE_TOKENS_JSON:-{}}"
+    # Internal event ingestion stays loopback-only on the host.
+    ports:
+      - "127.0.0.1:${AUTOMATION_EVENT_PORT:-8792}:8792"
 
   # WhatsApp-style call ring when app is closed
   fcm-push:
