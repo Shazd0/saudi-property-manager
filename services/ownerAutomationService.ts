@@ -15,6 +15,21 @@ import type {
 } from './ownerAutomationTypes';
 import { auth } from '../firebase';
 
+const AMLAK_ADMIN_PREFIX = 'amlak-admin.';
+
+function staffAdminId(): string | undefined {
+  try {
+    const session = JSON.parse(localStorage.getItem('savedUserSession') || '{}');
+    const role = String(session.role || '').trim().toUpperCase();
+    if (role !== 'ADMIN') return undefined;
+    const id = String(session.id || session.uid || '').trim();
+    if (!id || id.length > 128 || !/^[A-Za-z0-9._:@-]+$/.test(id)) return undefined;
+    return id;
+  } catch {
+    return undefined;
+  }
+}
+
 const API_BASE = String((import.meta as any).env?.VITE_OWNER_AUTOMATION_URL || '/owner-api').trim();
 const REQUEST_TIMEOUT_MS = 12_000;
 const FILTER_KEYS = new Set<keyof OwnerActionFilters>([
@@ -166,10 +181,12 @@ function resolveBase(): string {
 }
 
 async function authHeaders(): Promise<Record<string, string>> {
-  const user = auth.currentUser;
-  if (!user) throw new OwnerAutomationError('Sign in as an admin to view action history.', 'SIGN_IN_REQUIRED');
-  const token = await user.getIdToken();
-  return { Authorization: `Bearer ${token}` };
+  if (auth.currentUser) {
+    return { Authorization: `Bearer ${await auth.currentUser.getIdToken()}` };
+  }
+  const staffId = staffAdminId();
+  if (staffId) return { Authorization: `Bearer ${AMLAK_ADMIN_PREFIX}${staffId}` };
+  throw new OwnerAutomationError('Sign in as an admin to view action history.', 'SIGN_IN_REQUIRED');
 }
 
 async function request(path: string, init: RequestInit = {}): Promise<unknown> {
