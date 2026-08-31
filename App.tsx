@@ -64,7 +64,7 @@ import FloatingToolsDock from './components/FloatingToolsDock';
 import FloatingCalculator from './components/FloatingCalculator';
 import OfflineBanner from './components/OfflineBanner';
 import { UserRole } from './types';
-import { getUsers, setUserScope } from './services/firestoreService';
+import { getUserById, setUserScope } from './services/firestoreService';
 import { startStaffLocationReporting } from './services/staffLocationService';
 import { BookProvider, useBook } from './contexts/BookContext';
 import BookManager from './components/BookManager';
@@ -94,8 +94,6 @@ const OwnerAutomationActions = React.lazy(() => import('./components/OwnerAutoma
 SoundService.init();
 
 const TAB_UI_STATE_PREFIX = 'tab-ui-state:';
-const isMacDataBackend = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
-
 const getRouteFromHash = (hash: string): string => {
   const normalized = hash || '#/';
   const withoutHash = normalized.startsWith('#') ? normalized.slice(1) : normalized;
@@ -368,7 +366,6 @@ const AppContent: React.FC = () => {
   // users who open the chat page.
   useEffect(() => {
     if (!user) return;
-    if (isMacDataBackend()) return;
     const userId = user.id || user.uid || 'unknown';
     const userName = (user as any).name || (user as any).displayName || (user as any).email || 'User';
 
@@ -396,7 +393,6 @@ const AppContent: React.FC = () => {
   }, [user]);
 
   useEffect(() => {
-    if (isMacDataBackend()) return;
     if (!user || isAdminLikeUser(user) || String((user as any).role || '').toUpperCase() === 'OWNER') return;
     return startStaffLocationReporting(user as any);
   }, [user?.id, user?.role]);
@@ -407,10 +403,8 @@ const AppContent: React.FC = () => {
     let cancelled = false;
     const refreshUserFlags = async () => {
       try {
-        const users = await getUsers({ includeDeleted: true });
-        if (cancelled) return;
-        const latest = users.find((item: any) => item.id === userId);
-        if (!latest) return;
+        const latest = await getUserById(userId, { includeDeleted: true });
+        if (cancelled || !latest) return;
         const watchedKeys = ['onVacation', 'vacationNote', 'vacationUpdatedAt', 'status', 'hasSystemAccess'];
         const changed = watchedKeys.some(key => (latest as any)[key] !== (user as any)[key]);
         if (!changed) return;
@@ -508,7 +502,6 @@ const AppContent: React.FC = () => {
 
   // Initialize cloud backup (auto-restore on first load)
   useEffect(() => {
-    if (isMacDataBackend()) return;
     if (user) {
       const accessToken = localStorage.getItem('gdrive_access_token');
       if (accessToken) {

@@ -1,0 +1,57 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function isSignedIn() {
+      return request.auth != null
+        && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function authProfile() {
+      return firestore.get(/databases/(default)/documents/authIndex/$(request.auth.uid)).data;
+    }
+
+    function hasAuthIndex() {
+      return isSignedIn()
+        && firestore.exists(/databases/(default)/documents/authIndex/$(request.auth.uid));
+    }
+
+    function isStaff() {
+      return hasAuthIndex()
+        && authProfile().kind in ['staff', 'owner'];
+    }
+
+    function userBookId() {
+      return authProfile().bookId;
+    }
+
+    function canAccessBook(teamCode) {
+      return isStaff() && (authProfile().role in ['ADMIN', 'MANAGER'] || userBookId() == teamCode);
+    }
+
+    // Migrated buyer assets: books/{teamCode}/...
+    match /books/{teamCode}/{allPaths=**} {
+      allow read, write: if canAccessBook(teamCode);
+    }
+
+    match /company/{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+
+    match /invoices/{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+
+    match /tenant/{customerId}/{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+
+    match /profiles/{userId}/{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if isStaff();
+    }
+  }
+}

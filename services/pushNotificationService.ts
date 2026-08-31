@@ -19,7 +19,7 @@ import { db } from '../firebase';
 import { collection, getDocs, query, where, doc, setDoc, deleteDoc, addDoc } from 'firebase/firestore';
 import { macListCollection, macSaveDocument } from './macApiClient';
 
-const usesMacData = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
+const usesMacData = () => false;
 
 // ─── VAPID key (Web Push certificate from Firebase Console) ───
 // Intentionally empty by default. A valid public VAPID key must be configured in Settings.
@@ -357,6 +357,7 @@ export const notifyAdminsOfRequest = async (data: ApprovalNotificationData): Pro
     transaction_delete: { emoji: '🗑️', label: 'Delete Transaction' },
     transaction_edit:   { emoji: '✏️', label: 'Edit Transaction' },
     contract_finalize:  { emoji: '📋', label: 'Finalize Contract' },
+    contract_reverse:   { emoji: '↩️', label: 'Reverse Finalize Contract' },
     contract_delete:    { emoji: '🗑️', label: 'Delete Contract' },
   };
 

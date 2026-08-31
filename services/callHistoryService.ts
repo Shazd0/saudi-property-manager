@@ -17,7 +17,7 @@ export interface CallHistoryEntry {
 
 const HISTORY_LIMIT = 200;
 
-const usesMacData = () => (import.meta as any).env?.VITE_DATA_BACKEND === 'mac';
+const usesMacData = () => false;
 
 const storageKey = (userId: string) => `amlak-call-history:${userId}`;
 

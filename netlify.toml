@@ -13,11 +13,7 @@
   force = true
 
 # Proxy Mac API through Netlify so the browser avoids cross-origin preflight.
-[[redirects]]
-  from = "/api/*"
-  to = "https://api.amlak-app.com/api/:splat"
-  status = 200
-  force = true
+# Removed after Firebase migration — data is read/written directly from Firestore.
 
 [[redirects]]
   from = "/owner"

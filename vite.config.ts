@@ -4,7 +4,6 @@ import react from '@vitejs/plugin-react';
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, '.', '');
-  const macProxyTarget = (env.VITE_MAC_PROXY_TARGET || 'https://api.amlak-app.com').replace(/\/+$/, '');
   const ollamaTarget = (env.VITE_LOCAL_AI_PROXY_TARGET || 'http://127.0.0.1:11434').replace(/\/+$/, '');
 
   const ollamaProxy = {
@@ -24,14 +23,8 @@ export default defineConfig(({ mode }) => {
       port: Number(env.VITE_DEV_SERVER_PORT) || 5220,
       strictPort: true,
       open: false,
-      // Same-origin /api → Mac Mini; /ollama → local Ollama (avoids localhost vs 127.0.0.1 CORS).
+      // /ollama → local Ollama (avoids localhost vs 127.0.0.1 CORS).
       proxy: {
-        '/api': {
-          target: macProxyTarget,
-          changeOrigin: true,
-          secure: true,
-          ws: true,
-        },
         ...ollamaProxy,
       },
     },

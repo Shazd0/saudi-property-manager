@@ -13,6 +13,8 @@ import {
 } from 'firebase/firestore';
 import { macGetDocument, macListCollection, macSaveDocument } from './macApiClient';
 import { macSignaling } from './macSignalingClient';
+import { getMacApiUrlEnv, isBrowserLocalHost, isPrivateOrLocalBackendUrl } from '../utils/macApiBase';
+import { isMacApiPollingAllowed } from '../utils/macApiHealth';
 
 export type CallType = 'audio' | 'video';
 export type CallStatus = 'ringing' | 'connecting' | 'active' | 'ended' | 'missed' | 'declined' | 'busy';
@@ -47,34 +49,9 @@ export interface CallSignal {
   createdAt?: any;
 }
 
-const MAC_API_URL = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
+const MAC_API_URL = getMacApiUrlEnv() || 'http://mac-mini.local:8787';
 
-const isBrowserLocalHost = () => {
-  if (typeof window === 'undefined') return true;
-  return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname);
-};
-
-const isPrivateOrLocalBackendUrl = (value: unknown): boolean => {
-  const raw = String(value || '').trim();
-  if (!raw) return false;
-  try {
-    const hostname = new URL(raw).hostname.toLowerCase();
-    if (['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname)) return true;
-    if (hostname.endsWith('.local')) return true;
-    if (/^10\./.test(hostname)) return true;
-    if (/^192\.168\./.test(hostname)) return true;
-    const private172 = hostname.match(/^172\.(\d+)\./);
-    return !!private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31;
-  } catch {
-    return false;
-  }
-};
-
-export const isMacCallBackend = () => {
-  if ((import.meta as any).env?.VITE_DATA_BACKEND !== 'mac') return false;
-  if (!isBrowserLocalHost() && isPrivateOrLocalBackendUrl(MAC_API_URL)) return false;
-  return true;
-};
+export const isMacCallBackend = () => false;
 
 export const ICE_SERVERS: RTCIceServer[] = [
   { urls: 'stun:stun.l.google.com:19302' },
@@ -116,6 +93,7 @@ function emitMacSession(sessionId: string, session: VoiceCallSession | null) {
 }
 
 async function macRefreshSessions() {
+  if (!isMacApiPollingAllowed()) return;
   try {
     const remote = await macListCollection<VoiceCallSession>('voiceCallSessions', {
       orderField: 'updatedAt',
@@ -319,6 +297,7 @@ export const listenIncomingVoiceCalls = (
     });
 
     const pollPending = window.setInterval(async () => {
+      if (!isMacApiPollingAllowed()) return;
       const rings = await macSignaling.fetchPendingRings(userId);
       rings.forEach((r: any) => {
         if (r.session) {

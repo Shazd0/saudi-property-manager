@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { User } from '../types';
 import { mockLogin, isOwnerPortalAccount, OWNER_PORTAL_ONLY_LOGIN } from '../services/firestoreService';
+import { loginWithFirebaseAuth } from '../services/authService';
 import { Building2, ArrowRight, Lock, User as UserIcon, Fingerprint, Eye, EyeOff, KeyRound, AlertCircle, CheckCircle, Sparkles, Tag } from 'lucide-react';
 import SoundService from '../services/soundService';
 import { useLanguage } from '../i18n';
@@ -115,7 +116,17 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
     setError('');
 
     try {
-      const user = await mockLogin(id, password);
+      let user: User | null = null;
+      try {
+        user = await loginWithFirebaseAuth(id, password);
+      } catch (authErr: any) {
+        const code = String(authErr?.code || '');
+        if (code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password') {
+          user = await mockLogin(id, password);
+        } else {
+          throw authErr;
+        }
+      }
       if (user) {
         if(user.status === 'Inactive') {
             setError('Account is inactive. Contact Admin.');

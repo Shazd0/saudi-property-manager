@@ -10,8 +10,9 @@ import { getNextVatInvoiceNumber } from "../utils/vatInvoiceNumber";
 import { compactAmlakWorkbook } from "../utils/amlakSheetPosting";
 import { syncTransactionIntoAmlakWorkbooks } from "../utils/amlakWorkbookTransactionSync";
 import { bankAccountKey, bankReferencePatch, countRecordsByBank, type BankReferenceField } from "../utils/bankAccounts";
-import { getCached, setCached, invalidateFirestoreCache } from "./firestoreCache";
+import { getCached, setCached, invalidateFirestoreCache, invalidateCollectionCache } from "./firestoreCache";
 import { macDeleteDocument, macGetDocument, macListCollection, macSaveDocument } from "./macApiClient";
+import { getMacApiUrlEnv, isBrowserLocalHost, isPrivateOrLocalBackendUrl, resolveMacRestApiBase } from "../utils/macApiBase";
 
 /** Hash a password with SHA-256 using the Web Crypto API (browser-compatible). */
 export const hashPassword = async (plain: string): Promise<string> => {
@@ -139,46 +140,11 @@ const FIRESTORE_STORAGE_ESTIMATE_COLLECTIONS = Array.from(new Set([
   ...Array.from(ALL_AMLAK_MAC_COLLECTIONS),
 ]));
 
-const isBrowserLocalHost = () => {
-  if (typeof window === 'undefined') return true;
-  return ['localhost', '127.0.0.1', '::1', '[::1]'].includes(window.location.hostname);
-};
-
-const isPrivateOrLocalBackendUrl = (value: unknown): boolean => {
-  const raw = String(value || '').trim();
-  if (!raw) return false;
-  try {
-    const hostname = new URL(raw).hostname.toLowerCase();
-    if (['localhost', '127.0.0.1', '::1', '[::1]'].includes(hostname)) return true;
-    if (hostname.endsWith('.local')) return true;
-    if (/^10\./.test(hostname)) return true;
-    if (/^192\.168\./.test(hostname)) return true;
-    const private172 = hostname.match(/^172\.(\d+)\./);
-    return !!private172 && Number(private172[1]) >= 16 && Number(private172[1]) <= 31;
-  } catch {
-    return false;
-  }
-};
-
-const useMacBackend = () => {
-  if ((import.meta as any).env?.VITE_DATA_BACKEND !== 'mac') return false;
-  const apiUrl = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
-  if (!isBrowserLocalHost() && isPrivateOrLocalBackendUrl(apiUrl)) {
-    console.warn('[Amlak] Ignoring local Mac backend URL on hosted site. Falling back to Firestore.', apiUrl);
-    return false;
-  }
-  return true;
-};
-const useMacCollection = (name: string) => useMacBackend() && ALL_AMLAK_MAC_COLLECTIONS.has(name);
+const useMacBackend = () => false;
+const useMacCollection = (_name: string) => false;
 
 if (typeof window !== 'undefined') {
-  const macOn = useMacBackend();
-  const apiUrl = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
-  console.info(
-    macOn
-      ? `[Amlak] Data backend: Mac Mini API (${apiUrl || '/'})`
-      : '[Amlak] Data backend: Firebase Firestore (set VITE_DATA_BACKEND=mac in .env.local to use Mac Mini)',
-  );
+  console.info('[Amlak] Data backend: Firebase Firestore (saudi-property-manager)');
 }
 
 const macSave = async (name: string, data: any, bookId = currentBookId, merge = false) => {
@@ -464,7 +430,7 @@ export const listenTransactions = (callback: (transactions: any[]) => void) => {
       if (!cancelled) callback(rows || []);
     };
     void load();
-    const timer = window.setInterval(load, 5000);
+    const timer = window.setInterval(load, 30000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -491,7 +457,7 @@ type SaveTransactionOptions = {
 
 export const saveTransaction = async (t: any, options?: SaveTransactionOptions) => {
   const data = sanitize(t);
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('transactions', currentBookId);
   let result: any;
   if (useMacCollection('transactions')) result = await macSave('transactions', data);
   else if (!t.id) result = await addDoc(fsCollection( "transactions"), data);
@@ -515,7 +481,7 @@ export const listenAmlakWorkbooks = (callback: (workbooks: any[]) => void) => {
       if (!cancelled) callback(rows || []);
     };
     void load();
-    const timer = window.setInterval(load, 1000);
+    const timer = window.setInterval(load, 15000);
     return () => {
       cancelled = true;
       window.clearInterval(timer);
@@ -541,8 +507,7 @@ export const saveAmlakWorkbook = async (workbook: any) => {
     ...compacted,
     updatedAt: Date.now(),
   });
-  invalidateFirestoreCache('col:');
-  if (useMacCollection('amlakSheets')) return macSave('amlakSheets', data);
+  invalidateCollectionCache('amlakSheets', currentBookId);
   if (!workbook.id) return addDoc(fsCollection("amlakSheets"), data);
   return setDoc(fsDoc("amlakSheets", workbook.id), data);
 };
@@ -564,7 +529,7 @@ const syncSavedTransactionToAmlakSheets = async (tx: any) => {
 };
 
 export const deleteAmlakWorkbook = async (id: string) => {
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('amlakSheets', currentBookId);
   if (useMacCollection('amlakSheets')) return macSave('amlakSheets', { id, deleted: true, updatedAt: Date.now() });
   return setDoc(fsDoc("amlakSheets", id), { deleted: true, updatedAt: Date.now() }, { merge: true } as any);
 };
@@ -705,7 +670,7 @@ export const getBuildings = async (opts?: { includeDeleted?: boolean }) => {
 };
 export const saveBuilding = async (b: any) => {
   const data = sanitize(b);
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('buildings', currentBookId);
   if (useMacCollection('buildings')) return macSave('buildings', data);
   if (!b.id) return addDoc(fsCollection( "buildings"), data);
   return setDoc(fsDoc( "buildings", b.id), data);
@@ -881,7 +846,7 @@ export const getCustomers = async (opts?: GetCustomersOptions) => {
 export const saveCustomer = async (c: any) => {
   const data = sanitize(c);
   invalidateFirestoreCache('customers:');
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('customers', currentBookId);
   const activeBook = getCurrentBookId();
   if (useMacCollection('customers')) {
     const saved = await macSave('customers', data, 'default');
@@ -918,7 +883,7 @@ export const saveCustomer = async (c: any) => {
 };
 export const deleteCustomer = async (id: string) => {
   invalidateFirestoreCache('customers:');
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('customers', currentBookId);
   if (useMacCollection('customers')) return macDelete('customers', id);
   return deleteDoc(fsDoc( "customers", id));
 };
@@ -991,6 +956,23 @@ export const getCustomersAcrossBooks = async (opts?: { includeDeleted?: boolean 
 
 export const getUsers = async (opts?: { includeDeleted?: boolean }) => {
   return getCollection("users", { includeDeleted: !!opts?.includeDeleted });
+};
+
+/** Fetch a single user doc — avoids loading the entire users collection for flag sync. */
+export const getUserById = async (userId: string, opts?: { includeDeleted?: boolean }): Promise<any | null> => {
+  if (!userId) return null;
+  if (useMacCollection('users')) {
+    return macGetDocument('users', userId, { bookId: currentBookId, includeDeleted: !!opts?.includeDeleted });
+  }
+  try {
+    const snap = await getDoc(fsDoc('users', userId));
+    if (!snap.exists()) return null;
+    const row = { id: snap.id, ...(snap.data() as any) };
+    if (!opts?.includeDeleted && (row as any).deleted) return null;
+    return row;
+  } catch {
+    return null;
+  }
 };
 
 /**
@@ -1085,6 +1067,41 @@ export const getProfilePhoto = (userId: string): string | null => {
 export const deleteUser = async (id: string) => {
   if (useMacCollection('users')) return macDelete('users', id);
   return deleteDoc(fsDoc( "users", id));
+};
+
+async function findUserByField(field: 'id' | 'firebaseUid', value: string): Promise<{ user: any; bookId: string; colPath: string } | null> {
+  const q = query(_colRef(assertDb(), 'users'), where(field, '==', value));
+  const snap = await getDocs(q as any);
+  const arr = toArray(snap);
+  if (arr[0]) return { user: arr[0], bookId: 'default', colPath: 'users' };
+  try {
+    const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
+    for (const bDoc of booksSnap.docs) {
+      const bookId = bDoc.id;
+      const bq = query(_colRef(assertDb(), `book_${bookId}_users`), where(field, '==', value));
+      const bSnap = await getDocs(bq as any);
+      const bArr = toArray(bSnap);
+      if (bArr[0]) return { user: bArr[0], bookId, colPath: `book_${bookId}_users` };
+    }
+  } catch {
+    /* books collection may not exist yet */
+  }
+  return null;
+}
+
+export const loadUserByLoginId = async (id: string) => {
+  const found = await findUserByField('id', id);
+  return found ? { ...found.user, bookId: found.bookId } : null;
+};
+
+export const loadUserByFirebaseUid = async (uid: string, preferredBookId?: string) => {
+  const found = await findUserByField('firebaseUid', uid);
+  if (found) return { ...found.user, bookId: found.bookId };
+  if (preferredBookId) {
+    const byId = await findUserByField('id', uid);
+    if (byId) return { ...byId.user, bookId: byId.bookId };
+  }
+  return null;
 };
 
 export const mockLogin = async (id: string, pass: string) => {
@@ -1546,7 +1563,7 @@ export const updateBankAccount = async (
   const shouldDeleteOriginalNameDoc = !originalBankId && documentNameChanged;
   if (!referenceNameChanged) {
     if (shouldDeleteOriginalNameDoc) await deleteBank(originalName).catch(() => {});
-    invalidateFirestoreCache('col:');
+    invalidateCollectionCache('banks', currentBookId);
     return {
       renamed: documentNameChanged,
       transactionsUpdated: 0,
@@ -1569,7 +1586,8 @@ export const updateBankAccount = async (
   ]);
 
   if (shouldDeleteOriginalNameDoc) await deleteBank(originalName).catch(() => {});
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('banks', currentBookId);
+  invalidateCollectionCache('transactions', currentBookId);
   await (useMacCollection('audit')
     ? macSave('audit', sanitize({
       action: 'UPDATE_BANK_ACCOUNT',
@@ -1609,7 +1627,7 @@ export const getContracts = async (opts?: { includeDeleted?: boolean }) => {
 };
 export const saveContract = async (c: any) => {
   const data = sanitize(c);
-  invalidateFirestoreCache('col:');
+  invalidateCollectionCache('contracts', currentBookId);
   if (useMacCollection('contracts')) return macSave('contracts', data);
   if (!c.id) return addDoc(fsCollection( "contracts"), data);
   return setDoc(fsDoc( "contracts", c.id), data);
@@ -1847,6 +1865,9 @@ export const approveRequest = async (approvalId: string, approverId: string, app
     } else if (ap.type === 'contract_finalize' && ap.payload && ap.targetCollection === 'contracts' && ap.targetId) {
       const data = sanitize(ap.payload);
       await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
+    } else if (ap.type === 'contract_reverse' && ap.payload && ap.targetCollection === 'contracts' && ap.targetId) {
+      const data = sanitize(ap.payload);
+      await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
     } else if (ap.type === 'contract_delete' && ap.payload && ap.targetCollection === 'contracts' && ap.targetId) {
       const data = sanitize(ap.payload);
       await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);
@@ -1959,6 +1980,23 @@ export const requestContractFinalize = async (requestorId: string, contractId: s
     const { notifyAdminsOfRequest } = await import('./pushNotificationService');
     const userName = await getUserName(requestorId);
     notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_finalize', requestedBy: userName, targetId: contractId }).catch(() => {});
+  }, 'approval notification');
+  return r;
+};
+
+export const requestContractReverse = async (requestorId: string, contractId: string, payload: any) => {
+  const req = sanitize({ type: 'contract_reverse', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  if (useMacCollection('approvals')) {
+    const r = await macSave('approvals', req);
+    runInBackground(macSave('audit', { action: 'REQUEST_CONTRACT_REVERSE', details: `Reverse finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
+    return { id: (r as any).id } as any;
+  }
+  const r = await addDoc(fsCollection( 'approvals'), req);
+  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_REVERSE', details: `Reverse finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+  runInBackground(async () => {
+    const { notifyAdminsOfRequest } = await import('./pushNotificationService');
+    const userName = await getUserName(requestorId);
+    notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_reverse', requestedBy: userName, targetId: contractId }).catch(() => {});
   }, 'approval notification');
   return r;
 };
@@ -2403,7 +2441,8 @@ export const saveTransfer = async (t: any) => {
   const data = sanitize(t);
   if (useMacCollection('transfers')) {
     const saved = await macSave('transfers', data);
-    invalidateFirestoreCache('col:');
+    invalidateCollectionCache('transfers', currentBookId);
+    invalidateCollectionCache('transactions', currentBookId);
     return saved;
   }
   try {
@@ -3049,6 +3088,36 @@ export const getTransactionsAllBooks = async (opts?: { includeDeleted?: boolean 
   const firestoreBooks = await getBooks();
   let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
   if (!bookList.some(b => b.id === 'default')) bookList.unshift({ id: 'default', name: 'Main Book' });
+
+  if (useMacBackend()) {
+    const perBook = await Promise.all(
+      bookList.map(async (bk) => {
+        try {
+          const rows = await macListCollection('transactions', {
+            bookId: bk.id,
+            includeDeleted,
+            orderField: 'date',
+          });
+          return rows
+            .filter((t: any) => includeDeleted || !t.deleted)
+            .map((t: any) => {
+              const rawBuildingId = t.buildingId;
+              const compositeBuildingId = rawBuildingId && bk.id !== activeBookId ? `${bk.id}:${rawBuildingId}` : rawBuildingId;
+              return {
+                ...t,
+                _sourceBookId: bk.id,
+                _bookId: bk.id,
+                _bookName: bk.name || bk.id,
+                buildingId: compositeBuildingId,
+              };
+            });
+        } catch {
+          return [];
+        }
+      }),
+    );
+    return perBook.flat();
+  }
   
   const perBook = await Promise.all(
     bookList.map(async bk => {
@@ -3080,6 +3149,26 @@ export const getContractsAllBooks = async (opts?: { includeDeleted?: boolean }):
   const firestoreBooks = await getBooks();
   let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
   if (!bookList.some(b => b.id === 'default')) bookList.unshift({ id: 'default', name: 'Main Book' });
+
+  if (useMacBackend()) {
+    const perBook = await Promise.all(
+      bookList.map(async (bk) => {
+        try {
+          const rows = await macListCollection('contracts', { bookId: bk.id, includeDeleted });
+          return rows
+            .filter((c: any) => includeDeleted || !c.deleted)
+            .map((c: any) => {
+              const rawBuildingId = c.buildingId;
+              const compositeBuildingId = rawBuildingId && bk.id !== activeBookId ? `${bk.id}:${rawBuildingId}` : rawBuildingId;
+              return { ...c, _sourceBookId: bk.id, buildingId: compositeBuildingId };
+            });
+        } catch {
+          return [];
+        }
+      }),
+    );
+    return perBook.flat();
+  }
   
   const perBook = await Promise.all(
     bookList.map(async bk => {
@@ -3105,6 +3194,36 @@ export const getTransfersAllBooks = async (opts?: { includeDeleted?: boolean }):
   const firestoreBooks = await getBooks();
   let bookList: { id: string; name: string }[] = firestoreBooks.map(b => ({ id: b.id, name: b.name || b.id }));
   if (!bookList.some(b => b.id === 'default')) bookList.unshift({ id: 'default', name: 'Main Book' });
+
+  if (useMacBackend()) {
+    const perBook = await Promise.all(
+      bookList.map(async (bk) => {
+        try {
+          const rows = await macListCollection('transfers', { bookId: bk.id, includeDeleted });
+          return rows
+            .filter((tr: any) => includeDeleted || !tr.deleted)
+            .map((tr: any) => {
+              const trData = {
+                ...tr,
+                _sourceBookId: bk.id,
+                _bookId: bk.id,
+                _bookName: bk.name || bk.id,
+              };
+              if (trData.fromType === 'BUILDING' && trData.fromId && bk.id !== activeBookId) {
+                trData.fromId = `${bk.id}:${trData.fromId}`;
+              }
+              if (trData.toType === 'BUILDING' && trData.toId && bk.id !== activeBookId) {
+                trData.toId = `${bk.id}:${trData.toId}`;
+              }
+              return trData;
+            });
+        } catch {
+          return [];
+        }
+      }),
+    );
+    return perBook.flat();
+  }
   
   const perBook = await Promise.all(
     bookList.map(async bk => {

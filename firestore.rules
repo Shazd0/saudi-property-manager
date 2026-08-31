@@ -1,0 +1,134 @@
+rules_version = '2';
+
+/**
+ * Unified saudi-property-manager Firestore rules.
+ * Supports default collections (internal spm) and book_{teamCode}_* buyer isolation.
+ * Deploy: firebase deploy --only firestore:rules,firestore:indexes,storage
+ */
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null
+        && request.auth.token.firebase.sign_in_provider != 'anonymous';
+    }
+
+    function authProfile() {
+      return get(/databases/$(database)/documents/authIndex/$(request.auth.uid)).data;
+    }
+
+    function hasAuthIndex() {
+      return isSignedIn()
+        && exists(/databases/$(database)/documents/authIndex/$(request.auth.uid));
+    }
+
+    function userRole() {
+      return authProfile().get('role', '');
+    }
+
+    function userKind() {
+      return authProfile().get('kind', '');
+    }
+
+    function userBookId() {
+      return authProfile().get('bookId', 'default');
+    }
+
+    function isAdmin() {
+      return hasAuthIndex() && userRole() in ['ADMIN', 'MANAGER'];
+    }
+
+    function isStrictAdmin() {
+      return hasAuthIndex() && userRole() == 'ADMIN';
+    }
+
+    function isStaff() {
+      return hasAuthIndex() && userKind() in ['staff', 'owner'];
+    }
+
+    function isTenant() {
+      return hasAuthIndex() && userKind() == 'tenant';
+    }
+
+    function canWriteOps() {
+      return hasAuthIndex()
+        && userKind() == 'staff'
+        && userRole() in ['ADMIN', 'MANAGER', 'EMPLOYEE'];
+    }
+
+    function bookIdFromCollection(col) {
+      return col.matches('book_[^_]+_.*') ? col.split('_')[1] : 'default';
+    }
+
+    function canAccessCollection(col) {
+      return isAdmin() || userBookId() == bookIdFromCollection(col);
+    }
+
+    function isRegistryCollection(col) {
+      return col == 'product_licenses' || col == 'license_gift_reveals' || col == 'product_zatca_jobs' || col == '_server';
+    }
+
+    function noNewPasswordField() {
+      return !('password' in request.resource.data)
+        || (resource != null
+            && 'password' in resource.data
+            && request.resource.data.password == resource.data.password);
+    }
+
+    // Registry — License API Admin SDK only
+    match /product_licenses/{id} {
+      allow read, write: if false;
+      match /tenantPins/{pinId} {
+        allow read, write: if false;
+      }
+    }
+    match /license_gift_reveals/{id} {
+      allow read, write: if false;
+    }
+    match /product_zatca_jobs/{id} {
+      allow read, write: if false;
+    }
+    match /_server/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /authIndex/{uid} {
+      allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
+      allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == uid);
+      allow delete: if isAdmin();
+    }
+
+    match /books/{bookId} {
+      allow read: if isStaff();
+      allow write: if isAdmin();
+    }
+
+    match /meta/{docId} {
+      allow read: if isStaff();
+      allow write: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isStaff() && canAccessCollection('users');
+      allow create, update: if (isAdmin() || canWriteOps()) && noNewPasswordField() && canAccessCollection('users');
+      allow delete: if isAdmin();
+    }
+
+    match /{collection}/{docId} {
+      allow read: if isStaff() && canAccessCollection(collection) && !isRegistryCollection(collection);
+      allow create, update: if canWriteOps() && canAccessCollection(collection) && !isRegistryCollection(collection);
+      allow delete: if isAdmin() && canAccessCollection(collection) && !isRegistryCollection(collection);
+    }
+
+    match /chatRooms/{roomId} {
+      allow read, write: if isStaff();
+      match /messages/{messageId} {
+        allow read, write: if isStaff();
+      }
+    }
+
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
