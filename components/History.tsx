@@ -31,7 +31,14 @@ import HapticService from '../services/hapticService';
 import { fmtDate, fmtDateTime, isDateInCurrentMonth } from '../utils/dateFormat';
 import { addMoneyFingerprint, buildTransactionSearchHaystack, buildVendorSearchHaystack, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
-import { transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import { getTransactionInclusiveAmount, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import {
+  computeLedgerSummary,
+  enrichLedgerTransactions,
+  filterApprovedLedgerTransactions,
+  filterLedgerByBuildings,
+  isLedgerOpeningBalanceRow,
+} from '../utils/ledgerSummary';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { createVatReportSnapshot } from '../utils/vatSnapshot';
 import SearchableSelect from './SearchableSelect';
@@ -769,38 +776,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         return parts.join(' · ') || undefined;
     };
 
-    const displayAmount = (tx: Transaction): number => {
-        const inclRaw = (tx as any).amountIncludingVAT ?? (tx as any).totalWithVat;
-        if (inclRaw != null && inclRaw !== '') {
-            const n = Number(inclRaw);
-            if (!Number.isNaN(n)) {
-                const base = Number(tx.amount || 0);
-                const vat = Number(tx.vatAmount || 0);
-                // Old data guard: some expense rows stored amountIncludingVAT equal to the exclusive
-                // base. Newer rows store `amount` as inclusive (same as amountIncludingVAT) — do NOT
-                // add VAT again (that wrongly turns 517.5 into 585 = 517.5 + 67.5).
-                if (tx.type === TransactionType.EXPENSE && vat > 0 && base > 0 && n > 0 && Math.abs(n - base) <= 0.01) {
-                    const excl = Number((tx as any).amountExcludingVAT);
-                    const amountLooksInclusive =
-                        Number.isFinite(excl) && excl > 0 && Math.abs(excl - base) > 0.5;
-                    if (!amountLooksInclusive) return base + vat;
-                }
-                return n;
-            }
-        }
-        const base = Number(tx.amount || 0);
-        // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
-        // and some rows may be missing `isVATApplicable` even though VAT was entered.
-        if (tx.type === TransactionType.EXPENSE && Number(tx.vatAmount || 0) > 0) {
-            const excl = Number((tx as any).amountExcludingVAT);
-            // If amount already matches excl+vat (or differs from excl), treat amount as inclusive.
-            const vat = Number(tx.vatAmount || 0);
-            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - excl) > 0.5) return base;
-            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - (excl + vat)) <= 0.05) return base;
-            return base + vat;
-        }
-        return base;
-    };
+    const displayAmount = (tx: Transaction): number => getTransactionInclusiveAmount(tx);
 
     const buildDetailItems = (tx: Transaction): Array<{ label: string; value: string }> => {
         const amountExcl = Number(tx.amountExcludingVAT ?? tx.amount ?? 0);
@@ -2292,11 +2268,13 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                     const status = String(t.status || TransactionStatus.APPROVED).toUpperCase();
                     return status === TransactionStatus.APPROVED || status === 'COMPLETED' || !t.status;
                 });
-                // Match visible table/PDF rows: with no date filter, KPI totals must sum ALL filtered rows (e.g. owner filter),
-                // not only the current calendar month — otherwise PDF summary cards disagree with the exported lines.
+                // Match ledger Net Balance window: with no date filter use current month
+                // (not all-time). All-time movements were double-counting vs opening/net.
+                const _nowLocal = new Date();
+                const _monthStartLocal = `${_nowLocal.getFullYear()}-${String(_nowLocal.getMonth() + 1).padStart(2, '0')}-01`;
                 const periodList = hasDateFilterLocal
                     ? approvedFromList.filter(t => t.date && t.date >= effectiveFromLocal && t.date <= effectiveToLocal)
-                    : approvedFromList.filter(t => !!t.date);
+                    : approvedFromList.filter(t => t.date && t.date >= _monthStartLocal);
                 const incomeRowsF = periodList.filter(
                     r => normalizeType(r.type) === TransactionType.INCOME && !isOpeningBalance(r)
                 );
@@ -2342,193 +2320,62 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
         // Include configured opening balances from Settings (these are always part of the historical balance)
         // They are also displayed as synthetic rows in the list but not stored as transactions
-        let settingsOpeningCash = 0, settingsOpeningBank = 0;
-        Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
-            if (filterBuildingIds.length > 0 && !filterBuildingIds.some(id => id !== NO_SOURCE_BUILDING_FILTER && id === buildingId)) return;
-            settingsOpeningCash += Number((row as any).cash) || 0;
-            settingsOpeningBank += Number((row as any).bank) || 0;
-        });
-        const settingsOpeningAll = settingsOpeningCash + settingsOpeningBank;
-
         // Whether the user has explicitly set a date range
         const hasDateFilter = !!(filterDateFrom || filterDateTo || filterTillDate);
-        const effectiveDateFrom = filterDateFrom || '';
-        const effectiveDateTo = filterTillDate || filterDateTo || '9999-12-31';
 
-        // Inject pseudo-transactions for existing Building→Owner transfers that lack a transaction record
-        const existingTreasuryIds = new Set(
-            transactions
-                .filter((t: any) => (t as any).transferId)
-                .map((t: any) => String((t as any).transferId)),
+        // Same enrichment + approval filter as Dashboard (shared helper).
+        const approved = filterApprovedLedgerTransactions(
+            enrichLedgerTransactions(transactions, transfers),
         );
-        const buildingOwnerPseudoBal = (transfers || []).filter((tr: any) =>
-            ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-            && !tr.deleted && !existingTreasuryIds.has(tr.id)
-        ).map((tr: any) => ({
-            id: `pseudo_${tr.id}`,
-            date: tr.date || '',
-            type: tr.fromType === 'BUILDING' ? 'EXPENSE' : 'INCOME',
-            amount: Number(tr.amount) || 0,
-            paymentMethod: 'TREASURY',
-            originalPaymentMethod: tr.paymentMethod,
-            fromType: tr.fromType,
-            toType: tr.toType,
-            fromId: tr.fromId,
-            toId: tr.toId,
-            source: 'treasury',
-            buildingId: tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : undefined),
-            status: tr.status || 'APPROVED',
-            expenseCategory: '',
-            borrowingType: undefined,
-            transferId: tr.id,
-        } as any));
 
-        // Inter-Building pseudo legs — fill missing source/dest transactions for older
-        // SAME-BOOK transfers. Cross-book transfers are skipped (the other leg lives in
-        // a different book entirely and should not appear in the current book's view).
-        const interBuildingPseudoBal: any[] = [];
-        const rawOfBal = (v?: string) => (v && String(v).includes(':')) ? String(v).slice(String(v).indexOf(':') + 1) : (v || '');
-        const bookOfBal = (v?: string) => (v && String(v).includes(':')) ? String(v).slice(0, String(v).indexOf(':')) : '';
-        (transfers || []).forEach((tr: any) => {
-            if (tr.deleted) return;
-            if (!(tr.fromType === 'BUILDING' && tr.toType === 'BUILDING' && tr.fromId && tr.toId && tr.fromId !== tr.toId)) return;
-            const isCrossBook = (tr.sourceBookId && tr.destBookId && tr.sourceBookId !== tr.destBookId)
-                || (!!bookOfBal(tr.fromId) && !!bookOfBal(tr.toId) && bookOfBal(tr.fromId) !== bookOfBal(tr.toId));
-            if (isCrossBook) return;
-            const fromRaw = rawOfBal(tr.fromId);
-            const toRaw = rawOfBal(tr.toId);
-            const linked = transactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
-            const hasSource = linked.some(tx => normalize((tx as any).buildingId) === normalize(fromRaw));
-            const hasDest   = linked.some(tx => normalize((tx as any).buildingId) === normalize(toRaw));
-            const base = {
-                date: tr.date || '',
-                amount: Number(tr.amount) || 0,
-                paymentMethod: 'TREASURY',
-                originalPaymentMethod: tr.paymentMethod,
-                fromType: tr.fromType,
-                toType: tr.toType,
-                fromId: tr.fromId,
-                toId: tr.toId,
-                source: 'treasury',
-                status: tr.status || 'APPROVED',
-                expenseCategory: '',
-                borrowingType: undefined,
-                transferId: tr.id,
-            };
-            if (!hasSource) interBuildingPseudoBal.push({ ...base, id: `pseudo_${tr.id}_src`, type: 'EXPENSE', buildingId: fromRaw, interBuildingRole: 'SOURCE' });
-            if (!hasDest)   interBuildingPseudoBal.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME',  buildingId: toRaw,   interBuildingRole: 'DEST' });
+        // Apply building filter if set (shared with Dashboard for identical scoping)
+        const buildingFiltered = filterLedgerByBuildings(approved, filterBuildingIds, buildings as any);
+
+        const ledger = computeLedgerSummary({
+            ledgerRows: buildingFiltered,
+            openingBalancesByBuilding,
+            buildingIds: filterBuildingIds.filter(id => id !== NO_SOURCE_BUILDING_FILTER),
+            dateFrom: filterDateFrom,
+            dateTo: filterDateTo,
+            tillDate: filterTillDate,
         });
 
-        const allTxns = [...transactions, ...buildingOwnerPseudoBal, ...interBuildingPseudoBal];
-
-        // Base approved transactions (not deleted) - use transactions directly, not filteredData
-        // Include transactions without status (legacy data) as approved
-        // Treasury transfers (source=treasury) ARE included in balance totals; TREASURY_REVERSAL artifacts are not.
-        // Owner Expense transactions are excluded from balance totals (separate owner view).
-        const approved = allTxns.filter(t => {
-            if ((t as any).deleted) return false;
-            if (t.paymentMethod === 'TREASURY_REVERSAL') return false;
-            // Exclude Head→Owner treasury transactions from balance totals
-            if ((t as any).source === 'treasury') {
-                const ft = (t as any).fromType, tt = (t as any).toType;
-                if ((ft === 'OWNER' && tt === 'HEAD_OFFICE') || (ft === 'HEAD_OFFICE' && tt === 'OWNER')) return false;
-            }
-            const status = String(t.status || TransactionStatus.APPROVED).toUpperCase();
-            return status === TransactionStatus.APPROVED || status === 'COMPLETED' || !t.status;
-        });
-
-        // Apply building filter if set
-        // Owner expenses: only include for their specific source building
-        const buildingFiltered = filterBuildingIds.length > 0 
-            ? approved.filter(t => {
-                const ownerCat = (t.expenseCategory || '').trim();
-                if (ownerCat === 'Owner Expense' || ownerCat === 'Owner Profit Withdrawal') {
-                  const bId = String((t as any).buildingId || '');
-                  if (!bId) return filterBuildingIds.includes(NO_SOURCE_BUILDING_FILTER);
-                  return filterBuildingIds.includes(bId);
-                }
-                return filterBuildingIds.some(id => matchTransactionBuilding(t, id));
-              })
-            : approved;
-
-        // Opening = cumulative balance strictly before the report window (last month's closing when viewing a full month from the 1st).
         const _now = new Date();
         const _currentMonthStart = `${_now.getFullYear()}-${String(_now.getMonth() + 1).padStart(2, '0')}-01`;
-        const openingCutoff = hasDateFilter
-            ? (filterDateFrom || _currentMonthStart)
-            : _currentMonthStart;
-
-        // Period transactions: filtered range when date filter is set, current month when not
+        const effectiveDateFrom = filterDateFrom || '';
+        const effectiveDateTo = filterTillDate || filterDateTo || '9999-12-31';
         const periodTxns = hasDateFilter
             ? buildingFiltered.filter(t => t.date && t.date >= effectiveDateFrom && t.date <= effectiveDateTo)
             : buildingFiltered.filter(t => t.date && t.date >= _currentMonthStart);
-
-        // Exclude ALL borrowing opening balances from totals (tracked separately in BorrowingTracker/OwnerPortal)
-        // Also exclude Owner Opening Balance (tracked separately)
-        const incomeRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
-        // Include ALL expenses (regular + owner) for accurate totals
-        const expenseRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
-
-        // ownerExpenseTotal kept as 0 (owner expenses now merged into main expenseTotal)
-        const ownerExpenseTotal = 0;
-
-        const cashIncomeBase = sumAmount(incomeRows.filter(r => transactionCountsAsCashForSplit(r)));
-        const bankIncomeBase = sumAmount(incomeRows.filter(r => transactionCountsAsBankForSplit(r)));
-        // Totals include ALL rows regardless of payment method (avoids missing transactions with unknown/null payment method)
-        const incomeTotalBase = sumAmount(incomeRows);
-
-        const cashExpense = sumAmount(expenseRows.filter(r => transactionCountsAsCashForSplit(r)));
-        const bankExpenseTotal = sumAmount(expenseRows.filter(r => transactionCountsAsBankForSplit(r)));
-        const expenseTotal = sumAmount(expenseRows); // ALL expenses, not just cash+bank subset
-
-        // Cheque sub-totals (for separate display if needed)
+        const incomeRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.INCOME && !isLedgerOpeningBalanceRow(r));
+        const expenseRows = periodTxns.filter(r => normalizeType(r.type) === TransactionType.EXPENSE && !isLedgerOpeningBalanceRow(r));
         const chequeIncome = sumAmount(incomeRows.filter(r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'));
         const chequeExpense = sumAmount(expenseRows.filter(r => String((r as any).originalPaymentMethod || r.paymentMethod || '').toUpperCase() === 'CHEQUE'));
 
-        // Opening balance from transactions BEFORE the opening cutoff (last day of previous month)
-        let openingCash = 0, openingBank = 0, openingAll = 0;
-        
-        const priorTxns = buildingFiltered.filter(t => t.date && t.date < openingCutoff);
-        
-        for (const t of priorTxns) {
-            // Skip borrowing opening balance entries (tracked separately in BorrowingTracker/OwnerPortal)
-            if (isOpeningBalance(t)) continue;
-            // Include owner expenses in opening balance (they represent real cash outflows)
-            const amt = Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
-            const isIncome = normalizeType(t.type) === TransactionType.INCOME;
-            const netAmt = isIncome ? amt : -amt;
-            openingAll += netAmt;
-            if (transactionCountsAsCashForSplit(t)) openingCash += netAmt;
-            else if (transactionCountsAsBankForSplit(t)) openingBank += netAmt;
-        }
-
-        // Closing balances (payment method breakdown)
-        const cashBalance = openingCash + settingsOpeningCash + cashIncomeBase - cashExpense;
-        const bankBalance = openingBank + settingsOpeningBank + bankIncomeBase - bankExpenseTotal;
-        // True net: include ALL transactions + settings opening balance regardless of payment method
-        const totalNet = openingAll + settingsOpeningAll + incomeTotalBase - expenseTotal;
-
         const base = {
-            openingCash: openingCash + settingsOpeningCash,
-            openingBank: openingBank + settingsOpeningBank,
-            openingTotal: openingAll + settingsOpeningAll,
-            cashIncome: cashIncomeBase,
-            bankIncome: bankIncomeBase,
-            incomeTotal: incomeTotalBase,
-            cashExpense,
-            bankExpense: bankExpenseTotal,
-            expenseTotal,
-            cashBalance,
-            bankBalance,
-            totalNet,
+            openingCash: ledger.openingCash,
+            openingBank: ledger.openingBank,
+            openingTotal: ledger.openingTotal,
+            cashIncome: ledger.cashIncome,
+            bankIncome: ledger.bankIncome,
+            incomeTotal: ledger.incomeTotal,
+            cashExpense: ledger.cashExpense,
+            bankExpense: ledger.bankExpense,
+            expenseTotal: ledger.expenseTotal,
+            cashBalance: ledger.cashBalance,
+            bankBalance: ledger.bankBalance,
+            totalNet: ledger.totalNet,
             chequeIncome,
             chequeExpense,
             chequeBalance: chequeIncome - chequeExpense,
-            ownerExpenseTotal,
+            ownerExpenseTotal: 0,
             totalOutputVAT: incomeRows.filter(r => !(r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0) - incomeRows.filter(r => (r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
             totalInputVAT: expenseRows.reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
             netVATPayable: (incomeRows.filter(r => !(r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0) - incomeRows.filter(r => (r as any).isCreditNote).reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0)) - expenseRows.reduce((s,r) => s + Math.abs(Number(r.vatAmount)||0), 0),
         };
+        // Net / opening / cash / bank balances always reflect the true ledger (base).
+        // movementOverride only adjusts the income/expense/VAT/cheque movement cards
+        // when list-only filters (category, search, etc.) are active.
         if (!movementOverride) return base;
         return { ...base, ...movementOverride };
     }, [filteredData, transactions, filterBuildingIds, filterDateFrom, filterDateTo, filterTillDate, matchTransactionBuilding, transfers, openingBalancesByBuilding, filterType, filterMethod, filterStatus, filterCategory, filterBankName, filterCustomer, filterEmployee, filterOwner, filterUnit, searchTerm, filterVat]);

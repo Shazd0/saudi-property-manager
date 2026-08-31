@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useMemo, useRef } from 'react';
 import { Transaction, TransactionType, TransactionStatus, Contract, Building, Customer, ExpenseCategory, PaymentMethod, UserRole, User, Bank } from '../types';
-import { normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit } from '../utils/transactionUtils';
+import { getTransactionInclusiveAmount, normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit } from '../utils/transactionUtils';
 import { addMoneyFingerprint, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import {
@@ -315,26 +315,8 @@ const passesViewerStaffOwnerScopeTransfer = (
   return allowed.some(sid => ownerStakeBuildingIdsMatch(sid, cand, activeBookId));
 };
 
-/** VAT-inclusive totals — matches Dashboard `txDisplayAmount`. */
-const reportMoneyAmount = (t: Transaction): number => {
-  const tx = t as any;
-  const inclRaw = tx.amountIncludingVAT ?? tx.totalWithVat;
-  if (inclRaw != null && inclRaw !== '') {
-    const n = Number(inclRaw);
-    if (!Number.isNaN(n)) {
-      const base = Number(tx.amount) || 0;
-      const vat = Number(tx.vatAmount) || 0;
-      const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-      if (isExpense && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
-      return n;
-    }
-  }
-  const base = Number(tx.amount) || 0;
-  const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-  const vat = Number(tx.vatAmount) || 0;
-  if (isExpense && vat > 0) return base + vat;
-  return base;
-};
+/** VAT-inclusive totals — same helper as History / Dashboard. */
+const reportMoneyAmount = (t: Transaction): number => getTransactionInclusiveAmount(t);
 
 /** Withdrawal (+) vs contribution (−) for Building↔Owner treasury ledger rows. */
 const signedTreasuryBuildingOwnerAmount = (t: Transaction): number => {

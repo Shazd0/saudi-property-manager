@@ -73,11 +73,17 @@ import {
 } from 'recharts';
 
 import { Transaction, TransactionType, TransactionStatus, PaymentMethod, Contract, User, Building, UserRole } from '../types';
-import { getTransactions, getContracts, getApprovals, getBuildings, getSettings, getCustomers, getTransfers, getDataFromBook } from '../services/firestoreService';
+import { getTransactions, getContracts, getApprovals, getBuildings, getSettings, getCustomers, getTransfers, getDataFromBook, backfillInterBuildingTransactions } from '../services/firestoreService';
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
-import { normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import { getTransactionInclusiveAmount, normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import {
+  computeLedgerSummary,
+  enrichLedgerTransactions,
+  filterApprovedLedgerTransactions,
+  filterLedgerByBuildings,
+} from '../utils/ledgerSummary';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -205,11 +211,25 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
           ? [currentUser.buildingId]
           : [];
 
+      // Same self-heal as History so inter-building legs exist before totals are computed.
+      if (
+        (actorRoleKey === UserRole.ADMIN || actorRoleKey === UserRole.MANAGER) &&
+        (import.meta as any).env?.VITE_DATA_BACKEND !== 'mac'
+      ) {
+        try {
+          await Promise.race([
+            backfillInterBuildingTransactions(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('backfill timeout')), 8000)),
+          ]);
+        } catch { /* non-fatal */ }
+      }
+
       const [txs, cons, apprs, blds, appSettings, trsf] = await Promise.all([
         getTransactions({
           userId: actorId,
           role: actorRoleKey,
           buildingIds: userBuildingIds,
+          includeDeleted: true,
         } as any),
         getContracts(),
         getApprovals(),
@@ -253,7 +273,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       ? (currentUser as any).buildingIds
       : (currentUser?.buildingId ? [currentUser.buildingId] : []);
 
-    if (userBuildingIds.length > 0 && selectedBuildingIds.length === 0) {
+    // Mirror History: assigned users always scope to their building(s) so both
+    // screens compute Net Balance over the exact same building set.
+    if (userBuildingIds.length > 0) {
       setSelectedBuildingIds(userBuildingIds);
     }
   }, [currentUser?.id]);
@@ -393,92 +415,13 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
   const approved = useMemo(
     () => {
-      const isAdmin = (currentUser as any)?.role === UserRole.ADMIN;
       const isAdminOrManager = (currentUser as any)?.role === UserRole.ADMIN || (currentUser as any)?.role === UserRole.MANAGER;
       const userBuildingIds = (currentUser as any)?.buildingIds || ((currentUser as any)?.buildingId ? [(currentUser as any).buildingId] : []);
-      const norm = (v: any) => String(v || '').trim().toLowerCase();
 
-      const existingTreasuryIds = new Set(allTransactions.filter(t => (t as any).transferId).map(tx => (t as any).transferId));
-      const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
-        ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-        && !tr.deleted && !existingTreasuryIds.has(tr.id)
-      ).map((tr: any) => ({
-        id: `pseudo_${tr.id}`,
-        date: tr.date || '',
-        type: tr.fromType === 'BUILDING' ? 'EXPENSE' : 'INCOME',
-        amount: Number(tr.amount) || 0,
-        paymentMethod: 'TREASURY',
-        // Preserve the user-selected flow (CASH/BANK/CHEQUE) for proper cash/bank split.
-        originalPaymentMethod: tr.paymentMethod,
-        fromType: tr.fromType,
-        toType: tr.toType,
-        fromId: tr.fromId,
-        toId: tr.toId,
-        source: 'treasury',
-        buildingId: tr.fromType === 'BUILDING' ? tr.fromId : (tr.toType === 'BUILDING' ? tr.toId : undefined),
-        status: tr.status || 'APPROVED',
-        expenseCategory: '',
-        borrowingType: undefined,
-        transferId: tr.id,
-      } as any));
-      // Inter-building pseudo legs (match History.tsx): fill missing source/dest transaction legs
-      // for same-book transfers that lack one side in older data.
-      const interBuildingPseudo: any[] = [];
-      const rawOf = (compositeId: string | undefined): string => {
-        if (!compositeId) return '';
-        const s = String(compositeId);
-        return s.includes(':') ? s.slice(s.indexOf(':') + 1) : s;
-      };
-      const bookOf = (compositeId: string | undefined): string => {
-        if (!compositeId) return '';
-        const s = String(compositeId);
-        return s.includes(':') ? s.slice(0, s.indexOf(':')) : '';
-      };
-      (transfers || []).forEach((tr: any) => {
-        if (tr.deleted) return;
-        if (!(tr.fromType === 'BUILDING' && tr.toType === 'BUILDING' && tr.fromId && tr.toId && tr.fromId !== tr.toId)) return;
-        const isCrossBook =
-          (tr.sourceBookId && tr.destBookId && tr.sourceBookId !== tr.destBookId)
-          || (!!bookOf(tr.fromId) && !!bookOf(tr.toId) && bookOf(tr.fromId) !== bookOf(tr.toId));
-        if (isCrossBook) return;
-        const fromRaw = rawOf(tr.fromId);
-        const toRaw = rawOf(tr.toId);
-        const linked = allTransactions.filter(tx => (tx as any).transferId === tr.id && (tx as any).buildingId);
-        const hasSource = linked.some(tx => norm((tx as any).buildingId) === norm(fromRaw));
-        const hasDest = linked.some(tx => norm((tx as any).buildingId) === norm(toRaw));
-        const base = {
-          date: tr.date || '',
-          amount: Number(tr.amount) || 0,
-          paymentMethod: 'TREASURY',
-          originalPaymentMethod: tr.paymentMethod,
-          fromType: tr.fromType,
-          toType: tr.toType,
-          fromId: tr.fromId,
-          toId: tr.toId,
-          source: 'treasury',
-          status: tr.status || 'APPROVED',
-          expenseCategory: '',
-          borrowingType: undefined,
-          transferId: tr.id,
-        };
-        if (!hasSource) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_src`, type: 'EXPENSE', buildingId: fromRaw, interBuildingRole: 'SOURCE' });
-        if (!hasDest) interBuildingPseudo.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME', buildingId: toRaw, interBuildingRole: 'DEST' });
-      });
-
-      const allTxns = [...allTransactions, ...buildingOwnerPseudo, ...interBuildingPseudo];
-
-      let approvedTxns = allTxns.filter(t => {
-        if ((t as any).deleted) return false;
-        if (t.paymentMethod === 'TREASURY_REVERSAL') return false;
-        if ((t as any).source === 'treasury') {
-          const ft = (t as any).fromType, tt = (t as any).toType;
-          if ((ft === 'OWNER' && tt === 'HEAD_OFFICE') || (ft === 'HEAD_OFFICE' && tt === 'OWNER')) return false;
-        }
-        const status = String(t.status || TransactionStatus.APPROVED).toUpperCase();
-        return status === TransactionStatus.APPROVED || status === 'COMPLETED' || !t.status;
-      });
-
-      // All staff can view owner expenses
+      // Same transfer-leg enrichment + approval filter as History (shared helper).
+      let approvedTxns = filterApprovedLedgerTransactions(
+        enrichLedgerTransactions(allTransactions, transfers),
+      );
 
       // Filter borrowing opening balances: Admin/Manager see all, Staff see only their building's
       approvedTxns = approvedTxns.filter(t => {
@@ -513,56 +456,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
   );
 
   const filteredApproved = useMemo(
-    () => {
-      if (selectedBuildingIds.length === 0) {
-        return approved;
-      }
-
-      const normalize = (v?: string) => String(v || '').trim().toLowerCase();
-      const getBuildingName = (id?: string) => {
-        if (!id) return '';
-        if (id.includes(',')) return '';
-        const b = allBuildings.find(x => x.id === id || (x as any)._id === id);
-        return b ? (b as any).name || '' : '';
-      };
-      const matchTransactionBuilding = (tx: Transaction, buildingId: string) => {
-        const targetId = normalize(buildingId);
-        const targetName = normalize(getBuildingName(buildingId));
-        if (!targetId) return false;
-
-        // Same rule as History.tsx: for treasury-sourced rows, match STRICTLY by tx.buildingId
-        if ((tx as any).source === 'treasury') {
-          if (!tx.buildingId) return false;
-          return normalize(tx.buildingId) === targetId;
-        }
-
-        const rawIds = [
-          (tx as any).buildingId,
-          (tx as any).building,
-          (tx as any).building_id,
-          (tx as any).targetBuildingId,
-          (tx as any).fromId,
-          (tx as any).toId,
-        ]
-          .flatMap(v => String(v || '').split(','))
-          .map(v => normalize(v))
-          .filter(Boolean);
-        if (rawIds.includes(targetId)) return true;
-
-        const rawNames = [
-          (tx as any).buildingName,
-          typeof (tx as any).building === 'string' ? (tx as any).building : '',
-          (tx as any).building_name,
-        ]
-          .flatMap(v => String(v || '').split(','))
-          .map(v => normalize(v))
-          .filter(Boolean);
-        if (targetName && rawNames.includes(targetName)) return true;
-        return false;
-      };
-
-      return approved.filter(t => selectedBuildingIds.some(id => matchTransactionBuilding(t, id)));
-    },
+    () => filterLedgerByBuildings(approved, selectedBuildingIds, allBuildings as any),
     [approved, selectedBuildingIds, allBuildings]
   );
 
@@ -592,103 +486,30 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
   const effectiveDateFrom = fromDate || '';
   const effectiveDateTo = tillDate || toDate || '9999-12-31';
 
-  /** Amount to use in dashboard totals (prefer VAT-inclusive when available). */
-  const txDisplayAmount = useCallback((t: Transaction): number => {
-    const inclRaw = (t as any).amountIncludingVAT ?? (t as any).totalWithVat;
-    if (inclRaw != null && inclRaw !== '') {
-      const n = Number(inclRaw);
-      if (!Number.isNaN(n)) {
-        const base = Number((t as any).amount) || 0;
-        const vat = Number((t as any).vatAmount) || 0;
-        const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-        // Old data guard: some rows stored "amountIncludingVAT" but it equals the exclusive/base.
-        if (isExpense && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
-        return n;
-      }
-    }
-    const base = Number((t as any).amount) || 0;
-    const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-    const vat = Number((t as any).vatAmount) || 0;
-    // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
-    // and some rows may be missing `isVATApplicable` even though VAT was entered.
-    if (isExpense && vat > 0) return base + vat;
-    return base;
-  }, []);
+  /** Same amount helper as History — keeps Dashboard KPI cards in sync with transaction history. */
+  const txDisplayAmount = getTransactionInclusiveAmount;
 
-  const dashLedgerSummary = useMemo(() => {
-    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + txDisplayAmount(r), 0);
-    const isOpeningBalance = (t: Transaction) =>
-      t.borrowingType === 'OPENING_BALANCE' ||
-      (t as any).isOwnerOpeningBalance === true ||
-      t.expenseCategory === 'Owner Opening Balance';
-
-    // Settings opening balances
-    let settingsOpeningCash = 0;
-    let settingsOpeningBank = 0;
-    Object.entries(openingBalancesByBuilding || {}).forEach(([buildingId, row]) => {
-      if (selectedBuildingIds.length > 0 && !selectedBuildingIds.includes(buildingId)) return;
-      settingsOpeningCash += Number((row as any).cash) || 0;
-      settingsOpeningBank += Number((row as any).bank) || 0;
-    });
-    const settingsOpeningAll = settingsOpeningCash + settingsOpeningBank;
-
-    const openingCutoff = hasDateFilter ? (fromDate || currentMonthStart) : currentMonthStart;
-    const periodTxns = hasDateFilter
-      ? filteredApproved.filter(t => t.date && t.date >= effectiveDateFrom && t.date <= effectiveDateTo)
-      : filteredApproved.filter(t => t.date && t.date >= currentMonthStart);
-
-    const incomeRows = periodTxns.filter(r => normalizeTransactionType(r.type) === TransactionType.INCOME && !isOpeningBalance(r));
-    const expenseRows = periodTxns.filter(r => normalizeTransactionType(r.type) === TransactionType.EXPENSE && !isOpeningBalance(r));
-
-    const cashIncome = sumAmt(incomeRows.filter(r => transactionCountsAsCashForSplit(r)));
-    const bankIncome = sumAmt(incomeRows.filter(r => transactionCountsAsBankForSplit(r)));
-    const incomeTotal = sumAmt(incomeRows);
-
-    const cashExpense = sumAmt(expenseRows.filter(r => transactionCountsAsCashForSplit(r)));
-    const bankExpense = sumAmt(expenseRows.filter(r => transactionCountsAsBankForSplit(r)));
-    const expenseTotal = sumAmt(expenseRows);
-
-    // Opening balances from prior txns
-    let openingCash = 0, openingBank = 0, openingAll = 0;
-    const priorTxns = filteredApproved.filter(t => t.date && t.date < openingCutoff);
-    for (const t of priorTxns) {
-      if (isOpeningBalance(t)) continue;
-      const amt = txDisplayAmount(t);
-      const isInc = normalizeTransactionType(t.type) === TransactionType.INCOME;
-      const netAmt = isInc ? amt : -amt;
-      openingAll += netAmt;
-      if (transactionCountsAsCashForSplit(t)) openingCash += netAmt;
-      else if (transactionCountsAsBankForSplit(t)) openingBank += netAmt;
-    }
-
-    const cashBalance = openingCash + settingsOpeningCash + cashIncome - cashExpense;
-    const bankBalance = openingBank + settingsOpeningBank + bankIncome - bankExpense;
-    const totalNet = openingAll + settingsOpeningAll + incomeTotal - expenseTotal;
-
-    return {
-      openingCash: openingCash + settingsOpeningCash,
-      openingBank: openingBank + settingsOpeningBank,
-      openingTotal: openingAll + settingsOpeningAll,
-      cashIncome,
-      bankIncome,
-      incomeTotal,
-      cashExpense,
-      bankExpense,
-      expenseTotal,
-      cashBalance,
-      bankBalance,
-      totalNet,
-    };
-  }, [
-    filteredApproved,
-    openingBalancesByBuilding,
-    selectedBuildingIds,
-    hasDateFilter,
-    fromDate,
-    currentMonthStart,
-    effectiveDateFrom,
-    effectiveDateTo,
-  ]);
+  const dashLedgerSummary = useMemo(
+    () =>
+      computeLedgerSummary({
+        ledgerRows: filteredApproved,
+        openingBalancesByBuilding,
+        buildingIds: selectedBuildingIds,
+        dateFrom: fromDate,
+        dateTo: toDate,
+        tillDate,
+        currentMonthStart,
+      }),
+    [
+      filteredApproved,
+      openingBalancesByBuilding,
+      selectedBuildingIds,
+      fromDate,
+      toDate,
+      tillDate,
+      currentMonthStart,
+    ],
+  );
 
   const prevMonthClosing = useMemo(
     () => ({ cash: dashLedgerSummary.openingCash, bank: dashLedgerSummary.openingBank, total: dashLedgerSummary.openingTotal }),
@@ -740,7 +561,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       .reduce((sum: number, t: any) => sum + (Number(t.amount) || 0), 0);
     const priorHeadExpenses = filteredApproved
       .filter((t: Transaction) => t.expenseCategory === 'Head Office Expense' && (t.date || '') < openingCutoff)
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      .reduce((sum, t) => sum + txDisplayAmount(t), 0);
     const openingTotal = officeOpeningBalance + priorIn - priorOut - priorHeadExpenses;
 
     const totalIn = buildingFilteredTransfers
@@ -753,7 +574,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
     const headOfficeExpenses = filteredApproved
       .filter((t: Transaction) => t.expenseCategory === 'Head Office Expense' && (t.date || '') >= periodStart && (t.date || '') <= periodEnd)
-      .reduce((sum, t) => sum + (Number(t.amount) || 0), 0);
+      .reduce((sum, t) => sum + txDisplayAmount(t), 0);
 
     const netBalance = openingTotal + totalIn - totalOut - headOfficeExpenses;
 
