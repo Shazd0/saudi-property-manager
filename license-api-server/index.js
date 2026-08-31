@@ -1,6 +1,13 @@
 /**
  * Standalone license HTTP API — same handlers as Firebase `functions/licenseApi.js`.
- * Credentials: `FIREBASE_SERVICE_ACCOUNT_JSON` env, or `license-api-server/service-account.json` (gitignored).
+ *
+ * After unified migration, point Admin SDK at **saudi-property-manager**:
+ *   FIREBASE_SERVICE_ACCOUNT_JSON = service account for saudi-property-manager
+ *   (not amlak-sales-main). Licenses live in product_licenses on the unified project
+ *   after `npm run migrate:licenses` in mac-cloud.
+ *
+ * Optional overrides for resolve/join responses:
+ *   UNIFIED_FIREBASE_PROJECT_ID, UNIFIED_FIREBASE_API_KEY, etc.
  */
 const fs = require("fs");
 const path = require("path");
@@ -10,7 +17,6 @@ if (!process.env.SALES_CONSOLE_PASSWORD && process.env.VITE_SALES_CONSOLE_PASSWO
 }
 
 const express = require("express");
-const { initializeApp, cert, getApps } = require("firebase-admin/app");
 const { createCorsMiddleware } = require("./corsAllowlist");
 
 if (process.env.NODE_ENV === "production" && !String(process.env.SALES_CONSOLE_PASSWORD || "").trim()) {
@@ -20,6 +26,12 @@ if (process.env.NODE_ENV === "production" && !String(process.env.SALES_CONSOLE_P
 
 const licensePath = path.join(__dirname, "..", "functions", "licenseApi.js");
 const serviceAccountPath = path.join(__dirname, "service-account.json");
+
+// Must use the same firebase-admin copy that functions/licenseApi.js loads
+// (functions/node_modules). Root vs functions duplicates leave getFirestore() with no app.
+const { initializeApp, cert, getApps } = require(
+  require.resolve("firebase-admin/app", { paths: [path.join(__dirname, "..", "functions")] })
+);
 
 function initAdmin() {
   if (getApps().length > 0) return;
@@ -39,9 +51,11 @@ function initAdmin() {
 
   if (json) {
     initializeApp({ credential: cert(json) });
+    console.log("[license-api] Firebase Admin initialized from service account.");
   } else {
     try {
       initializeApp();
+      console.log("[license-api] Firebase Admin initialized from application default credentials.");
     } catch (e) {
       console.error(
         "[license-api] No Firebase Admin credentials. Add license-api-server/service-account.json or set FIREBASE_SERVICE_ACCOUNT_JSON."
@@ -80,18 +94,41 @@ const {
   handleCreateGiftLink,
   handleGiftRevealInfo,
   handleGiftRevealClaim,
+  handleUpsertTenantPin,
+  handleTenantSelfRegister,
+  handleTenantPinLogin,
+  handleTenantIqamaUpload,
+  handleBackfillTenantPins,
+  handleAiCloudGetStatus,
+  handleAiCloudSaveKeys,
 } = require(licensePath);
+
+const {
+  handleAssistantChat,
+  handleAssistantConfirm,
+  handleAssistantWhatsApp,
+  handleAssistantActionsList,
+  handleAssistantBriefing,
+  handleAssistantHireMeta,
+} = require(path.join(__dirname, "..", "functions", "aiStaffAssistant.js"));
 
 const app = express();
 app.use(createCorsMiddleware());
-app.use(express.json({ limit: "2mb" }));
+app.use(
+  express.json({
+    limit: "8mb",
+    verify: (req, _res, buf) => {
+      req.rawBody = buf ? buf.toString("utf8") : "";
+    },
+  })
+);
 
 function mountPost(url, handler) {
   app.post(url, (req, res) => {
     Promise.resolve(handler(req, res)).catch((err) => {
       console.error("[license-api]", url, err);
       if (!res.headersSent) {
-        res.status(500).json({ error: err?.message || "Internal error" });
+        res.status(500).json({ error: "Internal error" });
       }
     });
   });
@@ -127,6 +164,26 @@ mountPost("/productLicenseZatcaProcessQueue", handleProcessZatcaQueue);
 mountPost("/productLicenseCreateGiftLink", handleCreateGiftLink);
 mountPost("/productLicenseGiftRevealInfo", handleGiftRevealInfo);
 mountPost("/productLicenseGiftRevealClaim", handleGiftRevealClaim);
+mountPost("/productLicenseUpsertTenantPin", handleUpsertTenantPin);
+mountPost("/productLicenseTenantRegister", handleTenantSelfRegister);
+mountPost("/productLicenseTenantLogin", handleTenantPinLogin);
+mountPost("/productLicenseTenantIqamaUpload", handleTenantIqamaUpload);
+mountPost("/productLicenseBackfillTenantPins", handleBackfillTenantPins);
+mountPost("/productLicenseAiCloudStatus", handleAiCloudGetStatus);
+mountPost("/productLicenseAiCloudSave", handleAiCloudSaveKeys);
+
+mountPost("/assistant/chat", handleAssistantChat);
+mountPost("/assistant/confirm", handleAssistantConfirm);
+mountPost("/assistant/whatsapp", handleAssistantWhatsApp);
+mountPost("/assistant/hire-meta", handleAssistantHireMeta);
+mountPost("/assistant/briefing", handleAssistantBriefing);
+app.get("/assistant/actions", (req, res) => {
+  Promise.resolve(handleAssistantActionsList(req, res)).catch((err) => {
+    console.error("[license-api] /assistant/actions", err);
+    if (!res.headersSent) res.status(500).json({ error: err?.message || "Internal error" });
+  });
+});
+mountPost("/assistant/actions", handleAssistantActionsList);
 
 const ROUTE_NAMES = [
   "productLicenseCreate",
@@ -151,6 +208,19 @@ const ROUTE_NAMES = [
   "productLicenseCreateGiftLink",
   "productLicenseGiftRevealInfo",
   "productLicenseGiftRevealClaim",
+  "productLicenseUpsertTenantPin",
+  "productLicenseTenantRegister",
+  "productLicenseTenantLogin",
+  "productLicenseTenantIqamaUpload",
+  "productLicenseBackfillTenantPins",
+  "productLicenseAiCloudStatus",
+  "productLicenseAiCloudSave",
+  "assistant/chat",
+  "assistant/confirm",
+  "assistant/whatsapp",
+  "assistant/hire-meta",
+  "assistant/briefing",
+  "assistant/actions",
 ];
 
 app.get("/health", (_req, res) => {
