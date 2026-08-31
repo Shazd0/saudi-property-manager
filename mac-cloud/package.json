@@ -24,6 +24,8 @@
     "migrate:storage:dry": "node migrate/storage-to-unified.mjs --dry-run --all",
     "migrate:auth": "node migrate/auth-users-import.mjs --all",
     "migrate:auth:dry": "node migrate/auth-users-import.mjs --dry-run --all",
+    "migrate:auth-index": "node migrate/auth-index-bootstrap.mjs --all",
+    "migrate:auth-index:dry": "node migrate/auth-index-bootstrap.mjs --dry-run --all",
     "migrate:validate": "node migrate/validate-migration.mjs",
     "migrate:wipe": "node migrate/wipe-known-collections.mjs --all",
     "migrate:wipe:dry": "node migrate/wipe-known-collections.mjs --dry-run --all",

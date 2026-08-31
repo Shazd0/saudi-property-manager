@@ -34,6 +34,7 @@ async function main() {
     ['license-registry-to-unified.mjs', suffix],
     ['storage-to-unified.mjs', suffix],
     ['auth-users-import.mjs', suffix],
+    ['auth-index-bootstrap.mjs', suffix],
     ['validate-migration.mjs', dryRun ? ['--dry-run'] : []],
   ];
 

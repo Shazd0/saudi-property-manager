@@ -100,7 +100,13 @@ Download SAs: Firebase Console → Project → Project settings → Service acco
 1. Stop Mac API: `docker compose -f docker-compose.mac-mini.yml stop amlak-api`
 2. `npm run migrate:cutover`
 3. `npm run migrate:validate`
-4. Deploy rules from repo root:
+4. **Bootstrap authIndex** (required for Firestore rules login):
+
+```bash
+npm run migrate:auth-index
+```
+
+5. Deploy rules from repo root:
 
 ```bash
 cd ..

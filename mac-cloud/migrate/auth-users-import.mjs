@@ -94,6 +94,26 @@ async function writeFirebaseUid(db, targetBookId, userId, firebaseUid, dryRun) {
   }, { merge: true });
 }
 
+async function writeAuthIndex(db, uid, user, targetBookId, dryRun) {
+  if (!uid || user.hasSystemAccess === false) return;
+  const roleRaw = String(user.role || '').trim().toUpperCase();
+  const isOwner = Boolean(user.isOwner) || roleRaw === 'OWNER';
+  const role = isOwner ? 'ADMIN' : (roleRaw === 'ENGINEER' ? 'EMPLOYEE' : (roleRaw || 'EMPLOYEE'));
+  const kind = isOwner ? 'owner' : 'staff';
+  const payload = {
+    userId: user.id,
+    bookId: targetBookId,
+    role,
+    kind,
+    email: String(user.email || '').trim() || null,
+    buildingIds: Array.isArray(user.buildingIds) ? user.buildingIds : [],
+    buildingId: user.buildingId || null,
+    migratedAt: new Date().toISOString(),
+  };
+  if (dryRun) return;
+  await db.collection('authIndex').doc(uid).set(payload, { merge: true });
+}
+
 async function main() {
   const args = parseMigrationArgs(process.argv.slice(2));
   if (args.help) {
@@ -117,6 +137,7 @@ async function main() {
       try {
         const result = await upsertAuthUser(auth, user, targetBookId, args.dryRun);
         await writeFirebaseUid(db, targetBookId, user.id, result.uid, args.dryRun);
+        await writeAuthIndex(db, result.uid, user, targetBookId, args.dryRun);
         if (result.created) created += 1;
         else updated += 1;
       } catch (error) {
