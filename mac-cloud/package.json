@@ -13,6 +13,7 @@
     "migrate": "node migrate/firebase-to-postgres.mjs --all",
     "migrate:dry": "node migrate/firebase-to-postgres.mjs --dry-run --all",
     "migrate:inventory": "node migrate/inventory.mjs",
+    "migrate:resolve-book-map": "node migrate/resolve-book-map.mjs",
     "migrate:from-pg": "node migrate/postgres-to-firebase.mjs --all",
     "migrate:from-pg:dry": "node migrate/postgres-to-firebase.mjs --dry-run --all",
     "migrate:buyer-firebase": "node migrate/buyer-firebase-to-unified.mjs --all",

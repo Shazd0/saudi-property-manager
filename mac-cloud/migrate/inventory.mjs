@@ -13,6 +13,8 @@ import {
   countCollection,
   writeReport,
   parseMigrationArgs,
+  loadPostgresBookIdMap,
+  suggestPostgresBookIdMap,
 } from './lib/migration-utils.mjs';
 
 function printHelp() {
@@ -25,7 +27,9 @@ Environment:
   DATABASE_URL                          Postgres on Mac Mini
   FIREBASE_SERVICE_ACCOUNT_JSON         saudi-property-manager admin SA
   LICENSE_REGISTRY_SERVICE_ACCOUNT_JSON amlak-sales-main admin SA
+  POSTGRES_BOOK_ID_MAP                  legacy book_id → teamCode (required for buyers)
   BUYER_FIREBASE_PROJECTS_JSON          optional map of buyer Firebase projects
+  SKIP_BUYER_FIREBASE_IMPORT            set 1 to skip missing buyer SAs
 `);
 }
 
@@ -226,6 +230,42 @@ async function main() {
     label: b.label,
   }));
   report.buyerBookMap = buyerBookMap;
+
+  const postgresBooks = {};
+  if (report.postgres?.byBookCollection) {
+    for (const row of report.postgres.byBookCollection) {
+      if (!postgresBooks[row.book_id]) {
+        postgresBooks[row.book_id] = { bookId: row.book_id, totalDocuments: 0, collections: {} };
+      }
+      postgresBooks[row.book_id].collections[row.collection_name] = row.doc_count;
+      postgresBooks[row.book_id].totalDocuments += row.doc_count;
+    }
+  }
+  report.postgresBooks = Object.values(postgresBooks);
+
+  const configuredMap = loadPostgresBookIdMap();
+  report.postgresBookIdMap = {
+    configured: configuredMap,
+    suggested: {},
+    evidence: [],
+  };
+  if (report.postgres?.byBookCollection) {
+    try {
+      const { suggestions, evidence } = await suggestPostgresBookIdMap(
+        pool,
+        report.licenseRegistry?.buyers || [],
+      );
+      report.postgresBookIdMap.suggested = suggestions;
+      report.postgresBookIdMap.evidence = evidence;
+      if (!Object.keys(configuredMap).length && Object.keys(suggestions).length) {
+        report.warnings.push(
+          'POSTGRES_BOOK_ID_MAP is empty — copy postgresBookIdMap.suggested from migration-report.json into root .env before cutover',
+        );
+      }
+    } catch (error) {
+      report.postgresBookIdMap.error = error?.message || String(error);
+    }
+  }
 
   writeReport(args.output || 'migration-report.json', report);
   console.log(JSON.stringify({

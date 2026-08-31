@@ -16,6 +16,7 @@ import {
   batchWriteDocs,
   getAdminApp,
   parseServiceAccountJson,
+  postgresBookIdsForTarget,
 } from './lib/migration-utils.mjs';
 import { getFirestore } from 'firebase-admin/firestore';
 
@@ -30,16 +31,20 @@ Skips docs that already exist in Postgres for the same book/collection/doc_id.
 `);
 }
 
-async function postgresDocExists(bookId, collectionName, docId) {
-  const result = await pool.query(
-    `
-      select 1 from documents
-      where book_id = $1 and collection_name = $2 and doc_id = $3 and deleted = false
-      limit 1
-    `,
-    [bookId, collectionName, docId],
-  );
-  return result.rows.length > 0;
+async function postgresDocExists(teamCode, collectionName, docId) {
+  const postgresBookIds = postgresBookIdsForTarget(teamCode);
+  for (const postgresBookId of postgresBookIds) {
+    const result = await pool.query(
+      `
+        select 1 from documents
+        where book_id = $1 and collection_name = $2 and doc_id = $3 and deleted = false
+        limit 1
+      `,
+      [postgresBookId, collectionName, docId],
+    );
+    if (result.rows.length > 0) return true;
+  }
+  return false;
 }
 
 async function unifiedDocExists(db, bookId, collectionName, docId) {
@@ -156,12 +161,20 @@ async function main() {
 
   const summaries = [];
   const errors = [];
+  const skipMissingBuyerSa = ['1', 'true', 'yes'].includes(
+    String(process.env.SKIP_BUYER_FIREBASE_IMPORT || '').trim().toLowerCase(),
+  );
 
-  console.log(`Buyer Firebase → unified: ${selected.length} buyer(s), dryRun=${args.dryRun}`);
+  console.log(`Buyer Firebase → unified: ${selected.length} buyer(s), dryRun=${args.dryRun}, skipMissingSa=${skipMissingBuyerSa}`);
 
   for (const buyer of selected) {
     if (!buyer.serviceAccount) {
-      errors.push({ buyer: buyer.bookId, error: `Missing service account for project ${buyer.projectId}` });
+      const message = `Missing service account for project ${buyer.projectId}`;
+      if (skipMissingBuyerSa) {
+        console.warn(`SKIP ${buyer.bookId}: ${message}`);
+        continue;
+      }
+      errors.push({ buyer: buyer.bookId, error: message });
       continue;
     }
     try {

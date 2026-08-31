@@ -136,6 +136,139 @@ export function loadBuyerProjectsMap() {
   }
 }
 
+export function loadPostgresBookIdMap() {
+  const raw = process.env.POSTGRES_BOOK_ID_MAP || '';
+  if (!raw.trim()) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+/** Map Postgres book_id (20-char legacy id) → target teamCode bookId. */
+export function resolveTargetBookId(postgresBookId) {
+  const id = String(postgresBookId || '').trim();
+  if (!id || id === 'default') return 'default';
+  const mapped = loadPostgresBookIdMap()[id];
+  if (mapped) return normalizeTeamCode(mapped) || String(mapped);
+  const normalized = normalizeTeamCode(id);
+  if (/^[A-Z0-9]{14}$/.test(normalized)) return normalized;
+  return id;
+}
+
+/** Reverse lookup: all Postgres book_ids that should land under one teamCode. */
+export function postgresBookIdsForTarget(targetBookId) {
+  const target = normalizeTeamCode(targetBookId);
+  if (!target || target === 'DEFAULT') return ['default'];
+  const map = loadPostgresBookIdMap();
+  const pgIds = Object.entries(map)
+    .filter(([, value]) => normalizeTeamCode(value) === target)
+    .map(([postgresBookId]) => postgresBookId);
+  if (pgIds.length) return pgIds;
+  return [targetBookId];
+}
+
+function tokenizeLabel(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\u0600-\u06ff\s]/g, ' ')
+    .split(/\s+/)
+    .filter((token) => token.length > 2);
+}
+
+function labelsLikelyMatch(bookName, licenseLabel) {
+  const left = String(bookName || '').trim().toLowerCase();
+  const right = String(licenseLabel || '').trim().toLowerCase();
+  if (!left || !right) return false;
+  if (left.includes(right) || right.includes(left)) return true;
+  const leftTokens = tokenizeLabel(left);
+  const rightTokens = tokenizeLabel(right);
+  return rightTokens.some((token) => leftTokens.includes(token));
+}
+
+export async function suggestPostgresBookIdMap(pool, licenseBuyers = []) {
+  const suggestions = {};
+  const evidence = [];
+  const activeBuyers = (licenseBuyers || []).filter((buyer) => buyer.teamCode && buyer.status === 'active');
+
+  const booksResult = await pool.query(`
+    select doc_id, data
+    from documents
+    where book_id = 'default' and collection_name = 'books' and deleted = false
+  `);
+
+  for (const row of booksResult.rows) {
+    const postgresBookId = row.doc_id;
+    if (!postgresBookId || postgresBookId === 'default') continue;
+    const data = row.data || {};
+    const bookName = String(data.name || data.label || data.title || '').trim();
+    const embeddedTeamCode = normalizeTeamCode(data.teamCode || data.team_code || data.bookId);
+
+    if (embeddedTeamCode) {
+      suggestions[postgresBookId] = embeddedTeamCode;
+      evidence.push({
+        postgresBookId,
+        teamCode: embeddedTeamCode,
+        source: 'books.teamCode',
+        bookName,
+      });
+      continue;
+    }
+
+    for (const buyer of activeBuyers) {
+      if (!labelsLikelyMatch(bookName, buyer.label)) continue;
+      suggestions[postgresBookId] = buyer.teamCode;
+      evidence.push({
+        postgresBookId,
+        teamCode: buyer.teamCode,
+        source: 'books.label-match',
+        bookName,
+        licenseLabel: buyer.label,
+      });
+      break;
+    }
+  }
+
+  const metaResult = await pool.query(`
+    select book_id, data
+    from documents
+    where collection_name = 'meta' and deleted = false and book_id <> 'default'
+  `);
+  for (const row of metaResult.rows) {
+    const postgresBookId = row.book_id;
+    if (!postgresBookId || suggestions[postgresBookId]) continue;
+    const data = row.data || {};
+    const metaName = String(data.companyName || data.bookName || data.name || data.label || '').trim();
+    const embeddedTeamCode = normalizeTeamCode(data.teamCode || data.team_code || data.bookId);
+    if (embeddedTeamCode) {
+      suggestions[postgresBookId] = embeddedTeamCode;
+      evidence.push({
+        postgresBookId,
+        teamCode: embeddedTeamCode,
+        source: 'meta.teamCode',
+        bookName: metaName,
+      });
+      continue;
+    }
+    for (const buyer of activeBuyers) {
+      if (!labelsLikelyMatch(metaName, buyer.label)) continue;
+      suggestions[postgresBookId] = buyer.teamCode;
+      evidence.push({
+        postgresBookId,
+        teamCode: buyer.teamCode,
+        source: 'meta.label-match',
+        bookName: metaName,
+        licenseLabel: buyer.label,
+      });
+      break;
+    }
+  }
+
+  return { suggestions, evidence };
+}
+
 export function normalizeTeamCode(value) {
   return String(value || '').trim().toUpperCase().replace(/\s+/g, '');
 }

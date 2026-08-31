@@ -11,6 +11,7 @@ import {
   getUnifiedAdmin,
   parseMigrationArgs,
   batchWriteDocs,
+  resolveTargetBookId,
 } from './lib/migration-utils.mjs';
 
 function printHelp() {
@@ -88,7 +89,8 @@ async function migrateChatMessagesFromPostgres(args, db) {
 
 async function migrateTarget({ bookId, collectionName, args, db }) {
   const docs = await readPostgresDocs(bookId, collectionName, args.includeDeleted);
-  const targetCollection = rawBookCollection(bookId, collectionName);
+  const targetBookId = resolveTargetBookId(bookId);
+  const targetCollection = rawBookCollection(targetBookId, collectionName);
   const writes = [];
   let skippedDeleted = 0;
 
@@ -104,6 +106,7 @@ async function migrateTarget({ bookId, collectionName, args, db }) {
   const written = await batchWriteDocs(db, writes, { dryRun: args.dryRun });
   return {
     bookId,
+    targetBookId,
     collectionName,
     targetCollection,
     read: docs.length,

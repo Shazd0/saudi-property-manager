@@ -7,6 +7,8 @@ import {
   parseMigrationArgs,
   syntheticStaffEmail,
   normalizeTeamCode,
+  resolveTargetBookId,
+  postgresBookIdsForTarget,
 } from './lib/migration-utils.mjs';
 
 function printHelp() {
@@ -20,7 +22,7 @@ Passwords cannot be imported (SHA-256) — users must reset password on first lo
 `);
 }
 
-async function listStaffUsers(bookId) {
+async function listStaffUsers(postgresBookId) {
   const result = await pool.query(
     `
       select doc_id, data
@@ -28,7 +30,7 @@ async function listStaffUsers(bookId) {
       where book_id = $1 and collection_name = 'users' and deleted = false
       order by doc_id
     `,
-    [bookId || 'default'],
+    [postgresBookId || 'default'],
   );
   return result.rows.map((row) => ({
     id: row.doc_id,
@@ -36,7 +38,7 @@ async function listStaffUsers(bookId) {
   }));
 }
 
-async function listBooks() {
+async function listPostgresBooksWithUsers() {
   const result = await pool.query(
     `
       select distinct book_id
@@ -82,8 +84,8 @@ async function upsertAuthUser(auth, user, bookId, dryRun) {
   return { email, uid: record.uid, created: !user.firebaseUid };
 }
 
-async function writeFirebaseUid(db, bookId, userId, firebaseUid, dryRun) {
-  const collection = rawBookCollection(bookId, 'users');
+async function writeFirebaseUid(db, targetBookId, userId, firebaseUid, dryRun) {
+  const collection = rawBookCollection(targetBookId, 'users');
   if (dryRun) return;
   await db.collection(collection).doc(userId).set({
     firebaseUid,
@@ -100,26 +102,29 @@ async function main() {
   }
 
   const { db, auth } = getUnifiedAdmin();
-  const books = args.book ? [normalizeTeamCode(args.book)] : await listBooks();
+  const postgresBooks = args.book
+    ? postgresBookIdsForTarget(normalizeTeamCode(args.book))
+    : await listPostgresBooksWithUsers();
   const summaries = [];
   const errors = [];
 
-  for (const bookId of books) {
-    const users = await listStaffUsers(bookId);
+  for (const postgresBookId of postgresBooks) {
+    const targetBookId = resolveTargetBookId(postgresBookId);
+    const users = await listStaffUsers(postgresBookId);
     let created = 0;
     let updated = 0;
     for (const user of users) {
       try {
-        const result = await upsertAuthUser(auth, user, bookId, args.dryRun);
-        await writeFirebaseUid(db, bookId, user.id, result.uid, args.dryRun);
+        const result = await upsertAuthUser(auth, user, targetBookId, args.dryRun);
+        await writeFirebaseUid(db, targetBookId, user.id, result.uid, args.dryRun);
         if (result.created) created += 1;
         else updated += 1;
       } catch (error) {
-        errors.push({ bookId, userId: user.id, error: error?.message || String(error) });
+        errors.push({ postgresBookId, targetBookId, userId: user.id, error: error?.message || String(error) });
       }
     }
-    summaries.push({ bookId, users: users.length, created, updated });
-    console.log(`OK ${bookId}: users=${users.length} created=${created} updated=${updated}`);
+    summaries.push({ postgresBookId, targetBookId, users: users.length, created, updated });
+    console.log(`OK ${postgresBookId}→${targetBookId}: users=${users.length} created=${created} updated=${updated}`);
   }
 
   console.log(JSON.stringify({ dryRun: args.dryRun, summaries, errors }, null, 2));

@@ -2,79 +2,104 @@
 
 ## Step 1 — Get the scripts on the Mac
 
-On **Windows** (already done if you asked Cursor to push), or on Mac:
-
 ```bash
-cd ~/saudi-property-manager   # or your clone path
+cd ~/saudi-property-manager
 git fetch origin
 git checkout cursor/staff-login-owner-redirect
 git pull origin cursor/staff-login-owner-redirect
 ```
 
-Confirm files exist:
+## Step 2 — Create `mac-cloud/.env` (JSON-safe)
 
 ```bash
-ls mac-cloud/migrate/cutover.mjs mac-cloud/migrate/inventory.mjs
+node mac-cloud/scripts/setup-migration-env.mjs
+# or: bash mac-cloud/scripts/setup-migration-env.sh
 ```
 
-## Step 2 — Create `mac-cloud/.env`
+Do **not** hand-edit `FIREBASE_SERVICE_ACCOUNT_JSON` in bash — use the Node script above.
 
-```bash
-bash mac-cloud/scripts/setup-migration-env.sh
-```
-
-Or manually: copy `mac-cloud/.env.example` and set `DATABASE_URL`, `FIREBASE_SERVICE_ACCOUNT_JSON`, `LICENSE_REGISTRY_SERVICE_ACCOUNT_JSON`, `BUYER_FIREBASE_PROJECTS_JSON`.
-
-Registry SA file (if script can't find it):
-
-```bash
-export LICENSE_REGISTRY_SERVICE_ACCOUNT_JSON="$(cat ~/amlak-sale-product/license-api-server/service-account.json)"
-```
-
-## Step 3 — Install deps + inventory (read-only)
+## Step 3 — Resolve Postgres book_id → teamCode map
 
 ```bash
 cd mac-cloud
 npm install
+npm run migrate:resolve-book-map
+```
+
+Open `postgres-book-id-map.json` and copy `envLine` into **root** `.env`, then re-run setup:
+
+```bash
+# Example (confirm against evidence in the JSON file):
+POSTGRES_BOOK_ID_MAP={"6XwFZu6Tc7EMZNqDbe8u":"P25Y3RHH5GGAZ8","ZkxIzLH6YgvcFIA1j8Mq":"3TAJ3ZWQBSETPR"}
+SKIP_BUYER_FIREBASE_IMPORT=1
+
+node scripts/setup-migration-env.mjs
+```
+
+| Postgres `book_id` | Likely buyer | teamCode |
+|--------------------|--------------|----------|
+| `6XwFZu6Tc7EMZNqDbe8u` (519 docs) | RR MILLENNIUM | `P25Y3RHH5GGAZ8` |
+| `ZkxIzLH6YgvcFIA1j8Mq` (370 docs) | Duyoof Al Kiram | `3TAJ3ZWQBSETPR` |
+| `default` (7098 docs) | amlakrrgroup internal | stays `default` |
+
+**Confirm** with `npm run migrate:resolve-book-map` evidence before cutover.
+
+## Step 4 — Inventory
+
+```bash
 npm run migrate:inventory
 ```
 
-Open `mac-cloud/migration-report.json` and check:
+Check `migration-report.json`:
 
-- `buyerBookMap` — each license `teamCode` (this becomes `bookId`)
-- Postgres `book_id` values (e.g. `6XwFZu6Tc7EMZNqDbe8u`) — **not** the same as teamCode unless inventory says so
+- `postgresBookIdMap.suggested` / `configured`
+- `buyerBookMap` — license teamCodes
+- `postgresBooks` — doc counts per legacy book_id
 
-## Step 4 — Install CLI tools (one time)
-
-```bash
-npm install -g firebase-tools
-brew install --cask google-cloud-sdk
-firebase login
-gcloud auth login
-gcloud config set project saudi-property-manager
-```
-
-## Step 5 — Backups (mandatory)
+## Step 5 — Backups
 
 ```bash
 pg_dump "$DATABASE_URL" > ~/amlak-backup-$(date +%Y%m%d).sql
+```
+
+If `api_audit_log` TOAST is corrupt, exclude it:
+
+```bash
+pg_dump "$DATABASE_URL" --exclude-table=api_audit_log > ~/amlak-backup-$(date +%Y%m%d).sql
+```
+
+Firestore export (requires billing on `saudi-property-manager`):
+
+```bash
 gcloud firestore export gs://saudi-property-manager-backups/pre-cutover-$(date +%Y%m%d) --project=saudi-property-manager
 ```
+
+Enable billing: https://console.developers.google.com/billing/enable?project=saudi-property-manager
 
 ## Step 6 — Dry run
 
 ```bash
-cd mac-cloud
 npm run migrate:cutover:dry
 ```
 
-Fix any errors before live cutover.
+With `SKIP_BUYER_FIREBASE_IMPORT=1`, missing buyer Firebase SAs are warnings, not failures.
+
+Optional — import gaps from buyer Firebase projects later:
+
+```json
+BUYER_FIREBASE_PROJECTS_JSON={
+  "tandeel": { "serviceAccount": { ... } },
+  "amlak-demo-5ee30": { "serviceAccount": { ... } }
+}
+```
+
+Download SAs: Firebase Console → Project → Project settings → Service accounts → Generate new private key.
 
 ## Step 7 — Live cutover (maintenance window)
 
 1. Stop Mac API: `docker compose -f docker-compose.mac-mini.yml stop amlak-api`
-2. Run: `npm run migrate:cutover`
-3. Must pass: `npm run migrate:validate`
+2. `npm run migrate:cutover`
+3. `npm run migrate:validate`
 4. Deploy rules from repo root:
 
 ```bash
@@ -82,8 +107,8 @@ cd ..
 firebase deploy --only firestore:rules,firestore:indexes,storage
 ```
 
-5. Restart license API with **saudi-property-manager** service account (see amlak-sale-product `license-api-server/DEPLOY.md`)
-6. Deploy **amlak-app.com** + **amlakrrgroup.netlify.app** (Firebase-only builds)
+5. Restart license API with **saudi-property-manager** service account
+6. Deploy **amlak-app.com** + **amlakrrgroup.netlify.app**
 
 ## Step 8 — After 48h stable
 
@@ -93,5 +118,6 @@ bash mac-cloud/scripts/decommission-mac.sh
 
 ## teamCode vs Postgres book_id
 
-- **teamCode** = 14-char code in buyer URL `?teamCode=...` → target `book_{teamCode}_*`
-- **Postgres book_id** like `6XwFZu6Tc7EMZNqDbe8u` may be an old internal id — inventory report maps licenses to the correct teamCode before cutover.
+- **teamCode** = 14-char buyer URL code → target `book_{teamCode}_*`
+- **Postgres book_id** = legacy 20-char Firestore `books` doc id — must be in `POSTGRES_BOOK_ID_MAP`
+- Without the map, cutover writes to `book_6XwFZu6..._*` (wrong) instead of `book_P25Y3R..._*`

@@ -7,6 +7,7 @@ import {
   parseMigrationArgs,
   stableHash,
   writeReport,
+  resolveTargetBookId,
 } from './lib/migration-utils.mjs';
 
 function printHelp() {
@@ -93,29 +94,31 @@ async function main() {
 
   for (const target of targets) {
     const pgCount = target.doc_count;
-    const fbCount = await firebaseCount(db, target.book_id, target.collection_name);
+    const targetBookId = resolveTargetBookId(target.book_id);
+    const fbCount = await firebaseCount(db, targetBookId, target.collection_name);
     report.checked += 1;
     if (pgCount !== fbCount) {
       const item = {
         bookId: target.book_id,
+        targetBookId,
         collectionName: target.collection_name,
         postgresCount: pgCount,
         firebaseCount: fbCount,
       };
       mismatches.push(item);
       report.mismatches.push(item);
-      console.warn(`MISMATCH ${target.book_id}/${target.collection_name}: pg=${pgCount} fb=${fbCount}`);
+      console.warn(`MISMATCH ${target.book_id}→${targetBookId}/${target.collection_name}: pg=${pgCount} fb=${fbCount}`);
     } else {
-      console.log(`OK ${target.book_id}/${target.collection_name}: count=${pgCount}`);
+      console.log(`OK ${target.book_id}→${targetBookId}/${target.collection_name}: count=${pgCount}`);
     }
 
     if (args.spotCheck > 0 && pgCount > 0) {
       const samples = await samplePostgresDocs(target.book_id, target.collection_name, args.spotCheck);
-      const collectionPath = rawBookCollection(target.book_id, target.collection_name);
+      const collectionPath = rawBookCollection(targetBookId, target.collection_name);
       for (const sample of samples) {
         const snap = await db.collection(collectionPath).doc(sample.doc_id).get();
         if (!snap.exists) {
-          hashMismatches.push({ bookId: target.book_id, collectionName: target.collection_name, docId: sample.doc_id, reason: 'missing-in-firebase' });
+          hashMismatches.push({ bookId: target.book_id, targetBookId, collectionName: target.collection_name, docId: sample.doc_id, reason: 'missing-in-firebase' });
           continue;
         }
         const pgHash = stableHash({ ...sample.data, id: sample.doc_id });
@@ -123,6 +126,7 @@ async function main() {
         if (pgHash !== fbHash) {
           hashMismatches.push({
             bookId: target.book_id,
+            targetBookId,
             collectionName: target.collection_name,
             docId: sample.doc_id,
             reason: 'hash-mismatch',
