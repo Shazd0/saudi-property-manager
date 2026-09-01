@@ -1,0 +1,24 @@
+# Copy to ~/.cloudflared/config.yml on the Mac mini (or merge into your existing config).
+# Replace TUNNEL_UUID and the credentials filename with your real saleapi tunnel values.
+#
+# One-time setup (on Mac mini, logged into Cloudflare for amlak-app.com):
+#   cloudflared tunnel login
+#   cloudflared tunnel create amlak-saleapi
+#   cloudflared tunnel route dns amlak-saleapi saleapi.amlak-app.com
+#   ls ~/.cloudflared/*.json   # note the UUID filename
+#
+# Then:
+#   cloudflared tunnel run amlak-saleapi
+# Or if this file is the active config:
+#   cloudflared tunnel run
+
+tunnel: REPLACE_WITH_SALEAPI_TUNNEL_UUID
+credentials-file: /Users/shahzad/.cloudflared/REPLACE_WITH_SALEAPI_TUNNEL_UUID.json
+
+ingress:
+  - hostname: saleapi.amlak-app.com
+    service: http://127.0.0.1:8787
+  # Optional — keep ZATCA on the same Mac / same tunnel if you already use it:
+  # - hostname: zatca.amlak-app.com
+  #   service: http://127.0.0.1:3002
+  - service: http_status:404

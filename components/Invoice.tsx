@@ -6,6 +6,7 @@ import { FileText, Printer, CheckCircle } from 'lucide-react';
 import { useToast } from './Toast';
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom } from '../utils/customerDisplay';
+import { getTransactionExclusiveAmount, getTransactionInclusiveAmount } from '../utils/transactionUtils';
 import { useLanguage } from '../i18n';
 
 
@@ -203,16 +204,16 @@ const Invoice: React.FC = () => {
             <div style="font-weight:600">${transaction.details || (isExpense ? 'Purchase / Expense' : 'Property Rental Services')}</div>
             <div class="tbl-sub">${isExpense ? 'Expense' : 'Rental Income'}</div>
           </td>
-          <td>${(transaction.amountExcludingVAT || transaction.amount || 0).toLocaleString()} SAR</td>
+          <td>${getTransactionExclusiveAmount(transaction).toLocaleString()} SAR</td>
         </tr>
       </tbody>
     </table>
 
     <div class="tots">
       <div class="tot-card">
-        <div class="tot-row"><span>Subtotal (Excl. VAT)</span><span>${(transaction.amountExcludingVAT || transaction.amount || 0).toLocaleString()}</span></div>
+        <div class="tot-row"><span>Subtotal (Excl. VAT)</span><span>${getTransactionExclusiveAmount(transaction).toLocaleString()}</span></div>
         <div class="tot-row"><span>VAT (${transaction.vatRate || 15}%)</span><span>${(transaction.vatAmount || 0).toLocaleString()}</span></div>
-        <div class="tot-total"><span>Total (Incl. VAT)</span><span>${(transaction.amountIncludingVAT || transaction.totalWithVat || 0).toLocaleString()} <span class="tot-sar">SAR</span></span></div>
+        <div class="tot-total"><span>Total (Incl. VAT)</span><span>${getTransactionInclusiveAmount(transaction).toLocaleString()} <span class="tot-sar">SAR</span></span></div>
       </div>
     </div>
 
@@ -337,7 +338,7 @@ const Invoice: React.FC = () => {
                 <div>
                   <div className="font-semibold text-slate-700">{transaction.details || (isExpense ? 'Purchase / Expense' : 'Property Rental Services')}</div>
                 </div>
-                <div className="text-right font-bold text-slate-700">{(transaction.amountExcludingVAT || transaction.amount || 0).toLocaleString()}</div>
+                <div className="text-right font-bold text-slate-700">{getTransactionExclusiveAmount(transaction).toLocaleString()}</div>
               </div>
             </div>
 
@@ -345,7 +346,7 @@ const Invoice: React.FC = () => {
               <div className="w-full max-w-xs border border-slate-200 rounded-xl overflow-hidden shadow-sm">
                 <div className="flex justify-between px-4 py-3 text-sm text-slate-500 bg-white border-b border-slate-100">
                   <span>Subtotal (Excl. VAT)</span>
-                  <span className="font-semibold text-slate-700">{(transaction.amountExcludingVAT || transaction.amount || 0).toLocaleString()}</span>
+                  <span className="font-semibold text-slate-700">{getTransactionExclusiveAmount(transaction).toLocaleString()}</span>
                 </div>
                 <div className="flex justify-between px-4 py-3 text-sm text-slate-500 bg-white border-b border-slate-100">
                   <span>VAT ({transaction.vatRate || 15}%)</span>
@@ -353,7 +354,7 @@ const Invoice: React.FC = () => {
                 </div>
                 <div className="flex justify-between px-4 py-4 bg-gradient-to-br from-teal-700 to-emerald-600 text-white font-black text-lg font-inter">
                   <span>Total</span>
-                  <span>{(transaction.amountIncludingVAT || transaction.totalWithVat || 0).toLocaleString()} <span className="text-sm font-normal opacity-70">SAR</span></span>
+                  <span>{getTransactionInclusiveAmount(transaction).toLocaleString()} <span className="text-sm font-normal opacity-70">SAR</span></span>
                 </div>
               </div>
             </div>
