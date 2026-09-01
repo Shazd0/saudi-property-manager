@@ -9,6 +9,7 @@
   "scripts": {
     "dev": "concurrently \"vite --force\" \"node fcm-server/zatca-service.js\"",
     "build": "vite build",
+    "verify:cutover": "node scripts/verify-cutover.mjs",
     "preview": "vite preview",
     "test": "vitest",
     "desktop:dev": "electron .",

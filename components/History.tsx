@@ -1,4 +1,4 @@
-import { getTransactions, deleteTransaction, updateTransactionStatus, getContracts, getCustomers, getBuildings, requestTransactionDeletion, getBanks, createCreditNote, saveTransaction, saveContract, requestTransactionEdit, getSettings, getUsers, getServiceAgreements, saveServiceAgreement, getTransfers, softDeleteTransfer, restoreTransfer, getVendors, restoreStockFromTransaction, redeductStockFromTransaction, backfillInterBuildingTransactions } from '../services/firestoreService';
+import { getTransactions, deleteTransaction, updateTransactionStatus, getContracts, getCustomers, getBuildings, requestTransactionDeletion, getBanks, createCreditNote, saveTransaction, saveContract, requestTransactionEdit, getSettings, getUsers, getUsersAcrossBooks, getServiceAgreements, saveServiceAgreement, getTransfers, softDeleteTransfer, restoreTransfer, getVendors, restoreStockFromTransaction, redeductStockFromTransaction, backfillInterBuildingTransactions } from '../services/firestoreService';
 
 import React, { useState, useEffect, useMemo, useCallback, useRef } from 'react';
 import { createPortal } from 'react-dom';
@@ -20,18 +20,25 @@ function useStickyState<T>(key: string, defaultValue: T): [T, React.Dispatch<Rea
 }
 import { useLanguage } from '../i18n/LanguageContext';
 import { Transaction, User, UserRole, TransactionType, TransactionStatus, ExpenseCategory, PaymentMethod, Building, Vendor, Contract } from '../types';
-import { Filter, Download, Search, AlertOctagon, ChevronDown, AlertTriangle, Trash2, Printer, MessageCircle, Home, X, CheckCircle, Calendar, RefreshCcw, SlidersHorizontal, FileText, RotateCcw, Pencil, PenLine, Building2, Check, Copy } from 'lucide-react';
+import { Filter, Download, Search, AlertOctagon, ChevronDown, AlertTriangle, Trash2, Printer, MessageCircle, Home, X, CheckCircle, Calendar, RefreshCcw, RefreshCw, SlidersHorizontal, FileText, RotateCcw, Pencil, PenLine, Building2, Check, Copy } from 'lucide-react';
 import SavedFilters from './SavedFilters';
 import { Bank } from '../types';
 import { useNavigate, useLocation, useSearchParams } from 'react-router-dom';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
+import { SkeletonTableRows } from './LoadingSkeleton';
 import SoundService from '../services/soundService';
 import HapticService from '../services/hapticService';
-import { fmtDate, fmtDateTime, isDateInCurrentMonth } from '../utils/dateFormat';
+import { fmtDate, fmtDateTime, isDateInCurrentMonth, contractDateToYmd } from '../utils/dateFormat';
 import { addMoneyFingerprint, buildTransactionSearchHaystack, buildVendorSearchHaystack, matchesAdvancedSearch, moneyFingerprintSuffix } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
-import { transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import {
+    transactionCountsAsBankForSplit,
+    transactionCountsAsCashForSplit,
+    transactionDisplayAmount,
+    ledgerOpeningAmount,
+    dedupeTreasuryTransferLegs,
+} from '../utils/transactionUtils';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { createVatReportSnapshot } from '../utils/vatSnapshot';
 import SearchableSelect from './SearchableSelect';
@@ -53,6 +60,31 @@ function getCalendarMonthBounds(ym: string): { from: string; to: string } {
   const last = new Date(y, m, 0);
   const to = `${y}-${pad(m)}-${pad(last.getDate())}`;
   return { from, to };
+}
+
+function historyRoleKey(role: unknown): string {
+    return String(role || '').trim().toUpperCase();
+}
+
+function isHistoryStaffUser(u: any): boolean {
+    if (!u || u.deleted) return false;
+    const rk = historyRoleKey(u.role);
+    if (rk === 'ADMIN' || rk === 'OWNER') return false;
+    if (rk === 'EMPLOYEE' || rk === 'ENGINEER' || rk === 'STAFF') return true;
+    const sal = Number(u.baseSalary);
+    return Number.isFinite(sal) && sal > 0;
+}
+
+function transactionMatchesStaffFilter(t: Transaction, staffId: string, staffName?: string): boolean {
+    const id = String(staffId || '');
+    if (!id) return false;
+    if (String(t.employeeId || '') === id) return true;
+    if (String(t.createdBy || '') === id) return true;
+    const name = String(staffName || '').trim().toLowerCase();
+    if (!name) return false;
+    if (String(t.employeeName || '').trim().toLowerCase() === name) return true;
+    if (String((t as any).createdByName || '').trim().toLowerCase() === name) return true;
+    return false;
 }
 
 function isFullMonthRange(from: string, to: string, till: string, ym: string): boolean {
@@ -181,14 +213,15 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             setEditPaymentMethod(editPaymentTx.paymentMethod || '');
             setEditBankName(editPaymentTx.bankName || '');
             setEditChequeNo(editPaymentTx.chequeNo || '');
-            setEditChequeDueDate(editPaymentTx.chequeDueDate || '');
-            setEditTxDate(editPaymentTx.date || '');
+            setEditChequeDueDate(contractDateToYmd(editPaymentTx.chequeDueDate) || editPaymentTx.chequeDueDate || '');
+            setEditTxDate(contractDateToYmd(editPaymentTx.date) || '');
         }
     }, [showEditPaymentModal, editPaymentTx]);
 
     // Handle submit for edit payment method
     const handleEditPaymentSubmit = () => {
-        if (!editPaymentTx || !editPaymentMethod) return;
+        if (!editPaymentTx || !editPaymentMethod || savingPayment) return;
+        setSavingPayment(true);
         const pmLabel: Record<string, string> = { BANK: 'Bank Transfer', CASH: 'Cash', CHEQUE: 'Cheque', TREASURY: 'Treasury' };
         const lines = [
             '\u26a0 Please verify the following before submitting:',
@@ -213,10 +246,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 showSuccess('Transaction updated successfully.');
                 emitHaptic('success');
                 setShowEditPaymentModal(false);
-                await loadData();
+                refreshAfterMutation();
             } catch (e) {
                 showError('Failed to update transaction.');
                 emitHaptic('destructive');
+            } finally {
+                setSavingPayment(false);
             }
             closeConfirm();
         }, { title: 'Confirm Edit Changes' });
@@ -232,6 +267,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const [vatVendorSearch, setVatVendorSearch] = useState('');
     const [vatVendorDropdownOpen, setVatVendorDropdownOpen] = useState(false);
     const [vatSaving, setVatSaving] = useState(false);
+    const [deleting, setDeleting] = useState(false);
+    const [savingPayment, setSavingPayment] = useState(false);
+    const [pageLoading, setPageLoading] = useState(true);
     const [vatIsInclusive, setVatIsInclusive] = useState(true); // expense default: inclusive; income: exclusive
 
     const openVatModal = (tx: Transaction) => {
@@ -429,24 +467,13 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         setConfirmOpen(false);
         setConfirmMessage('');
         setConfirmAction(null);
+        setSavingPayment(false);
     };
 
-    // Load Data
-    const loadData = async () => {
-        // Self-heal Firestore books only — skip on Mac Mini backend (backfill uses Firestore and can hang).
-        if (
-            (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) &&
-            (import.meta as any).env?.VITE_DATA_BACKEND !== 'mac'
-        ) {
-            try {
-                await Promise.race([
-                    backfillInterBuildingTransactions(),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error('backfill timeout')), 8000)),
-                ]);
-            } catch { /* non-fatal */ }
-        }
-
-        const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
+    const fetchTransactions = useCallback(async (): Promise<any[]> => {
+        const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0
+            ? (currentUser as any).buildingIds
+            : (currentUser.buildingId ? [currentUser.buildingId] : []);
         let txs: any[] = [];
         try {
             txs = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds, includeDeleted: true });
@@ -455,9 +482,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             txs = [];
         }
 
-        // Fallback: if scoped fetch is empty (e.g. no building assignment), load broader data
-        // and safely narrow for non-admin users so History doesn't appear blank.
-        if ((!txs || txs.length === 0)) {
+        if (!txs || txs.length === 0) {
             try {
                 const allTxs = await getTransactions({ role: UserRole.ADMIN as any, includeDeleted: true });
                 if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) {
@@ -469,9 +494,29 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 console.error('History fallback getTransactions failed', e);
             }
         }
+        return txs || [];
+    }, [currentUser]);
 
-        // Show ledger as soon as transactions arrive — don't wait on secondary collections.
-        setTransactions(txs || []);
+    // Load Data — silent/txOnly avoid full-page skeleton after quick actions (delete, restore, etc.)
+    const loadData = async (opts?: { silent?: boolean; transactionsOnly?: boolean }) => {
+        if (!opts?.silent) setPageLoading(true);
+        try {
+        if (!opts?.transactionsOnly) {
+            // Self-heal Firestore books (Mac Mini backend removed — always safe on Firebase).
+            if (currentUser.role === UserRole.ADMIN || currentUser.role === UserRole.MANAGER) {
+                try {
+                    await Promise.race([
+                        backfillInterBuildingTransactions(),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error('backfill timeout')), 8000)),
+                    ]);
+                } catch { /* non-fatal */ }
+            }
+        }
+
+        const txs = await fetchTransactions();
+        setTransactions(txs);
+
+        if (opts?.transactionsOnly) return;
 
         try {
             const [allBuildings, allCustomers, allBanks, appSettings, allUsers, allTransfers, allVendors, allContracts] = await Promise.all([
@@ -479,7 +524,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 getCustomers().catch(() => []),
                 getBanks().catch(() => []),
                 getSettings().catch(() => null),
-                getUsers().catch(() => []),
+                getUsersAcrossBooks().catch(() => getUsers().catch(() => [])),
                 getTransfers({}).catch(() => []),
                 getVendors().catch(() => []),
                 getContracts({ includeDeleted: true }).catch(() => [] as Contract[]),
@@ -491,12 +536,25 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             setVendors(allVendors || []);
             setTransfers(allTransfers || []);
             setOpeningBalancesByBuilding(((appSettings as any)?.openingBalancesByBuilding || {}) as Record<string, { cash: number; bank: number; date?: string }>);
-            setStaff((allUsers || []).filter((u: any) => u.role === 'STAFF' || u.role === 'EMPLOYEE'));
-            setOwners((allUsers || []).filter((u: any) => u.role === 'OWNER'));
+            setStaff(
+                (allUsers || [])
+                    .filter(isHistoryStaffUser)
+                    .sort((a: any, b: any) => String(a?.name || '').localeCompare(String(b?.name || ''), undefined, { sensitivity: 'base' }))
+            );
+            setOwners((allUsers || []).filter((u: any) => historyRoleKey(u.role) === 'OWNER' || u.isOwner));
         } catch (e) {
             console.error('History secondary load failed', e);
         }
+        } finally {
+            if (!opts?.silent) setPageLoading(false);
+        }
     };
+
+    const refreshAfterMutation = () => {
+        void loadData({ silent: true, transactionsOnly: true });
+    };
+
+    const yieldToUi = () => new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
 
     useEffect(() => { loadData(); }, []);
 
@@ -530,9 +588,16 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         return () => root.removeEventListener('pointerdown', onPointerDown, true);
     }, [emitHaptic]);
 
-    // Refresh data whenever this page becomes visible again (e.g. navigating back from EntryForm)
+    // Refresh when tab becomes visible — silent tx-only (Mac Mini: avoid full 8-collection reload).
     useEffect(() => {
-        const onVisible = () => { if (document.visibilityState === 'visible') loadData(); };
+        let lastRefresh = Date.now();
+        const onVisible = () => {
+            if (document.visibilityState !== 'visible') return;
+            const now = Date.now();
+            if (now - lastRefresh < 30_000) return;
+            lastRefresh = now;
+            void loadData({ silent: true, transactionsOnly: true });
+        };
         document.addEventListener('visibilitychange', onVisible);
         return () => document.removeEventListener('visibilitychange', onVisible);
     }, []);
@@ -769,37 +834,13 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         return parts.join(' · ') || undefined;
     };
 
-    const displayAmount = (tx: Transaction): number => {
-        const inclRaw = (tx as any).amountIncludingVAT ?? (tx as any).totalWithVat;
-        if (inclRaw != null && inclRaw !== '') {
-            const n = Number(inclRaw);
-            if (!Number.isNaN(n)) {
-                const base = Number(tx.amount || 0);
-                const vat = Number(tx.vatAmount || 0);
-                // Old data guard: some expense rows stored amountIncludingVAT equal to the exclusive
-                // base. Newer rows store `amount` as inclusive (same as amountIncludingVAT) — do NOT
-                // add VAT again (that wrongly turns 517.5 into 585 = 517.5 + 67.5).
-                if (tx.type === TransactionType.EXPENSE && vat > 0 && base > 0 && n > 0 && Math.abs(n - base) <= 0.01) {
-                    const excl = Number((tx as any).amountExcludingVAT);
-                    const amountLooksInclusive =
-                        Number.isFinite(excl) && excl > 0 && Math.abs(excl - base) > 0.5;
-                    if (!amountLooksInclusive) return base + vat;
-                }
-                return n;
-            }
-        }
-        const base = Number(tx.amount || 0);
-        // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
-        // and some rows may be missing `isVATApplicable` even though VAT was entered.
-        if (tx.type === TransactionType.EXPENSE && Number(tx.vatAmount || 0) > 0) {
-            const excl = Number((tx as any).amountExcludingVAT);
-            // If amount already matches excl+vat (or differs from excl), treat amount as inclusive.
-            const vat = Number(tx.vatAmount || 0);
-            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - excl) > 0.5) return base;
-            if (Number.isFinite(excl) && excl > 0 && Math.abs(base - (excl + vat)) <= 0.05) return base;
-            return base + vat;
-        }
-        return base;
+    const displayAmount = (tx: Transaction): number => transactionDisplayAmount(tx);
+    /** Amount + discount covers the installment; discount must not show as "Left". */
+    const installmentShortfall = (tx: Transaction): number => {
+        const expected = Number(tx.expectedAmount) || 0;
+        if (expected <= 0) return 0;
+        const covered = (Number(tx.amount) || 0) + (Number((tx as any).discountAmount) || 0);
+        return Math.max(0, Number((expected - covered).toFixed(2)));
     };
 
     const buildDetailItems = (tx: Transaction): Array<{ label: string; value: string }> => {
@@ -842,6 +883,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             { label: t('history.feeInvoiceNo'), value: feeInv },
             { label: t('history.linkedContract'), value: linked },
             { label: t('history.expectedAmount'), value: tx.expectedAmount != null && tx.expectedAmount > 0 ? `${Number(tx.expectedAmount).toLocaleString()} ${t('common.sar')}` : '' },
+            { label: t('history.discount'), value: Number((tx as any).discountAmount) > 0 ? `- ${Number((tx as any).discountAmount).toLocaleString()} ${t('common.sar')}` : '' },
         ];
 
         if (isFees) {
@@ -883,7 +925,10 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const linkedContractForView = selectedTx ? formatLinkedContract(selectedTx) : undefined;
 
     const handleDeleteConfirm = async () => {
-        if (!txToDelete) return;
+        if (!txToDelete || deleting) return;
+        setDeleting(true);
+        await yieldToUi();
+        const txId = txToDelete.id;
         try {
             // If VAT INCOME (sales) transaction was already reported to ZATCA,
             // create a credit note; otherwise proceed with normal deletion flow.
@@ -946,9 +991,9 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 }
 
                 showSuccess('Credit Note created and reported to ZATCA. Original invoice retained for audit.');
-                await loadData();
                 setShowDeleteModal(false);
                 setTxToDelete(null);
+                refreshAfterMutation();
                 return;
             }
 
@@ -960,6 +1005,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                     deletedBy: currentUser.id,
                 } as any;
                 await saveTransaction(updated);
+                setTransactions((prev) => prev.map((t) => (t.id === txId ? updated : t)));
 
                 // Restore stock quantities if this is a stock-sale transaction
                 if ((updated as any).isStockIssue && Array.isArray((updated as any).items)) {
@@ -985,9 +1031,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                             deletedBy: currentUser.id,
                         } as any;
                         await saveTransaction(updatedOriginal);
+                        setTransactions((prev) => prev.map((t) => (t.id === originalTx.id ? updatedOriginal : t)));
                         const origTransferId = (originalTx as any).transferId;
                         if (origTransferId) await softDeleteTransfer(origTransferId, currentUser.id);
                     }
+                    setShowDeleteModal(false);
+                    setTxToDelete(null);
                     showToast('Credit note and original VAT transaction moved to trash.', 'info', 6000, 'Undo', async () => {
                         const restoredCN = { ...updated, deleted: false, deletedAt: undefined, deletedBy: undefined } as any;
                         await saveTransaction(restoredCN);
@@ -999,9 +1048,11 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                             if (origTransferId) await restoreTransfer(origTransferId);
                         }
                         showSuccess('Restored.');
-                        await loadData();
+                        refreshAfterMutation();
                     });
                 } else {
+                    setShowDeleteModal(false);
+                    setTxToDelete(null);
                     showToast('Transaction moved to trash.', 'info', 6000, 'Undo', async () => {
                         const restored = { ...updated, deleted: false, deletedAt: undefined, deletedBy: undefined } as any;
                         await saveTransaction(restored);
@@ -1011,20 +1062,22 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                         }
                         if (linkedTransferId) await restoreTransfer(linkedTransferId);
                         showSuccess('Transaction restored.');
-                        await loadData();
+                        refreshAfterMutation();
                     });
                 }
             } else {
                 // Non-admins create a deletion request for approval
                 await requestTransactionDeletion(currentUser.id, txToDelete.id);
                 showInfo('Deletion request has been sent to admin for approval. If accepted, the transaction will be deleted.');
+                setShowDeleteModal(false);
+                setTxToDelete(null);
             }
-            await loadData(); // Reload all data
-            setShowDeleteModal(false);
-            setTxToDelete(null);
+            refreshAfterMutation();
         } catch (error) {
             console.error('Delete error:', error);
             showError('Failed to process deletion. Please try again.');
+        } finally {
+            setDeleting(false);
         }
     };
 
@@ -1037,17 +1090,18 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             try {
                 const restored = { ...tx, deleted: false, deletedAt: undefined, deletedBy: undefined } as any;
                 await saveTransaction(restored);
-                // Re-deduct stock since we're restoring a trashed transaction
+                setTransactions((prev) => prev.map((t) => (t.id === tx.id ? restored : t)));
                 if ((restored as any).isStockIssue && Array.isArray((restored as any).items)) {
                     await redeductStockFromTransaction(restored, currentUser.id);
                 }
                 showSuccess('Transaction restored.');
-                await loadData();
+                closeConfirm();
+                refreshAfterMutation();
             } catch (error) {
                 console.error('Restore error:', error);
                 showError('Failed to restore transaction. Please try again.');
+                closeConfirm();
             }
-            closeConfirm();
         });
     };
 
@@ -1089,13 +1143,15 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                     await softDeleteTransfer(linkedTransferId, currentUser.id);
                 }
                 await deleteTransaction(tx.id, { skipStockRestore: true });
+                setTransactions((prev) => prev.filter((t) => t.id !== tx.id));
                 showSuccess('Transaction permanently deleted.');
-                await loadData();
+                closeConfirm();
+                refreshAfterMutation();
             } catch (error) {
                 console.error('Permanent delete error:', error);
                 showError('Failed to permanently delete transaction. Please try again.');
+                closeConfirm();
             }
-            closeConfirm();
         }, { danger: true, title: 'Delete Transaction' });
     };
 
@@ -1112,12 +1168,13 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                     }
                 }));
                 showSuccess('All trashed transactions restored.');
-                await loadData();
+                closeConfirm();
+                refreshAfterMutation();
             } catch (error) {
                 console.error('Restore all error:', error);
                 showError('Failed to restore all transactions.');
+                closeConfirm();
             }
-            closeConfirm();
         });
     };
 
@@ -1128,20 +1185,20 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             try {
                 // Handle service agreement payments before deleting
                 const serviceAgreementTxs = deleted.filter(tx => 
-                    t.serviceAgreementId || t.expenseCategory === 'Service Agreement' || t.expenseCategory === ExpenseCategory.SERVICE_AGREEMENT
+                    tx.serviceAgreementId || tx.expenseCategory === 'Service Agreement' || tx.expenseCategory === ExpenseCategory.SERVICE_AGREEMENT
                 );
                 if (serviceAgreementTxs.length > 0) {
                     const agreements = await getServiceAgreements();
                     const updatedAgreements = new Map<string, any>();
                     
                     for (const tx of serviceAgreementTxs) {
-                        let agreement = t.serviceAgreementId 
-                            ? (updatedAgreements.get(t.serviceAgreementId) || agreements.find(a => a.id === t.serviceAgreementId))
-                            : agreements.find(a => a.payments?.some((p: any) => p.date === t.date && p.amount === t.amount));
+                        let agreement = tx.serviceAgreementId 
+                            ? (updatedAgreements.get(tx.serviceAgreementId) || agreements.find(a => a.id === tx.serviceAgreementId))
+                            : agreements.find(a => a.payments?.some((p: any) => p.date === tx.date && p.amount === tx.amount));
                         
                         if (agreement && agreement.payments && agreement.payments.length > 0) {
                             const paymentIndex = agreement.payments.findIndex(
-                                (p: any) => p.date === t.date && p.amount === t.amount
+                                (p: any) => p.date === tx.date && p.amount === tx.amount
                             );
                             if (paymentIndex !== -1) {
                                 const updatedPayments = [...agreement.payments];
@@ -1160,13 +1217,15 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 }
                 
                 await Promise.all(deleted.map(tx => deleteTransaction(tx.id, { skipStockRestore: true })));
+                setTransactions((prev) => prev.filter((t) => !(t as any).deleted));
                 showSuccess('All trashed transactions permanently deleted.');
-                await loadData();
+                closeConfirm();
+                refreshAfterMutation();
             } catch (error) {
                 console.error('Delete all error:', error);
                 showError('Failed to delete all trashed transactions.');
+                closeConfirm();
             }
-            closeConfirm();
         }, { danger: true, title: 'Delete All Transactions' });
     };
 
@@ -1850,9 +1909,10 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             result = result.filter(t => (t.expenseCategory || '').trim() !== 'Opening Balance');
         }
 
-        // Staff filter (createdBy)
+        // Staff filter: salary/borrowing subject (employeeId) OR who created the entry
         if (filterEmployee && filterEmployee !== 'ALL') {
-            result = result.filter(t => t.createdBy === filterEmployee);
+            const selectedStaff = staff.find(s => String(s.id) === String(filterEmployee));
+            result = result.filter(t => transactionMatchesStaffFilter(t, filterEmployee, selectedStaff?.name));
         }
         // Owner filter (ownerId)
         if (filterOwner && filterOwner !== 'ALL') {
@@ -1992,35 +2052,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
 
         // Same treasury transfer leg can appear twice (pseudo backfill + real row, legacy
         // id mismatch, or duplicate writes). Keep one row per (transferId, building, type).
-        const legDedupeKey = (r: any): string => {
-            const tid = String(r?.transferId || '').trim();
-            if (!tid) return '';
-            const rawB = rawOfBuilding(String(r.buildingId || ''));
-            const ty = String(r?.type || '').toUpperCase();
-            return `${tid}::${normalize(rawB)}::${ty}`;
-        };
-        const byLeg = new Map<string, Transaction[]>();
-        for (const r of result) {
-            const k = legDedupeKey(r as any);
-            if (!k) continue;
-            const arr = byLeg.get(k);
-            if (arr) arr.push(r);
-            else byLeg.set(k, [r]);
-        }
-        const dropRowIds = new Set<string>();
-        for (const [, arr] of byLeg) {
-            if (arr.length <= 1) continue;
-            arr.sort((a: any, b: any) => {
-                const ap = String(a.id || '').startsWith('pseudo_') ? 1 : 0;
-                const bp = String(b.id || '').startsWith('pseudo_') ? 1 : 0;
-                if (ap !== bp) return ap - bp;
-                return (Number(b.createdAt) || 0) - (Number(a.createdAt) || 0);
-            });
-            for (let i = 1; i < arr.length; i++) dropRowIds.add(String(arr[i].id));
-        }
-        if (dropRowIds.size > 0) {
-            result = result.filter(r => !dropRowIds.has(String(r.id)));
-        }
+        result = dedupeTreasuryTransferLegs(result);
 
         // Near-identical rental income rows (double-submit or legacy twin Firestore docs): keep one, prefer richer metadata.
         const dedupeNearIdenticalRentalIncome = (rows: Transaction[]): Transaction[] => {
@@ -2071,7 +2103,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         result = dedupeNearIdenticalRentalIncome(result);
 
         return result;
-    }, [transactions, searchTerm, filterType, filterMethod, filterStatus, filterCategory, filterBuildingIds, filterUnit, filterDateFrom, filterDateTo, filterTillDate, filterVat, filterBankName, filterCustomer, filterEmployee, filterOwner, currentUser, showDeleted, transfers, buildings]);
+    }, [transactions, searchTerm, filterType, filterMethod, filterStatus, filterCategory, filterBuildingIds, filterUnit, filterDateFrom, filterDateTo, filterTillDate, filterVat, filterBankName, filterCustomer, filterEmployee, filterOwner, currentUser, showDeleted, transfers, buildings, staff]);
 
     // Opening balances should appear in the transaction list as synthetic rows
     const openingRows = useMemo(() => {
@@ -2363,7 +2395,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
         );
         const buildingOwnerPseudoBal = (transfers || []).filter((tr: any) =>
             ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-            && !tr.deleted && !existingTreasuryIds.has(tr.id)
+            && !tr.deleted && !existingTreasuryIds.has(String(tr.id || ''))
         ).map((tr: any) => ({
             id: `pseudo_${tr.id}`,
             date: tr.date || '',
@@ -2419,7 +2451,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             if (!hasDest)   interBuildingPseudoBal.push({ ...base, id: `pseudo_${tr.id}_dst`, type: 'INCOME',  buildingId: toRaw,   interBuildingRole: 'DEST' });
         });
 
-        const allTxns = [...transactions, ...buildingOwnerPseudoBal, ...interBuildingPseudoBal];
+        const allTxns = dedupeTreasuryTransferLegs([...transactions, ...buildingOwnerPseudoBal, ...interBuildingPseudoBal]);
 
         // Base approved transactions (not deleted) - use transactions directly, not filteredData
         // Include transactions without status (legacy data) as approved
@@ -2494,7 +2526,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
             // Skip borrowing opening balance entries (tracked separately in BorrowingTracker/OwnerPortal)
             if (isOpeningBalance(t)) continue;
             // Include owner expenses in opening balance (they represent real cash outflows)
-            const amt = Number(t.amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0;
+            const amt = ledgerOpeningAmount(t);
             const isIncome = normalizeType(t.type) === TransactionType.INCOME;
             const netAmt = isIncome ? amt : -amt;
             openingAll += netAmt;
@@ -3342,9 +3374,12 @@ const canDelete = useCallback((tx: Transaction) => {
                             </div>
                         )}
                     </div>
-                    {visibleData.map((row) => {
-                        const dueAmount = (row.expectedAmount || 0) - row.amount;
-                        const isUnderpaid = row.type === TransactionType.INCOME && dueAmount > 0;
+                    {pageLoading ? (
+                        <SkeletonTableRows count={8} columns={4} />
+                    ) : visibleData.map((row) => {
+                        const dueAmount = installmentShortfall(row);
+                        const isUnderpaid = row.type === TransactionType.INCOME && dueAmount > 0.01;
+                        const discountAmt = Number((row as any).discountAmount) || 0;
                         const isPending = row.status === 'PENDING';
                         const bName = getBuildingName(row.buildingId || (row as any).building) || row.buildingName || '';
                         const category = row.expenseCategory || '';
@@ -3409,8 +3444,11 @@ const canDelete = useCallback((tx: Transaction) => {
                                 <div className="flex flex-wrap items-center gap-1 text-[10px] text-slate-600 pt-0.5">
                                     <span className="px-1.5 py-0.5 rounded bg-slate-50 border border-slate-200 font-bold" title={fmtPaymentMethod(row)}>{fmtPaymentMethod(row)}</span>
                                     {row.isVATApplicable && <span className="px-1.5 py-0.5 rounded bg-blue-50 border border-blue-200 text-blue-700 font-bold">VAT</span>}
+                                    {discountAmt > 0 && (
+                                        <span className="px-1.5 py-0.5 rounded bg-teal-50 border border-teal-200 text-teal-700 font-bold">{t('history.discount')}: -{discountAmt.toLocaleString()}</span>
+                                    )}
                                     {isUnderpaid && (
-                                        <span className="px-2 py-1 rounded bg-rose-50 border border-rose-200 text-rose-700 font-bold">Left: {dueAmount.toLocaleString()}</span>
+                                        <span className="px-2 py-1 rounded bg-rose-50 border border-rose-200 text-rose-700 font-bold">{t('history.left')}: {dueAmount.toLocaleString()}</span>
                                     )}
                                 </div>
 
@@ -3458,7 +3496,7 @@ const canDelete = useCallback((tx: Transaction) => {
                             </div>
                         );
                     })}
-                    {effectiveList.length === 0 && (
+                    {effectiveList.length === 0 && !pageLoading && (
                         <div className="px-3 py-10 text-center">
                             <div className="inline-flex items-center justify-center w-14 h-14 rounded-2xl bg-slate-100 text-slate-400 mb-3"><FileText size={26}/></div>
                             <div className="text-sm font-bold text-slate-500">{showDuplicatesOnly ? (t('history.noDuplicates') || 'No duplicates found') : t('history.noTransactions')}</div>
@@ -3563,9 +3601,12 @@ const canDelete = useCallback((tx: Transaction) => {
                             </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-100 bg-white">
-                            {visibleData.map((row) => {
-                                const dueAmount = (row.expectedAmount || 0) - row.amount;
-                                const isUnderpaid = row.type === TransactionType.INCOME && dueAmount > 0;
+                            {pageLoading ? (
+                        <SkeletonTableRows count={8} columns={4} />
+                    ) : visibleData.map((row) => {
+                                const dueAmount = installmentShortfall(row);
+                                const isUnderpaid = row.type === TransactionType.INCOME && dueAmount > 0.01;
+                                const discountAmt = Number((row as any).discountAmount) || 0;
                                 const isPending = row.status === 'PENDING';
                                 const leftAccent = row.type === TransactionType.INCOME
                                     ? 'border-l-4 border-l-emerald-400'
@@ -3654,9 +3695,14 @@ const canDelete = useCallback((tx: Transaction) => {
                                                     <div className="amount-pill amount-neutral amount-pill-right"><span className="amt-value">-</span></div>
                                                 )}
                                             </div>
+                                            {discountAmt > 0 && (
+                                                <div className="text-[10px] text-teal-700 font-bold mt-1 bg-teal-50 px-2 py-1 rounded border border-teal-100 inline-block">
+                                                    {t('history.discount')}: -{discountAmt.toLocaleString()}
+                                                </div>
+                                            )}
                                             {isUnderpaid && (
                                                 <div className="text-[10px] text-rose-600 font-bold flex items-center justify-end gap-1 mt-1 bg-rose-50 px-2 py-1 rounded border border-rose-100 inline-block">
-                                                    <AlertTriangle size={10} /> Left: {dueAmount.toLocaleString()}
+                                                    <AlertTriangle size={10} /> {t('history.left')}: {dueAmount.toLocaleString()}
                                                 </div>
                                             )}
                                         </td>
@@ -3717,7 +3763,7 @@ const canDelete = useCallback((tx: Transaction) => {
                                     </tr>
                                 );
                             })}
-                            {effectiveList.length === 0 && (
+                            {effectiveList.length === 0 && !pageLoading && (
                                 <tr>
                                     <td colSpan={7} className="px-5 py-12">
                                         <div className="flex flex-col items-center justify-center text-center">
@@ -4062,8 +4108,8 @@ const canDelete = useCallback((tx: Transaction) => {
                                     )}
                                 </div>
                                 <div className="flex gap-3 mt-6">
-                                    <button type="button" onClick={() => setShowEditPaymentModal(false)} className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50">{t('common.cancel')}</button>
-                                    <button type="submit" className="flex-1 py-2.5 rounded-xl text-white font-bold shadow-lg bg-blue-600 hover:bg-blue-700 shadow-blue-200">{t('history.saveChanges')}</button>
+                                    <button type="button" onClick={() => setShowEditPaymentModal(false)} disabled={savingPayment} className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50 disabled:opacity-60">{t('common.cancel')}</button>
+                                    <button type="submit" disabled={savingPayment} className="flex-1 py-2.5 rounded-xl text-white font-bold shadow-lg bg-blue-600 hover:bg-blue-700 shadow-blue-200 disabled:opacity-60">{savingPayment ? t('common.saving') : t('history.saveChanges')}</button>
                                 </div>
                             </form>
                         </div>
@@ -4071,7 +4117,15 @@ const canDelete = useCallback((tx: Transaction) => {
                 )}
                 {showDeleteModal && txToDelete && (
                     <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-sm z-50 flex items-start justify-center pt-[12vh] p-4">
-                        <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-md w-full animate-slide-up">
+                        <div className="bg-white rounded-2xl shadow-2xl p-5 max-w-md w-full animate-slide-up relative">
+                            {deleting && (
+                                <div className="absolute inset-0 rounded-2xl bg-white/70 backdrop-blur-[1px] z-10 flex items-center justify-center">
+                                    <div className="flex items-center gap-2 text-sm font-bold text-slate-700">
+                                        <RefreshCw size={18} className="animate-spin text-rose-600" />
+                                        {t('common.processing')}
+                                    </div>
+                                </div>
+                            )}
                             <h3 className="text-lg font-bold text-slate-800 mb-2">
                                 {(txToDelete as any).isCreditNote
                                   ? 'Delete Credit Note'
@@ -4139,8 +4193,8 @@ const canDelete = useCallback((tx: Transaction) => {
                                 <p className="text-slate-500 text-sm mb-6">{t('history.confirmPermanentDelete')}</p>
                             )}
                             <div className="flex gap-3 mt-6">
-                                <button onClick={() => setShowDeleteModal(false)} className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50">{t('common.cancel')}</button>
-                                <button onClick={handleDeleteConfirm} className={`flex-1 py-2.5 rounded-xl text-white font-bold shadow-lg ${
+                                <button onClick={() => setShowDeleteModal(false)} disabled={deleting} className="flex-1 py-2.5 rounded-xl border border-slate-200 text-slate-600 font-bold hover:bg-slate-50 disabled:opacity-60 disabled:cursor-not-allowed">{t('common.cancel')}</button>
+                                <button onClick={handleDeleteConfirm} disabled={deleting} className={`flex-1 py-2.5 rounded-xl text-white font-bold shadow-lg disabled:opacity-60 disabled:cursor-not-allowed inline-flex items-center justify-center gap-2 ${
                                     (txToDelete as any).isCreditNote ? 'bg-rose-600 hover:bg-rose-700 shadow-rose-200'
                                     : (txToDelete.isVATApplicable && txToDelete.type === TransactionType.INCOME)
                                       ? (Boolean((txToDelete as any).zatcaQRCode || (txToDelete as any).zatcaReportedAt)
@@ -4148,13 +4202,14 @@ const canDelete = useCallback((tx: Transaction) => {
                                           : 'bg-rose-600 hover:bg-rose-700 shadow-rose-200')
                                     : 'bg-rose-600 hover:bg-rose-700 shadow-rose-200'
                                 }`}>
+                                    {deleting && <RefreshCw size={14} className="animate-spin" />}
                                     {(txToDelete as any).isCreditNote
                                       ? 'Delete Credit Note'
                                       : (txToDelete.isVATApplicable && txToDelete.type === TransactionType.INCOME)
                                         ? (Boolean((txToDelete as any).zatcaQRCode || (txToDelete as any).zatcaReportedAt)
-                                            ? t('history.createCreditNote')
-                                            : t('common.delete'))
-                                        : t('common.delete')}
+                                            ? (deleting ? t('common.processing') : t('history.createCreditNote'))
+                                            : (deleting ? t('common.processing') : t('common.delete')))
+                                        : (deleting ? t('common.processing') : t('common.delete'))}
                                 </button>
                             </div>
                         </div>
