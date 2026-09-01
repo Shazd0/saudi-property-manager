@@ -1362,7 +1362,7 @@ const ar: Record<string, string> = {
 
   'runtimeError.badge': 'إصلاح تلقائي',
   'runtimeError.title': 'تم رصد المشكلة',
-  'runtimeError.body': 'تم الإبلاغ عن الخطأ تلقائياً. فريقنا و Cursor AI يعملان على الإصلاح.',
+  'runtimeError.body': 'تم الإبلاغ عن الخطأ تلقائياً. فريقنا يعمل على الإصلاح.',
   'runtimeError.eta': 'عادةً يُصلح خلال دقائق قليلة',
   'approval.minsAgo': 'د مضت',
   'approval.hoursAgo': 'س مضت',

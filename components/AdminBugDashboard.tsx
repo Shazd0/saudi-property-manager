@@ -38,7 +38,7 @@ const AdminBugDashboard: React.FC = () => {
     <div className="max-w-4xl mx-auto p-6">
       <h1 className="text-2xl font-black mb-2 text-rose-700">Bugs & Auto-Fix Queue</h1>
       <p className="text-sm text-slate-500 mb-4">
-        Console and runtime errors from all users are captured automatically and can trigger Cursor to fix them.
+        Console and runtime errors from all users are captured automatically and queued for repair.
       </p>
 
       <div className="flex gap-2 mb-4">
@@ -66,11 +66,11 @@ const AdminBugDashboard: React.FC = () => {
                 <span className="font-bold text-violet-700">{r.kind}</span>
                 {r.cursorStatus === 'sent' && (
                   <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-700 flex items-center gap-1">
-                    <Zap size={12}/> Sent to Cursor
+                    <Zap size={12}/> Repair queued
                   </span>
                 )}
                 {r.cursorStatus === 'failed' && (
-                  <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700">Cursor webhook failed</span>
+                  <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700">Repair queue failed</span>
                 )}
                 <span className="text-xs text-slate-400 ml-auto">{new Date(r.createdAt).toLocaleString()}</span>
               </div>
@@ -82,7 +82,7 @@ const AdminBugDashboard: React.FC = () => {
                 <div>Page: <span className="font-mono">{r.route || r.url}</span></div>
                 {r.userId && <div>User: <span className="font-mono">{r.userId}</span></div>}
                 {r.bookId && <div>Book: <span className="font-mono">{r.bookId}</span></div>}
-                {r.cursorError && <div className="text-rose-600">Webhook: {r.cursorError}</div>}
+                {r.cursorError && <div className="text-rose-600">Queue: {r.cursorError}</div>}
               </div>
             </div>
           ))}

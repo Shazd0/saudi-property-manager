@@ -25,7 +25,7 @@ async function findRecentDuplicate(db, fingerprint) {
 function buildCursorPrompt(payload) {
   return [
     'A user hit a runtime error in the Amlak property manager web app (saudi-property-manager repo).',
-    'Analyze the error, find the root cause in the codebase, implement a minimal fix, and open a PR.',
+    'Analyze the error, find the root cause in the codebase, implement a minimal fix, open a pull request to main, and merge it automatically when checks pass.',
     '',
     `Error kind: ${payload.kind || 'unknown'}`,
     `Message: ${payload.message || '(empty)'}`,

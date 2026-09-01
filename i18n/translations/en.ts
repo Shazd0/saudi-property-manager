@@ -1380,7 +1380,7 @@ const en = {
 
   'runtimeError.badge': 'Auto-fix',
   'runtimeError.title': 'We caught that issue',
-  'runtimeError.body': 'The error was reported automatically. Our team and Cursor AI are working on a fix.',
+  'runtimeError.body': 'The error was reported automatically. Our team is working on a fix.',
   'runtimeError.eta': 'Usually fixed within a few minutes',
   'approval.minsAgo': 'm ago',
   'approval.hoursAgo': 'h ago',
