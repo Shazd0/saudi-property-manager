@@ -129,13 +129,62 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
 export async function requestPasswordReset(loginId: string): Promise<void> {
   const id = normalizeLoginId(loginId);
   const bookId = getCurrentBookId() || 'default';
-  let email = staffEmailForLogin(id, bookId);
-  try {
-    const profile = await loadUserByLoginId(id);
-    if (profile?.email) email = String(profile.email).trim();
-    else if (profile?.bookId) email = staffEmailForLogin(id, profile.bookId);
-  } catch {
-    /* use synthetic email */
-  }
+  const email = staffEmailForLogin(id, bookId);
   await sendPasswordResetEmail(auth, email);
+}
+
+/**
+ * Cutover helper: verify old Mac/Firestore password via Cloud Function Admin SDK,
+ * then create/update Firebase Auth password so normal login works.
+ */
+export async function migrateStaffPasswordWithLegacy(
+  loginId: string,
+  oldPassword: string,
+  newPassword: string,
+  bookId = 'default',
+): Promise<{ email: string }> {
+  const id = normalizeLoginId(loginId);
+  if (!id || !oldPassword || !newPassword) {
+    throw new Error('User ID, current password, and new password are required');
+  }
+  if (newPassword.length < 6) {
+    throw new Error('New password must be at least 6 characters');
+  }
+
+  const endpoints = [
+    'https://me-central2-saudi-property-manager.cloudfunctions.net/staffMigrateLogin',
+    'https://us-central1-saudi-property-manager.cloudfunctions.net/staffMigrateLogin',
+  ];
+
+  let lastError = 'Password migration endpoint unavailable';
+  for (const url of endpoints) {
+    try {
+      const res = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userId: id,
+          oldPassword,
+          newPassword,
+          bookId: bookId || 'default',
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        lastError = data?.error || `HTTP ${res.status}`;
+        if (res.status === 404 && url.includes('me-central2')) continue;
+        throw new Error(lastError);
+      }
+      return { email: String(data.email || staffEmailForLogin(id, bookId)) };
+    } catch (error: any) {
+      lastError = error?.message || String(error);
+      if (String(lastError).includes('Failed to fetch') || String(lastError).includes('NetworkError')) {
+        continue;
+      }
+      throw error;
+    }
+  }
+  throw new Error(
+    `${lastError}. Deploy staffMigrateLogin, or on Mac run: cd mac-cloud && npm run migrate:set-password -- --id ${id} --password 'YourNewPassword'`,
+  );
 }

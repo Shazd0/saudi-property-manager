@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { User } from '../types';
 import { isOwnerPortalAccount, OWNER_PORTAL_ONLY_LOGIN } from '../services/firestoreService';
-import { loginWithFirebaseAuth } from '../services/authService';
+import { loginWithFirebaseAuth, migrateStaffPasswordWithLegacy } from '../services/authService';
 import { Building2, ArrowRight, Lock, User as UserIcon, Fingerprint, Eye, EyeOff, KeyRound, AlertCircle, CheckCircle, Sparkles, Tag } from 'lucide-react';
 import SoundService from '../services/soundService';
 import { useLanguage } from '../i18n';
@@ -39,6 +39,7 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
   const [pricingOpen, setPricingOpen] = useState(false);
   const [forgotOpen, setForgotOpen] = useState(false);
   const [forgotId, setForgotId] = useState('');
+  const [forgotOldPass, setForgotOldPass] = useState('');
   const [forgotNewPass, setForgotNewPass] = useState('');
   const [forgotConfirmPass, setForgotConfirmPass] = useState('');
   const [forgotShowPass, setForgotShowPass] = useState(false);
@@ -336,8 +337,8 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                   <KeyRound size={24} />
                 </div>
                 <div>
-                  <h3 className="text-xl font-black">Forgot Password</h3>
-                  <p className="text-white/80 text-xs">Reset your password — admin will be notified</p>
+                  <h3 className="text-xl font-black">Set Firebase Password</h3>
+                  <p className="text-white/80 text-xs">Use your old password once, then log in with the new one</p>
                 </div>
               </div>
             </div>
@@ -349,16 +350,21 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                 e.preventDefault();
                 setForgotMsg(null);
                 if (!forgotId.trim()) { setForgotMsg({ type: 'error', text: 'Enter your User ID' }); return; }
-                if (forgotNewPass.length < 4) { setForgotMsg({ type: 'error', text: 'New password must be at least 4 characters' }); return; }
+                if (!forgotOldPass) { setForgotMsg({ type: 'error', text: 'Enter your current (old) password' }); return; }
+                if (forgotNewPass.length < 6) { setForgotMsg({ type: 'error', text: 'New password must be at least 6 characters' }); return; }
                 if (forgotNewPass !== forgotConfirmPass) { setForgotMsg({ type: 'error', text: 'Passwords do not match' }); return; }
                 setForgotLoading(true);
                 try {
-                  const svc = await import('../services/firestoreService');
-                  await svc.requestPasswordReset(forgotId.trim(), forgotNewPass);
-                  setForgotMsg({ type: 'success', text: 'Password changed successfully! You can now login with your new password.' });
-                  setForgotNewPass(''); setForgotConfirmPass('');
+                  await migrateStaffPasswordWithLegacy(forgotId.trim(), forgotOldPass, forgotNewPass);
+                  setForgotMsg({
+                    type: 'success',
+                    text: 'Firebase password set! Close this and log in with your NEW password.',
+                  });
+                  setForgotOldPass('');
+                  setForgotNewPass('');
+                  setForgotConfirmPass('');
                 } catch (err: any) {
-                  setForgotMsg({ type: 'error', text: err?.message || 'Failed to send request' });
+                  setForgotMsg({ type: 'error', text: err?.message || 'Failed to set password' });
                 } finally {
                   setForgotLoading(false);
                 }
@@ -376,6 +382,22 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                     onChange={e => setForgotId(e.target.value)}
                     className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-400 outline-none text-sm font-medium"
                     placeholder="Enter your User ID"
+                  />
+                </div>
+              </div>
+
+              {/* Current / old password (Mac-era password) */}
+              <div>
+                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Current password</label>
+                <div className="relative">
+                  <Lock className="absolute left-3 top-3 text-slate-400" size={16} />
+                  <input
+                    type={forgotShowPass ? 'text' : 'password'}
+                    required
+                    value={forgotOldPass}
+                    onChange={e => setForgotOldPass(e.target.value)}
+                    className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-400 outline-none text-sm font-medium"
+                    placeholder="Your old password (before Firebase)"
                   />
                 </div>
               </div>

@@ -2,12 +2,136 @@ const { onRequest } = require("firebase-functions/v2/https");
 const { setGlobalOptions } = require("firebase-functions/v2");
 const { initializeApp, getApps } = require("firebase-admin/app");
 const { getFirestore } = require("firebase-admin/firestore");
+const { getAuth } = require("firebase-admin/auth");
+const crypto = require("crypto");
 
 // Initialize Admin SDK once
 if (!getApps().length) initializeApp();
 
 // Deploy to Dammam, Saudi Arabia — required to reach ZATCA API
 setGlobalOptions({ region: "me-central2" });
+
+function sha256Hex(plain) {
+  return crypto.createHash("sha256").update(String(plain || ""), "utf8").digest("hex");
+}
+
+function verifyLegacyPassword(plain, stored) {
+  const value = String(stored || "");
+  if (!value) return false;
+  if (/^[a-f0-9]{64}$/i.test(value)) return sha256Hex(plain) === value.toLowerCase();
+  return plain === value;
+}
+
+function syntheticEmail(userId, bookId) {
+  const safeId = String(userId || "user").replace(/[^A-Za-z0-9._-]/g, "_").slice(0, 64);
+  const book = String(bookId || "default").trim().toUpperCase() || "DEFAULT";
+  return `${safeId}@${book}.amlak.internal`.toLowerCase();
+}
+
+function normalizeRole(role, isOwner) {
+  const value = String(role || "").trim().toUpperCase();
+  if (value === "OWNER" || isOwner) return "ADMIN";
+  if (value === "ENGINEER") return "EMPLOYEE";
+  if (["ADMIN", "MANAGER", "EMPLOYEE"].includes(value)) return value;
+  return "EMPLOYEE";
+}
+
+/**
+ * Post-cutover password migration:
+ * Verify the old SHA-256 / plaintext password from Firestore users/{id},
+ * then create/update Firebase Auth + authIndex so the app can sign in.
+ *
+ * POST { userId, oldPassword, newPassword, bookId? }
+ */
+exports.staffMigrateLogin = onRequest(
+  { timeoutSeconds: 30, memory: "256MiB", cors: true },
+  async (req, res) => {
+    if (req.method === "OPTIONS") return res.status(204).send("");
+    if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
+
+    const userId = String(req.body?.userId || "").trim();
+    const oldPassword = String(req.body?.oldPassword || "");
+    const newPassword = String(req.body?.newPassword || "");
+    const bookId = String(req.body?.bookId || "default").trim() || "default";
+
+    if (!userId || !oldPassword || !newPassword) {
+      return res.status(400).json({ error: "userId, oldPassword, and newPassword are required" });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ error: "New password must be at least 6 characters" });
+    }
+
+    try {
+      const db = getFirestore();
+      const auth = getAuth();
+      const usersCol = bookId === "default" ? "users" : `book_${bookId}_users`;
+      let snap = await db.collection(usersCol).doc(userId).get();
+      if (!snap.exists) {
+        const q = await db.collection(usersCol).where("id", "==", userId).limit(1).get();
+        if (!q.empty) snap = q.docs[0];
+      }
+      if (!snap.exists) {
+        return res.status(404).json({ error: "User ID not found" });
+      }
+
+      const data = snap.data() || {};
+      if (data.hasSystemAccess === false) {
+        return res.status(403).json({ error: "Account does not have system access" });
+      }
+      if (!verifyLegacyPassword(oldPassword, data.password)) {
+        return res.status(401).json({ error: "Current password is incorrect" });
+      }
+
+      const email = String(data.email || "").trim() || syntheticEmail(userId, bookId);
+      const normalizedEmail = email.toLowerCase();
+      let record;
+      try {
+        record = await auth.getUserByEmail(normalizedEmail);
+        await auth.updateUser(record.uid, {
+          password: newPassword,
+          displayName: data.name || userId,
+          disabled: String(data.status || "").toLowerCase() === "inactive",
+        });
+      } catch {
+        record = await auth.createUser({
+          email: normalizedEmail,
+          password: newPassword,
+          displayName: data.name || userId,
+          emailVerified: Boolean(data.email),
+        });
+      }
+
+      const role = normalizeRole(data.role, data.isOwner);
+      const kind = String(data.role || "").toUpperCase() === "OWNER" || data.isOwner ? "owner" : "staff";
+      await db.collection("authIndex").doc(record.uid).set({
+        userId,
+        bookId,
+        role,
+        kind,
+        email: normalizedEmail,
+        migratedAt: new Date().toISOString(),
+      }, { merge: true });
+
+      await db.collection(usersCol).doc(snap.id).set({
+        firebaseUid: record.uid,
+        password: sha256Hex(newPassword),
+        requiresPasswordReset: false,
+        authPasswordSetAt: new Date().toISOString(),
+      }, { merge: true });
+
+      return res.status(200).json({
+        ok: true,
+        userId,
+        email: normalizedEmail,
+        uid: record.uid,
+        bookId,
+      });
+    } catch (err) {
+      console.error("staffMigrateLogin failed", err);
+      return res.status(500).json({ error: err?.message || "Password migration failed" });
+    }
+  }
+);
 
 // The CSR generated for RR MILLENNIUM / amlak-prod
 const CSR_PEM = `-----BEGIN CERTIFICATE REQUEST-----
