@@ -1,18 +1,18 @@
+functionsDirectory = "C:\\Users\\shhah\\OneDrive\\Desktop\\saudi-property-manager\\netlify\\functions"
+functionsDirectoryOrigin = "config"
 headersOrigin = "config"
 redirectsOrigin = "config"
 plugins = []
 
-[functions]
-
-[functions."*"]
-
 [build]
-publish = "C:\\Users\\Asus\\Desktop\\My Projects 3\\saudi-property-manager\\dist"
-publishOrigin = "ui"
-commandOrigin = "ui"
+publish = "C:\\Users\\shhah\\OneDrive\\Desktop\\saudi-property-manager\\dist"
+publishOrigin = "config"
+commandOrigin = "config"
 command = "npm run build"
+functions = "C:\\Users\\shhah\\OneDrive\\Desktop\\saudi-property-manager\\netlify\\functions"
 
 [build.environment]
+VITE_OWNER_AUTOMATION_URL = "/owner-api"
 
 [build.processing]
 
@@ -26,6 +26,11 @@ command = "npm run build"
 
 [build.services]
 
+[functions]
+
+[functions."*"]
+node_bundler = "esbuild"
+
 [[headers]]
 for = "/*"
 
@@ -33,10 +38,58 @@ for = "/*"
 Content-Security-Policy = "default-src 'self' 'unsafe-inline' 'unsafe-eval' https: data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob: https://cdn.tailwindcss.com https://www.gstatic.com https://cdn.jsdelivr.net; worker-src 'self' blob: https://cdn.jsdelivr.net; child-src 'self' blob: https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com data:; img-src 'self' data: blob: https:; connect-src 'self' ws: wss: https: https://api.cloudinary.com https://*.cloudinary.com data: http://localhost:* http://127.0.0.1:*;"
 
 [[redirects]]
-from = "/api/*"
-to = "https://api.amlak-app.com/api/:splat"
+from = "/api/staff-migrate-login"
+to = "/.netlify/functions/staff-migrate-login"
 status = 200.0
 force = true
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/owner-api/*"
+to = "https://mcp.amlak-app.com/owner/:splat"
+status = 200.0
+force = true
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/owner"
+to = "/owner.html"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/tenant"
+to = "/tenant.html"
+status = 200.0
+force = false
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
+from = "/*"
+to = "/index.html"
+status = 200.0
+force = false
 
 [redirects.query]
 

@@ -111,11 +111,24 @@ export function computeInstallmentPaymentCoverage(params: {
   firstInstAmt: number;
   otherInstAmt: number;
   totalInst: number;
+  /**
+   * Installment capacity basis. VAT / non-residential leases store installment
+   * amounts as final (inclusive) prices — use `'incl'` so coverage matches cash.
+   */
+  scheduleBasis?: 'incl' | 'excl';
 }): {
   prior: { paid: number; allocations: PaymentCoverageItem[] };
   installments: Array<{ no: number; paid: number; allocations: PaymentCoverageItem[] }>;
 } {
-  const { contract, payments, priorOutstanding, firstInstAmt, otherInstAmt, totalInst } = params;
+  const {
+    contract,
+    payments,
+    priorOutstanding,
+    firstInstAmt,
+    otherInstAmt,
+    totalInst,
+    scheduleBasis = 'excl',
+  } = params;
   const sources = buildSources(contract, payments);
 
   const priorBucket: Bucket = {
@@ -132,7 +145,7 @@ export function computeInstallmentPaymentCoverage(params: {
       kind: 'installment',
       installmentNo: i,
       capacity: i === 1 ? firstInstAmt : otherInstAmt,
-      basis: 'excl',
+      basis: scheduleBasis,
       allocations: [],
     });
   }

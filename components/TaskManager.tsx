@@ -23,6 +23,7 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
     const [confirmTitle, setConfirmTitle] = useState('Confirm');
     const [confirmDanger, setConfirmDanger] = useState(false);
     const [confirmAction, setConfirmAction] = useState<null | (() => void)>(null);
+    const [saving, setSaving] = useState(false);
 
     const openConfirm = (message: string, onConfirm: () => void, opts?: { title?: string; danger?: boolean }) => {
         setConfirmTitle(opts?.title || 'Confirm');
@@ -50,6 +51,7 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
 
     const handleAddTask = async (e: React.FormEvent) => {
       e.preventDefault();
+      if (saving) return;
       SoundService.play('submit');
       if(!newTaskTitle.trim()) return;
       
@@ -71,11 +73,16 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
           createdAt: Date.now()
       };
       
+      setSaving(true);
+      try {
       await saveTask(newTask);
       
       const list = currentUser.role === 'ADMIN' && filter === 'ALL' ? await getTasks() : await getTasks(currentUser.id);
       setTasks(list);
       setNewTaskTitle('');
+      } finally {
+      setSaving(false);
+      }
   };
 
     const moveTask = async (task: Task, newStatus: TaskStatus) => {
@@ -187,7 +194,7 @@ const TaskManager: React.FC<TaskManagerProps> = ({ currentUser }) => {
                         className="w-full pl-8 sm:pl-9 pr-3 sm:pr-4 py-2 sm:py-3 bg-slate-50 border border-slate-200 rounded-lg sm:rounded-xl outline-none focus:ring-2 focus:ring-violet-500 text-xs sm:text-sm font-medium transition-all focus:bg-white"
                     />
                  </div>
-                 <button type="submit" className="bg-emerald-500 text-white p-2 sm:p-3 rounded-lg sm:rounded-xl hover:bg-emerald-600 transition-transform active:scale-95 shadow-lg flex-shrink-0">
+                 <button type="submit" disabled={saving} className="bg-emerald-500 text-white p-2 sm:p-3 rounded-lg sm:rounded-xl hover:bg-emerald-600 transition-transform active:scale-95 shadow-lg flex-shrink-0 disabled:opacity-60">
                      <Plus size={16} className="sm:size-[20px]" />
                  </button>
              </form>

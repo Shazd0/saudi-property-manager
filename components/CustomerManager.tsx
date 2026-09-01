@@ -17,6 +17,7 @@ import pdfjsWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createOcrWorker } from '../utils/createOcrWorker';
 import * as XLSX from 'xlsx';
 import { useLanguage } from '../i18n';
+import { SkeletonCustomerGrid, SkeletonTableRows } from './LoadingSkeleton';
 
 // Configure PDF.js worker from node_modules
 pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorker;
@@ -87,6 +88,8 @@ const CustomerManager: React.FC = () => {
   ]);
   const [newNationality, setNewNationality] = useState('');
   const [confirmModal, setConfirmModal] = useState<{open: boolean; title: string; message: string; danger: boolean; action: (() => Promise<void>) | null}>({open: false, title: 'Confirm', message: '', danger: false, action: null});
+  const [saving, setSaving] = useState(false);
+  const [listLoading, setListLoading] = useState(true);
 
   const openConfirm = (message: string, onConfirm: () => Promise<void>, opts?: { title?: string; danger?: boolean }) => {
     setConfirmModal({open: true, title: opts?.title || 'Confirm', message, danger: !!opts?.danger, action: onConfirm});
@@ -106,9 +109,14 @@ const CustomerManager: React.FC = () => {
 
   useEffect(() => { 
     (async () => { 
+      setListLoading(true);
+      try {
       const data = await getCustomers({ includeDeleted: true, acrossBooks: true }); 
       setCustomers(data || []); 
       setFilteredCustomers(data || []); 
+      } finally {
+      setListLoading(false);
+      }
     })(); 
   }, []);
 
@@ -133,6 +141,7 @@ const CustomerManager: React.FC = () => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     
     // Strict mobile validation
@@ -212,12 +221,17 @@ const CustomerManager: React.FC = () => {
       id: formData.id || crypto.randomUUID(),
       code: customerCode || '01'
     };
-    await saveCustomer(newCustomer);
-    const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
-    setCustomers(data || []);
-    setFilteredCustomers(data || []);
-    setView('LIST');
-    resetForm();
+    setSaving(true);
+    try {
+      await saveCustomer(newCustomer);
+      const data = await getCustomers({ includeDeleted: true, acrossBooks: true });
+      setCustomers(data || []);
+      setFilteredCustomers(data || []);
+      setView('LIST');
+      resetForm();
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleDelete = async (id: string, name: string) => {
@@ -1513,7 +1527,9 @@ const CustomerManager: React.FC = () => {
 
             {/* Mobile Cards */}
             <div className="md:hidden space-y-3 mb-4 animate-stagger">
-              {(filteredCustomers || []).length > 0 ? ([...(filteredCustomers || [])].sort((a, b) => {
+              {listLoading ? (
+                <SkeletonCustomerGrid count={6} />
+              ) : (filteredCustomers || []).length > 0 ? ([...(filteredCustomers || [])].sort((a, b) => {
                 const aCode = parseInt(a.code) || 0;
                 const bCode = parseInt(b.code) || 0;
                 if ((aCode === 0 && bCode !== 0) || (aCode !== 0 && bCode === 0)) {
@@ -1564,6 +1580,9 @@ const CustomerManager: React.FC = () => {
 
             {/* Desktop Table */}
             <div className="hidden md:block overflow-x-auto rounded-xl border border-slate-100">
+                {listLoading ? (
+                  <div className="p-4"><SkeletonTableRows count={10} columns={6} /></div>
+                ) : (
                 <table className="w-full text-left">
                 <thead>
                     <tr className="bg-slate-50 border-b border-slate-200 text-[10px] sm:text-xs">
@@ -1633,6 +1652,7 @@ const CustomerManager: React.FC = () => {
                     )}
                 </tbody>
                 </table>
+                )}
             </div>
           </>
         ) : (
@@ -1858,7 +1878,7 @@ const CustomerManager: React.FC = () => {
 
              <div className="pt-4 sm:pt-6 border-t border-slate-100 flex flex-col-reverse sm:flex-row justify-end gap-2 sm:gap-4">
                  <button type="button" onClick={() => { resetForm(); setView('LIST'); }} className="pm-btn pm-btn-secondary">{t('common.cancel')}</button>
-                 <button type="submit" className="pm-btn pm-btn-primary flex items-center justify-center gap-1.5 sm:gap-2"><Save size={14} />{t('common.save')}</button>
+                 <button type="submit" disabled={saving} className="pm-btn pm-btn-primary flex items-center justify-center gap-1.5 sm:gap-2 disabled:opacity-60"><Save size={14} />{saving ? t('common.saving') : t('common.save')}</button>
              </div>
           </form>
         )}

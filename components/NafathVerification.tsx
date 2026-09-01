@@ -81,6 +81,7 @@ const NafathVerificationPage: React.FC = () => {
   const [showKey, setShowKey] = useState(false);
   const [credStatus, setCredStatus] = useState<{ hasCredentials: boolean; maskedAppId: string } | null>(null);
   const [savingCreds, setSavingCreds] = useState(false);
+  const [saving, setSaving] = useState(false);
 
   // Active polling: map of transId → intervalId
   const pollingRefs = useRef<Record<string, ReturnType<typeof setInterval>>>({});
@@ -178,6 +179,7 @@ const NafathVerificationPage: React.FC = () => {
   /** Create a new verification via the real Nafath API */
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.customerName || !formData.nationalId) {
       showError('Customer name and National ID are required');
@@ -191,6 +193,7 @@ const NafathVerificationPage: React.FC = () => {
     if (editId) {
       // Simple edit (status/name only — not a re-initiation)
       const updated = { ...formData, id: editId };
+      setSaving(true);
       try {
         await saveNafathVerification(updated);
         showSuccess('Verification record updated');
@@ -199,10 +202,13 @@ const NafathVerificationPage: React.FC = () => {
         setFormData({ customerName: '', nationalId: '', status: 'Pending' });
         load();
       } catch (err: any) { showError(err.message || 'Failed to update'); }
+      finally { setSaving(false); }
       return;
     }
 
     // ── New request: call Nafath API ──────────────────────────────────────
+    setSaving(true);
+    try {
     let nafathResult: Awaited<ReturnType<typeof initiateNafathVerification>>;
     try {
       nafathResult = await initiateNafathVerification(formData.nationalId);
@@ -214,6 +220,7 @@ const NafathVerificationPage: React.FC = () => {
           : (err.message || 'Failed to reach Nafath API')
       );
       if ((err as any).guide) setShowSettings(true);
+      setSaving(false);
       return;
     }
 
@@ -237,9 +244,9 @@ const NafathVerificationPage: React.FC = () => {
       setIsFormOpen(false);
       setFormData({ customerName: '', nationalId: '', status: 'Pending' });
       load();
-      // Start polling immediately
       startPolling(record);
     } catch (err: any) { showError(err.message || 'Failed to save verification'); }
+    } finally { setSaving(false); }
   };
 
   const handleEdit = (v: NafathVerification) => { setFormData(v); setEditId(v.id); setIsFormOpen(true); };

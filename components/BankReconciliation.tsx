@@ -41,6 +41,7 @@ const BankReconciliation: React.FC = () => {
   const [splitModal, setSplitModal] = useState<BankStatement | null>(null);
   const [splitSelected, setSplitSelected] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
   const [activeTab, setActiveTab] = useState<'statements' | 'unmatched' | 'insights'>('statements');
 
   const load = async () => {
@@ -96,6 +97,7 @@ const BankReconciliation: React.FC = () => {
 
   const addManualEntry = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!manualEntry.bankName || !manualEntry.transactionDate) {
       showError('Bank name and date required');
@@ -112,6 +114,7 @@ const BankReconciliation: React.FC = () => {
       credit: Number(manualEntry.credit) || 0,
       createdAt: Date.now(),
     };
+    setSaving(true);
     try {
       await saveBankStatement(stmt);
       showSuccess('Statement entry added');
@@ -119,6 +122,8 @@ const BankReconciliation: React.FC = () => {
       load();
     } catch (err: any) {
       showError(err.message || 'Failed to save statement');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -631,8 +636,8 @@ const BankReconciliation: React.FC = () => {
                   step="0.01"
                 />
               </div>
-              <button type="submit" className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm">
-                Add Entry
+              <button type="submit" disabled={saving} className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm disabled:opacity-60">
+                {saving ? 'Saving...' : 'Add Entry'}
               </button>
             </form>
             <h3 className="font-semibold text-sm mb-2">Import from CSV</h3>

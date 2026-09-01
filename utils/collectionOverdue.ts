@@ -58,6 +58,7 @@ export function getDaysLateForContract(
     contract,
     payments: incomeTxs,
     excludeFeesEntry: nonRes,
+    useInclusivePayments: nonRes,
   });
 
   const dueDates = getInstallmentStartDates({

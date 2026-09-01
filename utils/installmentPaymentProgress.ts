@@ -12,6 +12,11 @@ export function computeInstallmentProgress(params: {
   payments: Transaction[];
   /** Non-residential: exclude feesEntry rows from rent schedule (same as Entry). */
   excludeFeesEntry?: boolean;
+  /**
+   * When true (VAT / non-residential leases), compare cash/inclusive payments to
+   * installment amounts — those contracts store final prices, not exclusive rent.
+   */
+  useInclusivePayments?: boolean;
 }): {
   installmentNo: number;
   firstInstAmt: number;
@@ -20,7 +25,7 @@ export function computeInstallmentProgress(params: {
   /** Paid toward schedule (tx amounts + discount + upfront), same basis as Entry loop. */
   schedulePaid: number;
 } {
-  const { contract, payments, excludeFeesEntry } = params;
+  const { contract, payments, excludeFeesEntry, useInclusivePayments } = params;
   const rentPayments = excludeFeesEntry
     ? payments.filter((t) => !(t as any).feesEntry)
     : payments;
@@ -37,11 +42,13 @@ export function computeInstallmentProgress(params: {
     firstInstAmt = Math.max(0, effectiveTotal - otherInstAmt * Math.max(0, totalInst - 1));
   }
 
-  const totalPaidExcl = rentPayments.reduce(
-    (sum, t) => sum + (Number(t.amount) || 0) + (Number((t as any).discountAmount) || 0),
-    0,
-  );
-  const schedulePaid = totalPaidExcl + upfrontPaid;
+  const totalPaid = rentPayments.reduce((sum, t) => {
+    const base = useInclusivePayments
+      ? Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount || 0)
+      : Number(t.amount || 0);
+    return sum + base + (Number((t as any).discountAmount) || 0);
+  }, 0);
+  const schedulePaid = totalPaid + upfrontPaid;
 
   let cumulative = 0;
   let installmentNo = totalInst;

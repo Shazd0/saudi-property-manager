@@ -77,7 +77,16 @@ import { getTransactions, getContracts, getApprovals, getBuildings, getSettings,
 import { fmtDate } from '../utils/dateFormat';
 import { formatNameWithRoom, buildCustomerRoomMap } from '../utils/customerDisplay';
 import { useToast } from './Toast';
-import { normalizePaymentMethod, normalizeTransactionType, transactionCountsAsBankForSplit, transactionCountsAsCashForSplit } from '../utils/transactionUtils';
+import { SkeletonDashboard } from './LoadingSkeleton';
+import {
+  normalizePaymentMethod,
+  normalizeTransactionType,
+  transactionCountsAsBankForSplit,
+  transactionCountsAsCashForSplit,
+  transactionDisplayAmount,
+  ledgerOpeningAmount,
+  dedupeTreasuryTransferLegs,
+} from '../utils/transactionUtils';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 
@@ -398,10 +407,16 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
       const userBuildingIds = (currentUser as any)?.buildingIds || ((currentUser as any)?.buildingId ? [(currentUser as any).buildingId] : []);
       const norm = (v: any) => String(v || '').trim().toLowerCase();
 
-      const existingTreasuryIds = new Set(allTransactions.filter(t => (t as any).transferId).map(tx => (t as any).transferId));
+      // Must map transferId from each tx — do not use outer `t` (i18n), or every
+      // Building↔Owner transfer is re-injected and double-counted vs History.
+      const existingTreasuryIds = new Set(
+        allTransactions
+          .filter(tx => (tx as any).transferId)
+          .map(tx => String((tx as any).transferId)),
+      );
       const buildingOwnerPseudo = (transfers || []).filter((tr: any) =>
         ((tr.fromType === 'BUILDING' && tr.toType === 'OWNER') || (tr.fromType === 'OWNER' && tr.toType === 'BUILDING'))
-        && !tr.deleted && !existingTreasuryIds.has(tr.id)
+        && !tr.deleted && !existingTreasuryIds.has(String(tr.id || ''))
       ).map((tr: any) => ({
         id: `pseudo_${tr.id}`,
         date: tr.date || '',
@@ -410,6 +425,9 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         paymentMethod: 'TREASURY',
         // Preserve the user-selected flow (CASH/BANK/CHEQUE) for proper cash/bank split.
         originalPaymentMethod: tr.paymentMethod,
+        fromBankName: tr.fromBankName,
+        toBankName: tr.toBankName,
+        bankName: tr.fromBankName || tr.bankName,
         fromType: tr.fromType,
         toType: tr.toType,
         fromId: tr.fromId,
@@ -497,7 +515,8 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
         return t.buildingId && userBuildingIds.includes(t.buildingId);
       });
 
-      return approvedTxns;
+      // Same as History list: drop duplicate treasury transfer legs so Opening/Net match.
+      return dedupeTreasuryTransferLegs(approvedTxns);
     },
     [allTransactions, currentUser, transfers]
   );
@@ -592,31 +611,11 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
   const effectiveDateFrom = fromDate || '';
   const effectiveDateTo = tillDate || toDate || '9999-12-31';
 
-  /** Amount to use in dashboard totals (prefer VAT-inclusive when available). */
-  const txDisplayAmount = useCallback((t: Transaction): number => {
-    const inclRaw = (t as any).amountIncludingVAT ?? (t as any).totalWithVat;
-    if (inclRaw != null && inclRaw !== '') {
-      const n = Number(inclRaw);
-      if (!Number.isNaN(n)) {
-        const base = Number((t as any).amount) || 0;
-        const vat = Number((t as any).vatAmount) || 0;
-        const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-        // Old data guard: some rows stored "amountIncludingVAT" but it equals the exclusive/base.
-        if (isExpense && vat > 0 && base > 0 && n > 0 && n <= base + 0.01) return base + vat;
-        return n;
-      }
-    }
-    const base = Number((t as any).amount) || 0;
-    const isExpense = normalizeTransactionType(t.type) === TransactionType.EXPENSE;
-    const vat = Number((t as any).vatAmount) || 0;
-    // Back-compat: some old VAT purchases stored `vatAmount` but not `amountIncludingVAT`,
-    // and some rows may be missing `isVATApplicable` even though VAT was entered.
-    if (isExpense && vat > 0) return base + vat;
-    return base;
-  }, []);
+  /** Same amount rules as History (shared helper — avoids VAT double-add). */
+  const txDisplayAmount = useCallback((t: Transaction): number => transactionDisplayAmount(t), []);
 
   const dashLedgerSummary = useMemo(() => {
-    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + txDisplayAmount(r), 0);
+    const sumAmt = (rows: Transaction[]) => rows.reduce((s, r) => s + transactionDisplayAmount(r), 0);
     const isOpeningBalance = (t: Transaction) =>
       t.borrowingType === 'OPENING_BALANCE' ||
       (t as any).isOwnerOpeningBalance === true ||
@@ -648,12 +647,12 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
     const bankExpense = sumAmt(expenseRows.filter(r => transactionCountsAsBankForSplit(r)));
     const expenseTotal = sumAmt(expenseRows);
 
-    // Opening balances from prior txns
+    // Opening balances from prior txns — same amount formula as History summary
     let openingCash = 0, openingBank = 0, openingAll = 0;
     const priorTxns = filteredApproved.filter(t => t.date && t.date < openingCutoff);
     for (const t of priorTxns) {
       if (isOpeningBalance(t)) continue;
-      const amt = txDisplayAmount(t);
+      const amt = ledgerOpeningAmount(t);
       const isInc = normalizeTransactionType(t.type) === TransactionType.INCOME;
       const netAmt = isInc ? amt : -amt;
       openingAll += netAmt;
@@ -1387,10 +1386,7 @@ const Dashboard: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
 
       {/* ── Loading ── */}
       {loading && (
-        <div className="flex flex-col items-center justify-center py-16">
-          <div className="w-12 h-12 border-4 border-emerald-200 border-t-emerald-600 rounded-full animate-spin mb-4"></div>
-          <p className="text-emerald-700 font-medium">{t('dashboard.loading')}</p>
-        </div>
+        <SkeletonDashboard />
       )}
 
       {/* ── Error ── */}

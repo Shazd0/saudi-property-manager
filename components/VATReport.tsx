@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Transaction, TransactionType, TransactionStatus, ExpenseCategory, PaymentMethod, Building, Customer, Vendor, Bank } from '../types';
+import { Transaction, TransactionType, TransactionStatus, ExpenseCategory, PaymentMethod, Building, Customer, Vendor, Bank, User, UserRole } from '../types';
 import { getTransactions, saveTransaction, getBuildings, getCustomers, getActiveContract, getVendors, createCreditNote, deleteTransaction, getContracts, saveContract, getBanks, getCustomExpenseCategories, saveCustomExpenseCategories } from '../services/firestoreService';
 import { isValidSaudiVAT } from '../utils/validators';
 import SearchableSelect from './SearchableSelect';
 import AddVendorDialog from './AddVendorDialog';
 import ConfirmDialog from './ConfirmDialog';
-import { FileText, Download, Calendar, Receipt, TrendingUp, TrendingDown, X, QrCode, FileDown, Search, Send, CheckCircle, AlertCircle, Loader, Eye, Plus, User, Sparkles, RotateCcw, FileUp, Trash2, ArrowLeftRight, History, ChevronDown, ChevronRight } from 'lucide-react';
+import { FileText, Download, Calendar, Receipt, TrendingUp, TrendingDown, X, QrCode, FileDown, Search, Send, CheckCircle, AlertCircle, Loader, Eye, Plus, User as UserIcon, Sparkles, RotateCcw, FileUp, Trash2, ArrowLeftRight, History, ChevronDown, ChevronRight, Pencil, Lock, Landmark, ClipboardList, Copy, ExternalLink, ShieldCheck, Scale } from 'lucide-react';
 import PdfPurchaseImport from './PdfPurchaseImport';
-import { fmtDate, dateToLocalStr } from '../utils/dateFormat';
+import { fmtDate, dateToLocalStr, contractDateToYmd } from '../utils/dateFormat';
 import { buildTransactionSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import { getInstallmentRange } from '../utils/installmentSchedule';
@@ -71,9 +71,33 @@ const getQuarterDateRange = (year: number, quarter: 1 | 2 | 3 | 4): { from: stri
   };
 };
 
-const VATReport: React.FC = () => {
+/** Normalize any transaction date to YYYY-MM-DD for reliable quarter/range filtering. */
+const txDateYmd = (value: unknown): string => {
+  if (value == null || value === '') return '';
+  if (typeof value === 'string') {
+    const s = value.trim();
+    const iso = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})/);
+    if (iso) return `${iso[1]}-${pad2(Number(iso[2]))}-${pad2(Number(iso[3]))}`;
+    const dmy = s.match(/^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{4})$/);
+    if (dmy) return `${dmy[3]}-${pad2(Number(dmy[2]))}-${pad2(Number(dmy[1]))}`;
+  }
+  return contractDateToYmd(value);
+};
+
+const txInDateRange = (tx: { date?: unknown }, from: string, to: string): boolean => {
+  const ymd = txDateYmd(tx.date);
+  if (!ymd) return false;
+  if (from && ymd < from) return false;
+  if (to && ymd > to) return false;
+  return true;
+};
+
+const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => {
   const [transactions, setTransactions] = useState<Transaction[]>([]);
   const { t, isRTL } = useLanguage();
+  const isAdmin = currentUser?.role === UserRole.ADMIN;
+  const [editColumnsMode, setEditColumnsMode] = useState(false);
+  const [savingEditId, setSavingEditId] = useState<string | null>(null);
 
   const [filterFromDate, setFilterFromDate] = useState('');
   const [filterToDate, setFilterToDate] = useState('');
@@ -84,7 +108,8 @@ const VATReport: React.FC = () => {
   const [filterBuildingId, setFilterBuildingId] = useState('');
   const [filterUnit, setFilterUnit] = useState('');
   const [filteredVATTransactions, setFilteredVATTransactions] = useState<Transaction[]>([]);
-  const [reportView, setReportView] = useState<'SALES' | 'PURCHASE' | 'CREDIT_NOTE' | 'COMBINED' | 'COMPARE' | 'IMPORT_HISTORY'>('SALES');
+  const [reportView, setReportView] = useState<'SALES' | 'PURCHASE' | 'CREDIT_NOTE' | 'COMBINED' | 'COMPARE' | 'IMPORT_HISTORY' | 'VAT_RETURN'>('SALES');
+  const [copiedReturnField, setCopiedReturnField] = useState<string | null>(null);
   const [selectedQRCode, setSelectedQRCode] = useState<string | null>(null);
   const [zatcaSending, setZatcaSending] = useState<Record<string, boolean>>({});
   const [zatcaStatus, setZatcaStatus] = useState<Record<string, { ok: boolean; msg: string }>>({});
@@ -147,20 +172,24 @@ const VATReport: React.FC = () => {
 
   useEffect(() => {
     let cancelled = false;
+    const VAT_MIGRATION_KEY = 'amlak_vat_invoice_migration_v1_done';
     (async () => {
-      // Always load rows first — migrate/snapshots must never block the tab.
       try {
         await loadData();
       } catch (e) {
         console.error('VATReport loadData failed', e);
       }
       if (cancelled) return;
-      try {
-        await migrateVatInvoiceNumbers();
-        if (!cancelled) await loadData();
-      } catch (e) {
-        console.error('VATReport migrateVatInvoiceNumbers failed', e);
-      }
+      if (localStorage.getItem(VAT_MIGRATION_KEY) === 'done') return;
+      void (async () => {
+        try {
+          await migrateVatInvoiceNumbers();
+          localStorage.setItem(VAT_MIGRATION_KEY, 'done');
+          if (!cancelled) void loadData();
+        } catch (e) {
+          console.error('VATReport migrateVatInvoiceNumbers failed', e);
+        }
+      })();
     })();
     Promise.all([getBuildings(), getCustomers(), getVendors(), getBanks(), getContracts()]).then(([b, c, v, bks, ctr]) => {
       if (cancelled) return;
@@ -944,6 +973,7 @@ const VATReport: React.FC = () => {
   };
 
   const handleUpdatePaymentMethod = async (id: string, method: PaymentMethod) => {
+    if (!isAdmin || !editColumnsMode) return;
     const t = transactions.find(x => x.id === id);
     if (!t) return;
     const next: Transaction = {
@@ -956,11 +986,72 @@ const VATReport: React.FC = () => {
   };
 
   const handleUpdateBankName = async (id: string, bankName: string) => {
+    if (!isAdmin || !editColumnsMode) return;
     const t = transactions.find(x => x.id === id);
     if (!t) return;
     const next: Transaction = { ...t, bankName: bankName || undefined } as Transaction;
     await saveTransaction(next);
     setTransactions(prev => prev.map(x => (x.id === id ? next : x)));
+  };
+
+  const patchVatTransaction = async (id: string, patch: Partial<Transaction>) => {
+    if (!isAdmin || !editColumnsMode) return;
+    const existing = transactions.find(x => x.id === id);
+    if (!existing) return;
+    setSavingEditId(id);
+    try {
+      const next = {
+        ...existing,
+        ...patch,
+        lastModifiedAt: Date.now(),
+      } as Transaction;
+      // Refresh VAT report snapshot so exports stay in sync with edited columns
+      const customerName = next.type === TransactionType.INCOME
+        ? (String((next as any).customerName || '').trim() || resolveSalesCustomerName(next))
+        : undefined;
+      next.vatReportSnapshot = createVatReportSnapshot(next, { customerName }) as any;
+      await saveTransaction(next);
+      setTransactions(prev => prev.map(x => (x.id === id ? next : x)));
+    } finally {
+      setSavingEditId(null);
+    }
+  };
+
+  const handleEditAmount = async (
+    id: string,
+    field: 'excl' | 'vat' | 'incl',
+    raw: string,
+  ) => {
+    const value = Math.abs(Number(String(raw).replace(/,/g, '')) || 0);
+    const existing = transactions.find(x => x.id === id);
+    if (!existing) return;
+    const sign = existing.isCreditNote ? -1 : 1;
+    let excl = Math.abs(existing.amountExcludingVAT ?? existing.amount ?? 0);
+    let vat = Math.abs(existing.vatAmount || 0);
+    let incl = Math.abs(existing.totalWithVat ?? existing.amountIncludingVAT ?? existing.amount ?? 0);
+
+    if (field === 'excl') {
+      excl = value;
+      vat = Math.round(excl * 0.15 * 100) / 100;
+      incl = Math.round((excl + vat) * 100) / 100;
+    } else if (field === 'vat') {
+      vat = value;
+      incl = Math.round((excl + vat) * 100) / 100;
+    } else {
+      incl = value;
+      excl = Math.round((incl / 1.15) * 100) / 100;
+      vat = Math.round((incl - excl) * 100) / 100;
+    }
+
+    await patchVatTransaction(id, {
+      amount: sign * excl,
+      amountExcludingVAT: sign * excl,
+      vatAmount: sign * vat,
+      amountIncludingVAT: sign * incl,
+      totalWithVat: sign * incl,
+      isVATApplicable: true,
+      vatRate: existing.vatRate ?? 15,
+    });
   };
 
   const toggleSelectAll = () => {
@@ -996,8 +1087,9 @@ const VATReport: React.FC = () => {
     }
     else if (reportView === 'PURCHASE') filtered = filtered.filter(t => t.type === TransactionType.EXPENSE && !t.isCreditNote);
     else if (reportView === 'CREDIT_NOTE') filtered = filtered.filter(t => !!t.isCreditNote);
-    if (filterFromDate) filtered = filtered.filter(t => t.date >= filterFromDate);
-    if (filterToDate) filtered = filtered.filter(t => t.date <= filterToDate);
+    if (filterFromDate || filterToDate) {
+      filtered = filtered.filter(t => txInDateRange(t, filterFromDate, filterToDate));
+    }
     
     // New Search & Building Filters
     if (filterBuildingId) filtered = filtered.filter(t => matchesBuildingFilter(t, filterBuildingId));
@@ -1016,33 +1108,61 @@ const VATReport: React.FC = () => {
 
   const allFilteredSelected = filteredVATTransactions.length > 0 && filteredVATTransactions.every(t => selectedIds.has(t.id));
 
-  const salesTransactions = filteredVATTransactions.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote);
-  const purchaseTransactions = filteredVATTransactions.filter(t => t.type === TransactionType.EXPENSE && !t.isCreditNote);
-  const creditNoteTransactions = filteredVATTransactions.filter(t => !!t.isCreditNote);
-  const salesVAT = salesTransactions.reduce((sum, t) => sum + Math.abs(t.vatAmount || 0), 0);
-  const purchaseVAT = purchaseTransactions.reduce((sum, t) => sum + Math.abs(t.vatAmount || 0), 0);
-  const creditNoteVAT = creditNoteTransactions.reduce((sum, t) => sum + Math.abs(t.vatAmount || 0), 0);
-  const netVATPayable = filteredVATTransactions.reduce((sum, tx) => {
-    const vat = Math.abs(tx.vatAmount || 0);
-    if (tx.type === TransactionType.INCOME) {
-      return sum + (tx.isCreditNote ? -vat : vat);
-    }
-    return sum + (tx.isCreditNote ? vat : -vat);
-  }, 0);
+  const allSelectedFiltered = filteredVATTransactions;
+  const salesTransactionsAll = allSelectedFiltered.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote);
+  /** Match Sales report tab: only ZATCA-reported sales count toward Output VAT. */
+  const salesTransactions = salesTransactionsAll.filter(t => isReportedToZatca(t));
+  const salesUnreportedTransactions = salesTransactionsAll.filter(t => !isReportedToZatca(t));
+  const purchaseTransactions = allSelectedFiltered.filter(t => t.type === TransactionType.EXPENSE && !t.isCreditNote);
+  const salesCreditNoteTransactions = allSelectedFiltered.filter(
+    t => !!t.isCreditNote && t.type === TransactionType.INCOME,
+  );
+  const purchaseCreditNoteTransactions = allSelectedFiltered.filter(
+    t => !!t.isCreditNote && t.type === TransactionType.EXPENSE,
+  );
+  const creditNoteTransactions = allSelectedFiltered.filter(t => !!t.isCreditNote);
 
-  const totalVAT = filteredVATTransactions.reduce((sum, t) => sum + (t.vatAmount || 0), 0);
-  const totalExcludingVAT = filteredVATTransactions.reduce((sum, t) => sum + (t.amountExcludingVAT || t.amount || 0), 0);
-  const totalIncludingVAT = filteredVATTransactions.reduce((sum, t) => sum + (t.amountIncludingVAT || t.totalWithVat || t.amount || 0), 0);
+  const sumVatAbs = (list: Transaction[]) =>
+    list.reduce((sum, t) => sum + Math.abs(Number(t.vatAmount || 0)), 0);
+
+  const salesVAT = sumVatAbs(salesTransactions);
+  const salesUnreportedVAT = sumVatAbs(salesUnreportedTransactions);
+  const purchaseVAT = sumVatAbs(purchaseTransactions);
+  const salesCreditNoteVAT = sumVatAbs(salesCreditNoteTransactions);
+  const purchaseCreditNoteVAT = sumVatAbs(purchaseCreditNoteTransactions);
+  const creditNoteVAT = salesCreditNoteVAT + purchaseCreditNoteVAT;
+
+  /**
+   * Output VAT = ZATCA-reported sales VAT only (matches Sales report total for same filters).
+   * Net Payable = Output − Sales CN − Input (purchases − purchase CN).
+   */
+  const outputVATNet = Math.round(salesVAT * 100) / 100;
+  const inputVATNet = Math.round((purchaseVAT - purchaseCreditNoteVAT) * 100) / 100;
+  const netVATPayable = Math.round((outputVATNet - salesCreditNoteVAT - inputVATNet) * 100) / 100;
+
+  const totalVAT = filteredVATTransactions.reduce((sum, t) => sum + Math.abs(t.vatAmount || 0), 0);
+  const totalExcludingVAT = filteredVATTransactions.reduce(
+    (sum, t) => sum + Math.abs(Number(t.amountExcludingVAT ?? t.amount ?? 0)),
+    0,
+  );
+  const totalIncludingVAT = filteredVATTransactions.reduce(
+    (sum, t) => sum + Math.abs(Number(t.amountIncludingVAT ?? t.totalWithVat ?? t.amount ?? 0)),
+    0,
+  );
   const totalDebit = filteredVATTransactions.reduce((sum, tx) => {
     const amount = Math.abs(tx.vatAmount || 0);
     if (tx.type === TransactionType.INCOME) return sum + (tx.isCreditNote ? amount : 0);
     return sum + (tx.isCreditNote ? 0 : amount);
   }, 0);
-  const totalCredit = filteredVATTransactions.reduce((sum, tx) => {
-    const amount = Math.abs(tx.vatAmount || 0);
-    if (tx.type === TransactionType.INCOME) return sum + (tx.isCreditNote ? 0 : amount);
-    return sum + (tx.isCreditNote ? amount : 0);
-  }, 0);
+  /** Credits: ZATCA-reported sales VAT + purchase credit notes (matches Output base). */
+  const totalCredit =
+    salesVAT +
+    filteredVATTransactions.reduce((sum, tx) => {
+      if (tx.type === TransactionType.EXPENSE && tx.isCreditNote) {
+        return sum + Math.abs(tx.vatAmount || 0);
+      }
+      return sum;
+    }, 0);
   const reportLabel =
     reportView === 'SALES'
       ? t('vat.salesReport')
@@ -1050,7 +1170,355 @@ const VATReport: React.FC = () => {
         ? t('vat.purchaseReport')
         : reportView === 'CREDIT_NOTE'
           ? 'Credit Note Report'
-          : t('vat.combinedReport');
+          : reportView === 'VAT_RETURN'
+            ? t('vat.returnPrepTitle')
+            : t('vat.combinedReport');
+
+  /** Period totals for ZATCA VAT return preparation (not sent to ZATCA — portal filing aid). */
+  const vatReturnPrep = useMemo(() => {
+    let txs = vatReportTransactions.filter(t => t.isVATApplicable === true);
+    if (filterFromDate || filterToDate) {
+      txs = txs.filter(t => txInDateRange(t, filterFromDate, filterToDate));
+    }
+    if (filterBuildingId) txs = txs.filter(t => matchesBuildingFilter(t, filterBuildingId));
+    if (filterUnit && filterBuildingId !== NO_BUILDING_FILTER) {
+      txs = txs.filter(t => t.unitNumber === filterUnit);
+    }
+
+    /** Taxable amount excl. VAT — never treat incl-VAT totals as excl. */
+    const taxableExcl = (tx: Transaction): number => {
+      const vat = Number(tx.vatAmount || 0);
+      if (tx.amountExcludingVAT != null && Number.isFinite(Number(tx.amountExcludingVAT))) {
+        return Number(tx.amountExcludingVAT);
+      }
+      const inclRaw = tx.amountIncludingVAT ?? tx.totalWithVat;
+      if (inclRaw != null && Number.isFinite(Number(inclRaw))) {
+        return Number(inclRaw) - vat;
+      }
+      const amt = Number(tx.amount || 0);
+      if (!vat) return amt;
+      const absAmt = Math.abs(amt);
+      const absVat = Math.abs(vat);
+      // amount looks like incl VAT (vat ≈ amount - amount/1.15)
+      if (Math.abs(absVat - (absAmt - absAmt / 1.15)) < 0.05) {
+        const excl = absAmt - absVat;
+        return amt < 0 ? -excl : excl;
+      }
+      return amt;
+    };
+    const vatOf = (tx: Transaction) => Number(tx.vatAmount || 0);
+    const sumAbs = (list: Transaction[], fn: (tx: Transaction) => number) =>
+      list.reduce((s, tx) => s + Math.abs(fn(tx)), 0);
+
+    const salesAll = txs.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote);
+    const purchases = txs.filter(t => t.type === TransactionType.EXPENSE && !t.isCreditNote);
+    const salesCreditNotes = txs.filter(t => !!t.isCreditNote && t.type === TransactionType.INCOME);
+    const purchaseCreditNotes = txs.filter(t => !!t.isCreditNote && t.type === TransactionType.EXPENSE);
+
+    const salesExcl = sumAbs(salesAll, taxableExcl);
+    const salesVat = sumAbs(salesAll, vatOf);
+    const salesIncl = salesExcl + salesVat;
+    const salesCnExcl = sumAbs(salesCreditNotes, taxableExcl);
+    const salesCnVat = sumAbs(salesCreditNotes, vatOf);
+    const purchaseExcl = sumAbs(purchases, taxableExcl);
+    const purchaseVat = sumAbs(purchases, vatOf);
+    const purchaseIncl = purchaseExcl + purchaseVat;
+    const purchaseCnExcl = sumAbs(purchaseCreditNotes, taxableExcl);
+    const purchaseCnVat = sumAbs(purchaseCreditNotes, vatOf);
+
+    // ZATCA Amount = current-period net taxable (sales − credit notes).
+    // Adjustments column is for prior-period corrections — leave 0 unless user edits.
+    const netSalesExcl = Math.round((salesExcl - salesCnExcl) * 100) / 100;
+    const outputVat = Math.round((salesVat - salesCnVat) * 100) / 100;
+    const netPurchaseExcl = Math.round((purchaseExcl - purchaseCnExcl) * 100) / 100;
+    const inputVat = Math.round((purchaseVat - purchaseCnVat) * 100) / 100;
+    const netPayable = Math.round((outputVat - inputVat) * 100) / 100;
+
+    const periodLabel =
+      filterFromDate || filterToDate
+        ? `${filterFromDate || '…'} → ${filterToDate || '…'}`
+        : t('vat.returnAllDates');
+
+    const quarterLabel = vatQuarterFilter
+      ? `${t(`vat.quarter${vatQuarterFilter}` as 'vat.quarter1')} ${vatQuarterYear}`
+      : null;
+
+    return {
+      txs,
+      salesAll,
+      purchases,
+      salesCreditNotes,
+      purchaseCreditNotes,
+      salesExcl: Math.round(salesExcl * 100) / 100,
+      salesVat: Math.round(salesVat * 100) / 100,
+      salesIncl: Math.round(salesIncl * 100) / 100,
+      salesCnExcl: Math.round(salesCnExcl * 100) / 100,
+      salesCnVat: Math.round(salesCnVat * 100) / 100,
+      purchaseExcl: Math.round(purchaseExcl * 100) / 100,
+      purchaseVat: Math.round(purchaseVat * 100) / 100,
+      purchaseIncl: Math.round(purchaseIncl * 100) / 100,
+      purchaseCnExcl: Math.round(purchaseCnExcl * 100) / 100,
+      purchaseCnVat: Math.round(purchaseCnVat * 100) / 100,
+      netSalesExcl,
+      outputVat,
+      netPurchaseExcl,
+      inputVat,
+      netPayable,
+      periodLabel,
+      quarterLabel,
+      counts: {
+        sales: salesAll.length,
+        purchases: purchases.length,
+        salesCn: salesCreditNotes.length,
+        purchaseCn: purchaseCreditNotes.length,
+        total: txs.length,
+      },
+    };
+  }, [
+    vatReportTransactions,
+    filterFromDate,
+    filterToDate,
+    filterBuildingId,
+    filterUnit,
+    vatQuarterFilter,
+    vatQuarterYear,
+    t,
+  ]);
+
+  const copyReturnAmount = async (key: string, value: number) => {
+    const text = Number(value || 0).toFixed(2);
+    try {
+      await navigator.clipboard.writeText(text);
+      setCopiedReturnField(key);
+      window.setTimeout(() => setCopiedReturnField(null), 1600);
+    } catch {
+      window.prompt('Copy this amount:', text);
+    }
+  };
+
+  /** Editable ZATCA-style filing form (Amount + Adjustments) — seeded from books. */
+  const [zatcaSalesForm, setZatcaSalesForm] = useState<Array<{ amount: number; adjustment: number }>>([]);
+  const [zatcaPurchaseForm, setZatcaPurchaseForm] = useState<Array<{ amount: number; adjustment: number }>>([]);
+
+  useEffect(() => {
+    const d = vatReturnPrep;
+    // Amount = net taxable excl VAT for this period (sales − credit notes).
+    // Adjustments stay 0 — ZATCA uses that column for prior-period corrections only.
+    setZatcaSalesForm([
+      { amount: d.netSalesExcl, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+    ]);
+    setZatcaPurchaseForm([
+      { amount: d.netPurchaseExcl, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+      { amount: 0, adjustment: 0 },
+    ]);
+  }, [
+    vatReturnPrep.netSalesExcl,
+    vatReturnPrep.netPurchaseExcl,
+    vatReturnPrep.periodLabel,
+    vatReturnPrep.quarterLabel,
+  ]);
+
+  const salesFormRowsMeta = [
+    { en: 'Standard Rated Sales (15%)', ar: 'المبيعات الخاضعة للنسبة الأساسية (15%)' },
+    { en: 'Sales on which the government bears the VAT', ar: 'المبيعات التي تتحمل الحكومة ضريبتها' },
+    { en: 'Zero Rated Domestic Sales', ar: 'المبيعات المحلية الخاضعة لنسبة الصفر' },
+    { en: 'Exports', ar: 'الصادرات' },
+    { en: 'Exempt Sales', ar: 'المبيعات المعفاة' },
+  ];
+  const purchaseFormRowsMeta = [
+    { en: 'Standard Rated Domestic Purchases', ar: 'المشتريات المحلية الخاضعة للنسبة الأساسية' },
+    { en: 'Imports subject to VAT paid at Customs', ar: 'الواردات الخاضعة للضريبة المسددة في الجمارك' },
+    { en: 'Imports subject to VAT accounted for through reverse charge', ar: 'الواردات الخاضعة للضريبة بآلية الاحتساب العكسي' },
+    { en: 'Zero Rated Purchases', ar: 'المشتريات الخاضعة لنسبة الصفر' },
+    { en: 'Exempt Purchases', ar: 'المشتريات المعفاة' },
+  ];
+
+  const sumFormCol = (rows: Array<{ amount: number; adjustment: number }>, field: 'amount' | 'adjustment') =>
+    rows.reduce((s, r) => s + Number(r[field] || 0), 0);
+  const salesTotalAmount = sumFormCol(zatcaSalesForm, 'amount');
+  const salesTotalAdj = sumFormCol(zatcaSalesForm, 'adjustment');
+  const purchaseTotalAmount = sumFormCol(zatcaPurchaseForm, 'amount');
+  const purchaseTotalAdj = sumFormCol(zatcaPurchaseForm, 'adjustment');
+  const salesNetBase = salesTotalAmount + salesTotalAdj;
+  const purchaseNetBase = purchaseTotalAmount + purchaseTotalAdj;
+  /** Prefer actual invoice VAT when row 1 still matches books net; else 15% of (amount+adj). */
+  const formOutputVat =
+    Math.abs((zatcaSalesForm[0]?.amount || 0) - vatReturnPrep.netSalesExcl) < 0.02 &&
+    Math.abs(zatcaSalesForm[0]?.adjustment || 0) < 0.02
+      ? vatReturnPrep.outputVat
+      : Math.round(salesNetBase * 0.15 * 100) / 100;
+  const formInputVat =
+    Math.abs((zatcaPurchaseForm[0]?.amount || 0) - vatReturnPrep.netPurchaseExcl) < 0.02 &&
+    Math.abs(zatcaPurchaseForm[0]?.adjustment || 0) < 0.02
+      ? vatReturnPrep.inputVat
+      : Math.round(purchaseNetBase * 0.15 * 100) / 100;
+  const formNetPayable = Math.round((formOutputVat - formInputVat) * 100) / 100;
+
+  const updateZatcaForm = (
+    kind: 'sales' | 'purchase',
+    index: number,
+    field: 'amount' | 'adjustment',
+    raw: string
+  ) => {
+    const n = Number(String(raw).replace(/,/g, ''));
+    const val = Number.isFinite(n) ? n : 0;
+    const setter = kind === 'sales' ? setZatcaSalesForm : setZatcaPurchaseForm;
+    setter((prev) => prev.map((row, i) => (i === index ? { ...row, [field]: val } : row)));
+  };
+
+  const handlePreviewVatReturn = () => {
+    const d = vatReturnPrep;
+    const w = window.open('', 'VAT_RETURN_PREP', 'height=960,width=920');
+    if (!w) return;
+    const netLabel = formNetPayable >= 0 ? 'Net VAT Payable' : 'Net VAT Refundable';
+    const salesRowsHtml = salesFormRowsMeta.map((m, i) => {
+      const row = zatcaSalesForm[i] || { amount: 0, adjustment: 0 };
+      return `<tr>
+        <td class="num">${i + 1}</td>
+        <td><div class="en">${escapeHtml(m.en)}</div><div class="ar">${escapeHtml(m.ar)}</div></td>
+        <td class="amt">${formatAmount(row.amount)}</td>
+        <td class="amt">${formatAmount(row.adjustment)}</td>
+      </tr>`;
+    }).join('');
+    const purchaseRowsHtml = purchaseFormRowsMeta.map((m, i) => {
+      const row = zatcaPurchaseForm[i] || { amount: 0, adjustment: 0 };
+      return `<tr>
+        <td class="num">${i + 1}</td>
+        <td><div class="en">${escapeHtml(m.en)}</div><div class="ar">${escapeHtml(m.ar)}</div></td>
+        <td class="amt">${formatAmount(row.amount)}</td>
+        <td class="amt">${formatAmount(row.adjustment)}</td>
+      </tr>`;
+    }).join('');
+    const html = `<!doctype html>
+      <html lang="en">
+      <head>
+        <meta charset="utf-8" />
+        <title>ZATCA VAT Return Form</title>
+        <style>
+          * { box-sizing: border-box; margin: 0; padding: 0; }
+          body { font-family: Arial, 'Segoe UI', sans-serif; background: #eef1f4; color: #212529; }
+          .page { width: 210mm; max-width: 100%; min-height: 297mm; margin: 0 auto; padding: 10px; }
+          .toolbar { display: flex; gap: 8px; margin-bottom: 10px; }
+          .btn { border: 1px solid #ced4da; border-radius: 6px; padding: 7px 12px; font-size: 12px; font-weight: 700; cursor: pointer; background: #fff; }
+          .btn.primary { background: #0d6efd; color: #fff; border-color: #0d6efd; }
+          .sheet { background: #fff; border: 1px solid #dee2e6; border-radius: 8px; overflow: hidden; min-height: calc(297mm - 36px); display: flex; flex-direction: column; }
+          .hero { padding: 16px 18px; border-bottom: 1px solid #dee2e6; background: #f8f9fa; }
+          .hero h1 { font-size: 18px; font-weight: 800; color: #212529; }
+          .hero .ar { font-size: 15px; font-weight: 800; margin-top: 4px; direction: rtl; }
+          .hero .meta { margin-top: 8px; font-size: 11px; color: #495057; display: flex; flex-wrap: wrap; gap: 12px; }
+          .block { padding: 14px 16px; }
+          .block h2 { font-size: 14px; font-weight: 800; margin-bottom: 10px; color: #212529; }
+          table.zatca { width: 100%; border-collapse: collapse; font-size: 12px; }
+          table.zatca th, table.zatca td { border: 1px solid #dee2e6; padding: 10px 12px; vertical-align: middle; }
+          table.zatca thead th { background: #f8f9fa; font-weight: 700; color: #495057; text-align: left; }
+          table.zatca th.r, table.zatca td.amt { text-align: right; direction: ltr; font-variant-numeric: tabular-nums; }
+          table.zatca td.num { width: 44px; text-align: center; color: #6c757d; font-weight: 700; background: #fcfcfd; }
+          table.zatca .en { font-weight: 600; color: #212529; }
+          table.zatca .ar { font-size: 11px; color: #6c757d; margin-top: 2px; direction: rtl; }
+          table.zatca tr.total td { background: #f8f9fa; font-weight: 800; }
+          .net { margin-top: auto; padding: 16px 18px; border-top: 2px solid #212529; display: flex; justify-content: space-between; align-items: center; background: #f8f9fa; }
+          .net .val { font-size: 24px; font-weight: 900; direction: ltr; }
+          .note { padding: 12px 16px; font-size: 10px; color: #6c757d; border-top: 1px solid #dee2e6; line-height: 1.5; }
+          @media print {
+            body { background: #fff; }
+            .page { padding: 0; width: auto; }
+            .toolbar { display: none; }
+            .sheet { border: none; min-height: calc(297mm - 16mm); }
+            @page { size: A4 portrait; margin: 8mm; }
+          }
+        </style>
+      </head>
+      <body>
+        <div class="page">
+          <div class="toolbar">
+            <button class="btn primary" onclick="window.print()">Print / Save PDF</button>
+            <button class="btn" onclick="window.close()">Close</button>
+          </div>
+          <div class="sheet">
+            <div class="hero">
+              <h1>ZATCA VAT Return — Filing Form</h1>
+              <div class="ar">نموذج إقرار ضريبة القيمة المضافة</div>
+              <div class="meta">
+                <span>${escapeHtml(companyNameEn)}</span>
+                <span>VAT ${escapeHtml(companyVAT)}</span>
+                <span>${escapeHtml(d.quarterLabel || d.periodLabel)}</span>
+                <span>Generated ${escapeHtml(fmtDate(new Date()))}</span>
+              </div>
+            </div>
+            <div class="block">
+              <h2>Sales</h2>
+              <table class="zatca">
+                <thead>
+                  <tr>
+                    <th style="width:44px">#</th>
+                    <th>Sales</th>
+                    <th class="r">Amount</th>
+                    <th class="r">Adjustments (﷼)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${salesRowsHtml}
+                  <tr class="total">
+                    <td class="num">6</td>
+                    <td>Total Sales</td>
+                    <td class="amt">﷼ ${formatAmount(salesTotalAmount)}</td>
+                    <td class="amt">﷼ ${formatAmount(salesTotalAdj)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="block">
+              <h2>Purchases</h2>
+              <table class="zatca">
+                <thead>
+                  <tr>
+                    <th style="width:44px">#</th>
+                    <th>Purchases</th>
+                    <th class="r">Amount</th>
+                    <th class="r">Adjustments (﷼)</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${purchaseRowsHtml}
+                  <tr class="total">
+                    <td class="num">6</td>
+                    <td>Total Purchases</td>
+                    <td class="amt">﷼ ${formatAmount(purchaseTotalAmount)}</td>
+                    <td class="amt">﷼ ${formatAmount(purchaseTotalAdj)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <div class="block">
+              <h2>VAT Summary</h2>
+              <table class="zatca">
+                <tr><td>Output VAT (from standard-rated sales)</td><td class="amt">﷼ ${formatAmount(formOutputVat)}</td></tr>
+                <tr><td>Input VAT (from standard-rated purchases)</td><td class="amt">﷼ ${formatAmount(formInputVat)}</td></tr>
+                <tr class="total"><td>${netLabel}</td><td class="amt">﷼ ${formatAmount(Math.abs(formNetPayable))}</td></tr>
+              </table>
+            </div>
+            <div class="net">
+              <div><strong>${netLabel}</strong><div style="font-size:11px;color:#6c757d;margin-top:4px">Output − Input</div></div>
+              <div class="val">﷼ ${formatAmount(Math.abs(formNetPayable))}</div>
+            </div>
+            <div class="note">
+              Prepared from Amlak books for copy into the official ZATCA portal. Does not auto-submit.
+              Credit notes for this period are already netted into Amount (row 1). Adjustments stay 0 for prior-period corrections only. Verify before filing.
+            </div>
+          </div>
+        </div>
+      </body>
+      </html>`;
+    w.document.write(html);
+    w.document.close();
+  };
 
   const matchesCompareSearch = useCallback((tx: Transaction, term: string) => {
     if (!term.trim()) return true;
@@ -1277,7 +1745,8 @@ const VATReport: React.FC = () => {
 
     const w = window.open('', 'VAT_REPORT_PREVIEW', 'height=900,width=1200');
     if (!w) return;
-    const pdfLogoSrc = new URL('./images/cologo.png', window.location.href).href;
+    const pdfLogoSrc = `${window.location.origin}/images/cologo.png`;
+    const companySealSrc = `${window.location.origin}/images/company-seal.png`;
 
     const fromLabel = filterFromDate || '-';
     const toLabel = filterToDate || '-';
@@ -1324,9 +1793,8 @@ const VATReport: React.FC = () => {
 
       const debitTotal = totalDebit;
       const creditTotal = totalCredit;
-      const netBalance = creditTotal - debitTotal;
-      const hijriFrom = '-';
-      const hijriTo = '-';
+      const netBalance = netVATPayable;
+      const netBalanceLabel = netBalance >= 0 ? 'صافي المستحق / Net VAT Payable' : 'صافي قابل للاسترداد / Net VAT Refundable';
 
       const combinedHtml = `<!doctype html>
         <html dir="rtl" lang="ar">
@@ -1336,11 +1804,22 @@ const VATReport: React.FC = () => {
             <style>
               * { box-sizing: border-box; margin: 0; padding: 0; }
               body { font-family: 'Tajawal', Arial, sans-serif; color: #0f172a; background: #f1f5f9; direction: rtl; }
-              .page { max-width: 920px; margin: 0 auto; padding: 12px; }
+              .page { width: 210mm; max-width: 100%; margin: 0 auto; padding: 12px; }
               .toolbar { display: flex; justify-content: flex-start; gap: 8px; margin-bottom: 8px; direction: ltr; }
               .btn { border: 1px solid #cbd5e1; border-radius: 9px; padding: 6px 11px; font-size: 11px; font-weight: 700; cursor: pointer; background: #fff; color: #334155; }
               .btn.primary { background: #0f766e; color: #fff; border-color: #0f766e; }
-              .sheet { background: #fff; border: 1px solid #64748b; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08); }
+              .sheet {
+                display: flex;
+                flex-direction: column;
+                width: 210mm;
+                max-width: 100%;
+                min-height: 297mm;
+                background: #fff;
+                border: 1px solid #64748b;
+                border-radius: 12px;
+                overflow: hidden;
+                box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+              }
               .header { display: grid; grid-template-columns: 1fr auto; gap: 10px; align-items: center; padding: 10px 12px; border-bottom: 1px solid #94a3b8; background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); }
               .logo { width: 68px; height: 68px; object-fit: contain; }
               .co { text-align: center; line-height: 1.35; }
@@ -1365,10 +1844,57 @@ const VATReport: React.FC = () => {
               .totals-row td { font-weight: 800; background: #f8fafc; }
               .balance td { background: #eef2ff; font-weight: 800; }
               .footerNote { padding: 7px 10px; font-size: 10px; color: #475569; display: flex; justify-content: space-between; border-top: 1px solid #cbd5e1; }
+              .seal-block {
+                display: flex;
+                justify-content: flex-start;
+                align-items: flex-end;
+                gap: 28px;
+                margin-top: auto;
+                padding: 20px 16px 16px;
+                border-top: 1px dashed #cbd5e1;
+                min-height: 155px;
+                background:
+                  radial-gradient(circle at 16% 58%, rgba(30, 64, 175, 0.05), transparent 40%),
+                  linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+                direction: ltr;
+              }
+              .seal-stamp {
+                width: 122px;
+                height: 122px;
+                object-fit: contain;
+                transform: rotate(-4deg);
+                filter: contrast(1.06) saturate(1.04);
+                opacity: 0.93;
+                mix-blend-mode: multiply;
+              }
+              .seal-meta {
+                flex: 1;
+                text-align: right;
+                padding-bottom: 8px;
+                font-size: 10px;
+                color: #64748b;
+                line-height: 1.55;
+                direction: rtl;
+              }
+              .seal-meta .line {
+                margin: 22px 0 4px auto;
+                border-bottom: 1px solid #94a3b8;
+                width: 180px;
+              }
+              .seal-meta .label { font-weight: 700; color: #475569; }
               @media print {
                 body { background: white; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-                .page { padding: 0; }
+                .page { width: auto; max-width: none; padding: 0; margin: 0; }
+                .sheet {
+                  width: auto;
+                  max-width: none;
+                  min-height: calc(297mm - 16mm);
+                  border: none;
+                  border-radius: 0;
+                  box-shadow: none;
+                }
                 .toolbar { display: none; }
+                .seal-stamp { opacity: 1; }
                 @page { margin: 8mm; size: A4 portrait; }
               }
             </style>
@@ -1414,11 +1940,20 @@ const VATReport: React.FC = () => {
                       <td class="tr">${formatAmount(creditTotal)}</td>
                     </tr>
                     <tr class="balance">
-                      <td colspan="4" class="tc">صافي الرصيد</td>
-                      <td colspan="2" class="tc">${formatAmount(netBalance)}</td>
+                      <td colspan="4" class="tc">${escapeHtml(netBalanceLabel)}</td>
+                      <td colspan="2" class="tc">${formatAmount(Math.abs(netBalance))}</td>
                     </tr>
                   </tbody>
                 </table>
+                <div class="seal-block">
+                  <img class="seal-stamp" src="${companySealSrc}" alt="Company Seal" />
+                  <div class="seal-meta">
+                    <div class="label">ختم الشركة / Company Seal</div>
+                    <div class="line"></div>
+                    <div>التوقيع المعتمد</div>
+                    <div>RR Millennium Co. Ltd.</div>
+                  </div>
+                </div>
                 <div class="footerNote">
                   <span>Combined VAT Report</span>
                   <span>Generated: ${escapeHtml(generatedAt)}</span>
@@ -1498,11 +2033,22 @@ const VATReport: React.FC = () => {
           <style>
             * { box-sizing: border-box; margin: 0; padding: 0; }
             body { font-family: 'Tajawal', Arial, sans-serif; color: #0f172a; background: #f1f5f9; direction: rtl; }
-            .page { max-width: 900px; margin: 0 auto; padding: 12px; }
+            .page { width: 210mm; max-width: 100%; margin: 0 auto; padding: 12px; }
             .toolbar { display: flex; justify-content: flex-start; gap: 8px; margin-bottom: 8px; direction: ltr; }
             .btn { border: 1px solid #cbd5e1; border-radius: 9px; padding: 7px 12px; font-size: 11px; font-weight: 700; cursor: pointer; background: white; color: #334155; }
             .btn.primary { background: #0f766e; border-color: #0f766e; color: white; }
-            .card { border: 1px solid #94a3b8; background: white; border-radius: 12px; overflow: hidden; box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08); }
+            .card {
+              display: flex;
+              flex-direction: column;
+              width: 210mm;
+              max-width: 100%;
+              min-height: 297mm;
+              border: 1px solid #94a3b8;
+              background: white;
+              border-radius: 12px;
+              overflow: hidden;
+              box-shadow: 0 10px 28px rgba(15, 23, 42, 0.08);
+            }
             .head { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid #94a3b8; background: linear-gradient(180deg, #ffffff 0%, #f8fafc 100%); }
             .head img { width: 58px; height: 58px; object-fit: contain; }
             .company { text-align: center; line-height: 1.35; }
@@ -1520,10 +2066,55 @@ const VATReport: React.FC = () => {
             tfoot td { background: #f1f5f9; font-weight: 800; }
             .totals { padding: 7px 10px; border-top: 1px solid #cbd5e1; font-size: 10px; display: flex; justify-content: space-between; gap: 10px; color: #334155; }
             .totals div { font-weight: 700; }
+            .seal-block {
+              display: flex;
+              justify-content: flex-start;
+              align-items: flex-end;
+              gap: 28px;
+              margin-top: auto;
+              padding: 18px 16px 14px;
+              border-top: 1px dashed #cbd5e1;
+              min-height: 150px;
+              background:
+                radial-gradient(circle at 18% 55%, rgba(30, 64, 175, 0.04), transparent 42%),
+                linear-gradient(180deg, #ffffff 0%, #f8fafc 100%);
+            }
+            .seal-stamp {
+              width: 118px;
+              height: 118px;
+              object-fit: contain;
+              transform: rotate(-3.5deg);
+              filter: contrast(1.05) saturate(1.05);
+              opacity: 0.92;
+              mix-blend-mode: multiply;
+            }
+            .seal-meta {
+              flex: 1;
+              text-align: right;
+              color: #64748b;
+              font-size: 10px;
+              line-height: 1.55;
+              padding-bottom: 8px;
+            }
+            .seal-meta .line {
+              border-bottom: 1px solid #94a3b8;
+              width: 180px;
+              margin: 22px 0 4px auto;
+            }
+            .seal-meta .label { font-weight: 700; color: #475569; }
             @media print {
               body { background: white; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-              .page { padding: 0; }
+              .page { width: auto; max-width: none; padding: 0; margin: 0; }
+              .card {
+                width: auto;
+                max-width: none;
+                min-height: calc(297mm - 16mm);
+                border: none;
+                border-radius: 0;
+                box-shadow: none;
+              }
               .toolbar { display: none; }
+              .seal-stamp { opacity: 0.95; }
               @page { margin: 8mm; size: A4 portrait; }
             }
           </style>
@@ -1549,7 +2140,7 @@ const VATReport: React.FC = () => {
                 </div>
               </div>
               <div class="report-title">${escapeHtml(sectionTitle)}</div>
-              <div class="report-info">
+              <div class="report-i  nfo">
                 <div><strong>التقرير:</strong> ${escapeHtml(reportLabel)}</div>
                 <div><strong>العملة:</strong> SAR</div>
               </div>
@@ -1572,6 +2163,15 @@ const VATReport: React.FC = () => {
                 <div>الضريبة: ${formatAmount(totalVat)} SAR</div>
                 <div>الإجمالي: ${formatAmount(totalValue)} SAR</div>
               </div>
+              <div class="seal-block">
+                <img class="seal-stamp" src="${companySealSrc}" alt="Company Seal" />
+                <div class="seal-meta">
+                  <div class="label">ختم الشركة / Company Seal</div>
+                  <div class="line"></div>
+                  <div>التوقيع المعتمد</div>
+                  <div>RR Millennium Co. Ltd.</div>
+                </div>
+              </div>
             </div>
           </div>
         </body>
@@ -1585,8 +2185,9 @@ const VATReport: React.FC = () => {
 
   const handleBulkInvoicePrint = (scope: 'SALES' | 'PURCHASE' | 'ALL') => {
     let rows = vatReportTransactions.filter(t => t.isVATApplicable === true);
-    if (filterFromDate) rows = rows.filter(t => t.date >= filterFromDate);
-    if (filterToDate) rows = rows.filter(t => t.date <= filterToDate);
+    if (filterFromDate || filterToDate) {
+      rows = rows.filter(t => txInDateRange(t, filterFromDate, filterToDate));
+    }
     if (filterBuildingId) rows = rows.filter(t => matchesBuildingFilter(t, filterBuildingId));
     if (filterUnit && filterBuildingId !== NO_BUILDING_FILTER) {
       rows = rows.filter(t => t.unitNumber === filterUnit);
@@ -2203,29 +2804,59 @@ const VATReport: React.FC = () => {
               </span>
             )}
           </button>
+          <button
+            onClick={() => setReportView('VAT_RETURN')}
+            className={`px-4 py-2 rounded-xl font-bold text-sm transition-all flex items-center gap-2 whitespace-nowrap ${reportView === 'VAT_RETURN' ? 'bg-teal-700 text-white shadow-lg shadow-teal-900/20' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'}`}
+          >
+            <Landmark size={16} /> {t('vat.returnPrepTab')}
+          </button>
         </div>
 
         {reportView === 'COMBINED' && (
-          <div className="grid grid-cols-1 md:grid-cols-5 gap-4 mt-6">
-            <div className="bg-emerald-50 p-5 rounded-xl border border-emerald-200">
-              <div className="text-[10px] font-bold text-emerald-600 uppercase mb-1">Sales VAT</div>
-              <div className="text-2xl font-black text-emerald-700">{formatAmount(salesVAT)} <span className="text-xs">SAR</span></div>
+          <div className="mt-6 space-y-4">
+            <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+              <div className="bg-emerald-50 p-5 rounded-xl border border-emerald-200">
+                <div className="text-[10px] font-bold text-emerald-600 uppercase mb-1">Output VAT (Sales report)</div>
+                <div className="text-2xl font-black text-emerald-700">{formatAmount(outputVATNet)} <span className="text-xs">SAR</span></div>
+                <div className="text-[11px] font-bold text-emerald-800/70 mt-1">
+                  ZATCA-reported sales only · {salesTransactions.length} invoices
+                </div>
+              </div>
+              <div className="bg-amber-50 p-5 rounded-xl border border-amber-200">
+                <div className="text-[10px] font-bold text-amber-700 uppercase mb-1">Sales Credit Notes</div>
+                <div className="text-2xl font-black text-amber-800">{formatAmount(salesCreditNoteVAT)} <span className="text-xs">SAR</span></div>
+                <div className="text-[11px] font-bold text-amber-800/70 mt-1">− subtracted in Net Payable</div>
+              </div>
+              <div className="bg-rose-50 p-5 rounded-xl border border-rose-200">
+                <div className="text-[10px] font-bold text-rose-600 uppercase mb-1">Input VAT (net)</div>
+                <div className="text-2xl font-black text-rose-700">{formatAmount(inputVATNet)} <span className="text-xs">SAR</span></div>
+                <div className="text-[11px] font-bold text-rose-800/70 mt-1">
+                  Purchases {formatAmount(purchaseVAT)} − CN {formatAmount(purchaseCreditNoteVAT)}
+                </div>
+              </div>
+              <div className="bg-slate-50 p-5 rounded-xl border border-slate-200">
+                <div className="text-[10px] font-bold text-slate-500 uppercase mb-1">Unreported sales VAT</div>
+                <div className="text-2xl font-black text-slate-800">{formatAmount(salesUnreportedVAT)} <span className="text-xs">SAR</span></div>
+                <div className="text-[11px] font-bold text-slate-500 mt-1">Not included in Output (not on Sales report)</div>
+              </div>
             </div>
-            <div className="bg-amber-50 p-5 rounded-xl border border-amber-200">
-              <div className="text-[10px] font-bold text-amber-600 uppercase mb-1">Credit Note VAT</div>
-              <div className="text-2xl font-black text-amber-700">{formatAmount(creditNoteVAT)} <span className="text-xs">SAR</span></div>
-            </div>
-            <div className="bg-rose-50 p-5 rounded-xl border border-rose-200">
-              <div className="text-[10px] font-bold text-rose-600 uppercase mb-1">Purchase VAT</div>
-              <div className="text-2xl font-black text-rose-700">{formatAmount(purchaseVAT)} <span className="text-xs">SAR</span></div>
-            </div>
-            <div className="bg-blue-50 p-5 rounded-xl border border-blue-200">
-              <div className="text-[10px] font-bold text-blue-600 uppercase mb-1">Net Payable</div>
-              <div className="text-2xl font-black text-blue-700">{formatAmount(Math.abs(netVATPayable))} <span className="text-xs">SAR</span></div>
-            </div>
-            <div className="bg-slate-50 p-5 rounded-xl border border-slate-200">
-              <div className="text-[10px] font-bold text-slate-500 uppercase mb-1">Count</div>
-              <div className="text-2xl font-black text-slate-800">{filteredVATTransactions.length}</div>
+            <div className={`rounded-xl border-2 p-5 flex flex-wrap items-center justify-between gap-4 ${
+              netVATPayable >= 0 ? 'bg-slate-900 border-slate-800 text-white' : 'bg-emerald-50 border-emerald-300 text-emerald-950'
+            }`}>
+              <div>
+                <div className={`text-[10px] font-black uppercase tracking-wider ${netVATPayable >= 0 ? 'text-teal-300' : 'text-emerald-700'}`}>
+                  {netVATPayable >= 0 ? t('vat.netVatPayable') : t('vat.returnNetRefundable')}
+                </div>
+                <div className="text-3xl font-black tabular-nums mt-1">
+                  {formatAmount(Math.abs(netVATPayable))} <span className="text-sm font-bold opacity-70">SAR</span>
+                </div>
+                <div className={`text-xs font-bold mt-1.5 ${netVATPayable >= 0 ? 'text-slate-300' : 'text-emerald-800'}`}>
+                  Output {formatAmount(outputVATNet)} − Sales CN {formatAmount(salesCreditNoteVAT)} − Input {formatAmount(inputVATNet)}
+                </div>
+              </div>
+              <div className={`text-sm font-bold px-4 py-2 rounded-lg ${netVATPayable >= 0 ? 'bg-white/10 text-white' : 'bg-white text-emerald-900 border border-emerald-200'}`}>
+                Rows: {filteredVATTransactions.length}
+              </div>
             </div>
           </div>
         )}
@@ -2248,7 +2879,17 @@ const VATReport: React.FC = () => {
                 <span className="text-xs font-bold text-slate-500 uppercase shrink-0">{t('vat.quarterFilter')}</span>
                 <select
                   value={vatQuarterFilter}
-                  onChange={(e) => setVatQuarterFilter(e.target.value)}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    setVatQuarterFilter(v);
+                    if (!v) return;
+                    const y = parseInt(vatQuarterYear, 10);
+                    const q = parseInt(v, 10) as 1 | 2 | 3 | 4;
+                    if (!Number.isFinite(y) || q < 1 || q > 4) return;
+                    const { from, to } = getQuarterDateRange(y, q);
+                    setFilterFromDate(from);
+                    setFilterToDate(to);
+                  }}
                   className="px-3 py-2 border border-slate-300 rounded-xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none bg-white min-w-[140px]"
                 >
                   <option value="">{t('vat.quarterCustom')}</option>
@@ -2260,7 +2901,17 @@ const VATReport: React.FC = () => {
                 {vatQuarterFilter ? (
                   <select
                     value={vatQuarterYear}
-                    onChange={(e) => setVatQuarterYear(e.target.value)}
+                    onChange={(e) => {
+                      const yearStr = e.target.value;
+                      setVatQuarterYear(yearStr);
+                      if (!vatQuarterFilter) return;
+                      const y = parseInt(yearStr, 10);
+                      const q = parseInt(vatQuarterFilter, 10) as 1 | 2 | 3 | 4;
+                      if (!Number.isFinite(y) || q < 1 || q > 4) return;
+                      const { from, to } = getQuarterDateRange(y, q);
+                      setFilterFromDate(from);
+                      setFilterToDate(to);
+                    }}
                     aria-label={t('vat.year')}
                     className="px-3 py-2 border border-slate-300 rounded-xl text-sm font-bold focus:ring-2 focus:ring-blue-500 outline-none bg-white"
                   >
@@ -2336,7 +2987,7 @@ const VATReport: React.FC = () => {
         )}
       </div>
 
-      {reportView !== 'COMPARE' && reportView !== 'IMPORT_HISTORY' && (
+      {reportView !== 'COMPARE' && reportView !== 'IMPORT_HISTORY' && reportView !== 'VAT_RETURN' && (
       <div className="premium-card p-4 sm:p-5 relative">
         <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-0 opacity-[0.03]">
           <img src="/images/logo.png" alt="" className="w-80 h-80 object-contain" />
@@ -2349,6 +3000,26 @@ const VATReport: React.FC = () => {
             {t('vat.allTransactions')} ({filteredVATTransactions.length})
           </h3>
           <div className="flex items-center gap-2 flex-wrap">
+            {isAdmin && (
+              <button
+                type="button"
+                onClick={() => setEditColumnsMode((v) => !v)}
+                className={`flex items-center gap-2 px-4 py-1.5 rounded-xl font-bold text-sm shadow-sm border transition-all ${
+                  editColumnsMode
+                    ? 'bg-indigo-600 hover:bg-indigo-700 text-white border-indigo-700'
+                    : 'bg-white hover:bg-indigo-50 text-indigo-700 border-indigo-200'
+                }`}
+                title="Admin only: edit all VAT report columns"
+              >
+                {editColumnsMode ? <Pencil size={14} /> : <Lock size={14} />}
+                {editColumnsMode ? 'Editing Columns' : 'Edit Columns'}
+              </button>
+            )}
+            {editColumnsMode && (
+              <span className="text-[10px] font-bold uppercase tracking-widest text-indigo-500 bg-indigo-50 border border-indigo-100 px-2 py-1 rounded-lg">
+                Admin edit mode
+              </span>
+            )}
             {selectedIds.size > 0 && (
               <button
                 onClick={() => {
@@ -2401,8 +3072,16 @@ const VATReport: React.FC = () => {
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
-              {filteredVATTransactions.map((tx, i) => (
-                <tr key={tx.id} className={`hover:bg-slate-50/80 transition-colors ${selectedIds.has(tx.id) ? 'bg-blue-50/40' : tx.isCreditNote ? 'bg-rose-50/30' : ''}`}>
+              {filteredVATTransactions.map((tx, i) => {
+                const canEdit = isAdmin && editColumnsMode;
+                const partyName = tx.type === TransactionType.INCOME ? resolveSalesCustomerName(tx) : (tx.vendorName || '');
+                const vatNo = tx.type === TransactionType.INCOME ? (tx.customerVATNumber || '') : (tx.vendorVATNumber || '');
+                const exclAbs = Math.abs(tx.amountExcludingVAT || tx.amount || 0);
+                const vatAbs = Math.abs(tx.vatAmount || 0);
+                const inclAbs = Math.abs(tx.totalWithVat || tx.amountIncludingVAT || tx.amount || 0);
+                const inputCls = 'w-full min-w-[88px] text-xs font-bold border border-indigo-200 rounded-lg px-2 py-1 bg-white outline-none focus:ring-2 focus:ring-indigo-300';
+                return (
+                <tr key={tx.id} className={`hover:bg-slate-50/80 transition-colors ${selectedIds.has(tx.id) ? 'bg-blue-50/40' : tx.isCreditNote ? 'bg-rose-50/30' : ''} ${canEdit ? 'bg-indigo-50/20' : ''}`}>
                   <td className="px-3 py-4">
                     <input
                       type="checkbox"
@@ -2411,54 +3090,178 @@ const VATReport: React.FC = () => {
                       className="rounded w-4 h-4 cursor-pointer accent-blue-600"
                     />
                   </td>
-                  <td className="px-2 py-4 text-[10px] font-bold text-slate-400 font-mono text-center">{i + 1}</td>
-                  <td className="px-4 py-4 text-xs font-mono whitespace-nowrap">{fmtDate(tx.date)}</td>
+                  <td className="px-2 py-4 text-[10px] font-bold text-slate-400 font-mono text-center">
+                    {savingEditId === tx.id ? <Loader size={12} className="animate-spin inline text-indigo-500" /> : i + 1}
+                  </td>
+                  <td className="px-4 py-4 text-xs font-mono whitespace-nowrap">
+                    {canEdit ? (
+                      <input
+                        type="date"
+                        defaultValue={tx.date || ''}
+                        key={`date-${tx.id}-${tx.date}`}
+                        onBlur={(e) => {
+                          if (e.target.value && e.target.value !== tx.date) {
+                            void patchVatTransaction(tx.id, { date: e.target.value });
+                          }
+                        }}
+                        className={inputCls}
+                      />
+                    ) : (
+                      fmtDate(tx.date)
+                    )}
+                  </td>
                   <td className="px-4 py-4">
                     <span className={`px-2 py-0.5 rounded-full text-[9px] font-bold ${tx.isCreditNote ? 'bg-rose-100 text-rose-700' : tx.type === TransactionType.INCOME ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'}`}>
                       {tx.isCreditNote ? 'CN' : tx.type === TransactionType.INCOME ? 'SALE' : 'PURCH'}
                     </span>
                   </td>
-                  <td className="px-4 py-4 text-xs font-bold text-blue-600 hover:underline cursor-pointer" onClick={() => window.location.hash = `/invoice/${tx.vatInvoiceNumber}`}>
-                    {tx.vatInvoiceNumber}
+                  <td className="px-4 py-4 text-xs font-bold text-blue-600">
+                    {canEdit ? (
+                      <input
+                        type="text"
+                        defaultValue={tx.vatInvoiceNumber || ''}
+                        key={`inv-${tx.id}-${tx.vatInvoiceNumber}`}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim();
+                          if (v !== (tx.vatInvoiceNumber || '')) {
+                            void patchVatTransaction(tx.id, { vatInvoiceNumber: v || undefined });
+                          }
+                        }}
+                        className={`${inputCls} text-blue-700`}
+                      />
+                    ) : (
+                      <span className="hover:underline cursor-pointer" onClick={() => { window.location.hash = `/invoice/${tx.vatInvoiceNumber}`; }}>
+                        {tx.vatInvoiceNumber}
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-4 text-xs">
-                    <div className="font-bold text-slate-800 truncate max-w-[180px]" title={tx.type === TransactionType.INCOME ? resolveSalesCustomerName(tx) : tx.vendorName}>
-                      {tx.type === TransactionType.INCOME ? resolveSalesCustomerName(tx) : (tx.vendorName || '-')}
-                    </div>
+                    {canEdit ? (
+                      <input
+                        type="text"
+                        defaultValue={partyName}
+                        key={`party-${tx.id}-${partyName}`}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim();
+                          if (v === partyName) return;
+                          if (tx.type === TransactionType.INCOME) {
+                            void patchVatTransaction(tx.id, { customerName: v || undefined } as any);
+                          } else {
+                            void patchVatTransaction(tx.id, { vendorName: v || undefined });
+                          }
+                        }}
+                        className={inputCls}
+                      />
+                    ) : (
+                      <div className="font-bold text-slate-800 truncate max-w-[180px]" title={partyName}>
+                        {partyName || '-'}
+                      </div>
+                    )}
                   </td>
                   <td className="px-4 py-4 text-[11px] font-mono text-slate-500 whitespace-nowrap">
-                    {tx.type === TransactionType.INCOME ? (tx.customerVATNumber || '-') : (tx.vendorVATNumber || '-')}
+                    {canEdit ? (
+                      <input
+                        type="text"
+                        defaultValue={vatNo}
+                        key={`vatno-${tx.id}-${vatNo}`}
+                        onBlur={(e) => {
+                          const v = e.target.value.trim();
+                          if (v === vatNo) return;
+                          if (tx.type === TransactionType.INCOME) {
+                            void patchVatTransaction(tx.id, { customerVATNumber: v || undefined });
+                          } else {
+                            void patchVatTransaction(tx.id, { vendorVATNumber: v || undefined });
+                          }
+                        }}
+                        className={`${inputCls} font-mono`}
+                      />
+                    ) : (
+                      vatNo || '-'
+                    )}
                   </td>
                   <td className="px-4 py-4 text-xs font-bold text-slate-600 text-right">
-                    {formatAmount(Math.abs(tx.amountExcludingVAT || tx.amount || 0))}
+                    {canEdit ? (
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        defaultValue={exclAbs.toFixed(2)}
+                        key={`excl-${tx.id}-${exclAbs}`}
+                        onBlur={(e) => {
+                          const next = Math.abs(Number(e.target.value) || 0);
+                          if (Math.abs(next - exclAbs) > 0.0001) void handleEditAmount(tx.id, 'excl', e.target.value);
+                        }}
+                        className={`${inputCls} text-right`}
+                      />
+                    ) : (
+                      formatAmount(exclAbs)
+                    )}
                   </td>
                   <td className="px-4 py-4 text-xs font-bold text-blue-600 text-right">
-                    {formatAmount(Math.abs(tx.vatAmount || 0))}
+                    {canEdit ? (
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        defaultValue={vatAbs.toFixed(2)}
+                        key={`vatamt-${tx.id}-${vatAbs}`}
+                        onBlur={(e) => {
+                          const next = Math.abs(Number(e.target.value) || 0);
+                          if (Math.abs(next - vatAbs) > 0.0001) void handleEditAmount(tx.id, 'vat', e.target.value);
+                        }}
+                        className={`${inputCls} text-right text-blue-700`}
+                      />
+                    ) : (
+                      formatAmount(vatAbs)
+                    )}
                   </td>
                   <td className="px-4 py-4 text-xs font-black text-slate-900 text-right">
-                    {formatAmount(Math.abs(tx.totalWithVat || tx.amountIncludingVAT || tx.amount || 0))}
+                    {canEdit ? (
+                      <input
+                        type="number"
+                        step="0.01"
+                        min="0"
+                        defaultValue={inclAbs.toFixed(2)}
+                        key={`incl-${tx.id}-${inclAbs}`}
+                        onBlur={(e) => {
+                          const next = Math.abs(Number(e.target.value) || 0);
+                          if (Math.abs(next - inclAbs) > 0.0001) void handleEditAmount(tx.id, 'incl', e.target.value);
+                        }}
+                        className={`${inputCls} text-right`}
+                      />
+                    ) : (
+                      formatAmount(inclAbs)
+                    )}
                   </td>
                   <td className="px-4 py-4 align-top">
-                    <select
-                      value={tx.paymentMethod || ''}
-                      onChange={e => handleUpdatePaymentMethod(tx.id, e.target.value as PaymentMethod)}
-                      className="text-[10px] font-bold border border-slate-200 rounded-lg px-2 py-1 bg-white outline-none focus:ring-1 focus:ring-blue-400 w-full min-w-[100px]"
-                    >
-                      {Object.values(PaymentMethod).map(m => <option key={m} value={m}>{m}</option>)}
-                    </select>
+                    {canEdit ? (
+                      <select
+                        value={tx.paymentMethod || ''}
+                        onChange={e => handleUpdatePaymentMethod(tx.id, e.target.value as PaymentMethod)}
+                        className="text-[10px] font-bold border border-indigo-200 rounded-lg px-2 py-1 bg-white outline-none focus:ring-1 focus:ring-indigo-400 w-full min-w-[100px]"
+                      >
+                        {Object.values(PaymentMethod).map(m => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                    ) : (
+                      <span className="text-[10px] font-bold text-slate-600">{tx.paymentMethod || '—'}</span>
+                    )}
                   </td>
                   <td className="px-4 py-4 align-top text-xs">
                     {tx.paymentMethod === PaymentMethod.BANK ? (
-                      <select
-                        value={tx.bankName || ''}
-                        onChange={e => handleUpdateBankName(tx.id, e.target.value)}
-                        className="w-full min-w-[120px] text-[10px] font-bold border border-slate-200 rounded-lg px-2 py-1 bg-white outline-none focus:ring-1 focus:ring-blue-400"
-                      >
-                        <option value="">{!tx.buildingId ? '—' : 'Select bank'}</option>
-                        {getBanksForBuildingId(tx.buildingId).map(b => (
-                          <option key={b.name} value={b.name}>{b.name}</option>
-                        ))}
-                      </select>
+                      canEdit ? (
+                        <select
+                          value={tx.bankName || ''}
+                          onChange={e => handleUpdateBankName(tx.id, e.target.value)}
+                          className="w-full min-w-[120px] text-[10px] font-bold border border-indigo-200 rounded-lg px-2 py-1 bg-white outline-none focus:ring-1 focus:ring-indigo-400"
+                        >
+                          <option value="">{!tx.buildingId ? '—' : 'Select bank'}</option>
+                          {getBanksForBuildingId(tx.buildingId).map(b => (
+                            <option key={b.name} value={b.name}>{b.name}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <span className="text-[10px] font-bold text-slate-600">{tx.bankName || '—'}</span>
+                      )
                     ) : (
                       <span className="text-slate-300">—</span>
                     )}
@@ -2496,7 +3299,8 @@ const VATReport: React.FC = () => {
                     </div>
                   </td>
                 </tr>
-              ))}
+                );
+              })}
               {filteredVATTransactions.length === 0 && (
                 <tr><td colSpan={14} className="px-4 py-16 text-center text-slate-400 font-bold italic">No VAT records found for chosen filters.</td></tr>
               )}
@@ -2845,6 +3649,281 @@ const VATReport: React.FC = () => {
         </div>
       )}
 
+      {/* VAT Return — ZATCA portal-style Sales & Purchases filing tables */}
+      {reportView === 'VAT_RETURN' && (() => {
+        const d = vatReturnPrep;
+        const isDue = formNetPayable >= 0;
+        const inputCls =
+          'w-full min-w-[7.5rem] max-w-[11rem] ml-auto rounded-md border border-slate-300 bg-white px-3 py-2 text-right text-sm font-semibold tabular-nums text-slate-900 shadow-sm focus:outline-none focus:ring-2 focus:ring-sky-400 focus:border-sky-400';
+        const FilingTable = ({
+          title,
+          titleAr,
+          colLabel,
+          rowsMeta,
+          rows,
+          kind,
+          totalAmount,
+          totalAdj,
+        }: {
+          title: string;
+          titleAr: string;
+          colLabel: string;
+          rowsMeta: Array<{ en: string; ar: string }>;
+          rows: Array<{ amount: number; adjustment: number }>;
+          kind: 'sales' | 'purchase';
+          totalAmount: number;
+          totalAdj: number;
+        }) => (
+          <div className="overflow-hidden rounded-xl border border-slate-300 bg-white shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 bg-slate-50 px-4 py-3">
+              <div>
+                <h4 className="text-base font-black text-slate-900">{title}</h4>
+                <p className="text-xs font-bold text-slate-600 mt-0.5" dir="rtl" lang="ar">{titleAr}</p>
+              </div>
+              <span className="text-[10px] font-black uppercase tracking-wider text-slate-500 bg-white border border-slate-200 px-2.5 py-1 rounded-full">
+                ZATCA Form
+              </span>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] border-collapse text-sm">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-600">
+                    <th className="border-b border-slate-200 px-3 py-3 w-12 text-center font-bold">#</th>
+                    <th className="border-b border-slate-200 px-4 py-3 text-left font-bold">{colLabel}</th>
+                    <th className="border-b border-slate-200 px-4 py-3 text-right font-bold w-[10rem]">Amount</th>
+                    <th className="border-b border-slate-200 px-4 py-3 text-right font-bold w-[10rem]">Adjustments (﷼)</th>
+                    <th className="border-b border-slate-200 px-2 py-3 w-12" />
+                  </tr>
+                </thead>
+                <tbody>
+                  {rowsMeta.map((m, i) => {
+                    const row = rows[i] || { amount: 0, adjustment: 0 };
+                    return (
+                      <tr key={`${kind}-${i}`} className="align-top hover:bg-slate-50/80">
+                        <td className="border-b border-slate-200 px-3 py-3 text-center font-bold text-slate-500 bg-slate-50/50">{i + 1}</td>
+                        <td className="border-b border-slate-200 px-4 py-3">
+                          <div className="font-bold text-slate-900 leading-snug">{m.en}</div>
+                          <div className="text-xs font-semibold text-slate-500 mt-1 leading-snug" dir="rtl" lang="ar">{m.ar}</div>
+                        </td>
+                        <td className="border-b border-slate-200 px-4 py-3">
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={row.amount}
+                            onChange={(e) => updateZatcaForm(kind, i, 'amount', e.target.value)}
+                            className={inputCls}
+                          />
+                        </td>
+                        <td className="border-b border-slate-200 px-4 py-3">
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={row.adjustment}
+                            onChange={(e) => updateZatcaForm(kind, i, 'adjustment', e.target.value)}
+                            className={inputCls}
+                          />
+                        </td>
+                        <td className="border-b border-slate-200 px-2 py-3">
+                          <button
+                            type="button"
+                            title="Copy amount"
+                            onClick={() => copyReturnAmount(`${kind}-a-${i}`, row.amount)}
+                            className="p-1.5 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-100"
+                          >
+                            {copiedReturnField === `${kind}-a-${i}` ? <CheckCircle size={14} className="text-teal-600" /> : <Copy size={14} />}
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                  <tr className="bg-slate-50 font-black">
+                    <td className="border-t-2 border-slate-300 px-3 py-3.5 text-center text-slate-800">6</td>
+                    <td className="border-t-2 border-slate-300 px-4 py-3.5 text-slate-900">
+                      {kind === 'sales' ? 'Total Sales' : 'Total Purchases'}
+                    </td>
+                    <td className="border-t-2 border-slate-300 px-4 py-3.5 text-right tabular-nums text-slate-950">
+                      ﷼ {formatAmount(totalAmount)}
+                    </td>
+                    <td className="border-t-2 border-slate-300 px-4 py-3.5 text-right tabular-nums text-slate-950">
+                      ﷼ {formatAmount(totalAdj)}
+                    </td>
+                    <td className="border-t-2 border-slate-300 px-2 py-3.5">
+                      <button
+                        type="button"
+                        title="Copy total amount"
+                        onClick={() => copyReturnAmount(`${kind}-total`, totalAmount)}
+                        className="p-1.5 rounded-md border border-slate-200 text-slate-600 hover:bg-slate-100"
+                      >
+                        {copiedReturnField === `${kind}-total` ? <CheckCircle size={14} className="text-teal-600" /> : <Copy size={14} />}
+                      </button>
+                    </td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+
+        return (
+          <div className="space-y-5 animate-slide-up">
+            <div className="overflow-hidden rounded-xl border border-slate-300 bg-white shadow-md">
+              <div className="bg-slate-900 px-5 sm:px-6 py-5 flex flex-wrap items-start justify-between gap-4">
+                <div>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/10 text-white text-[10px] font-black uppercase tracking-[0.14em] mb-2">
+                    <ShieldCheck size={11} /> Updated ZATCA Filing Layout
+                  </div>
+                  <h3 className="text-xl sm:text-2xl font-black text-white">{t('vat.returnPrepTitle')}</h3>
+                  <p className="text-slate-200 text-sm font-bold mt-1" dir="rtl" lang="ar">{t('vat.returnPrepTitleAr')}</p>
+                  <p className="text-slate-300 text-sm font-semibold mt-2 max-w-2xl leading-relaxed">{t('vat.returnPrepSubtitle')}</p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <span className="px-2.5 py-1 rounded-md bg-white text-slate-900 text-xs font-black">{companyNameEn}</span>
+                    <span className="px-2.5 py-1 rounded-md bg-white text-slate-900 text-xs font-black tabular-nums">VAT {companyVAT}</span>
+                    <span className="px-2.5 py-1 rounded-md bg-teal-500 text-white text-xs font-black">{d.quarterLabel || d.periodLabel}</span>
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <button type="button" onClick={handlePreviewVatReturn} className="px-4 py-2.5 rounded-lg bg-white text-slate-900 font-black text-sm hover:bg-slate-100 flex items-center gap-2">
+                    <Eye size={16} /> {t('vat.returnPrintPrep')}
+                  </button>
+                  <a href="https://zatca.gov.sa" target="_blank" rel="noreferrer" className="px-4 py-2.5 rounded-lg border-2 border-white/40 text-white font-black text-sm hover:bg-white/10 flex items-center gap-2">
+                    <ExternalLink size={16} /> {t('vat.returnOpenZatca')}
+                  </a>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 lg:grid-cols-3 gap-3 p-4 bg-slate-50 border-b border-slate-200">
+                {[
+                  { label: t('vat.returnStatSales'), value: d.counts.sales, sub: `Net excl ${formatAmount(d.netSalesExcl)}` },
+                  { label: t('vat.returnStatPurchases'), value: d.counts.purchases, sub: `Net excl ${formatAmount(d.netPurchaseExcl)}` },
+                  { label: t('vat.returnStatCreditNotes'), value: d.counts.salesCn + d.counts.purchaseCn, sub: 'Netted into Amount' },
+                ].map((s) => (
+                  <div key={s.label} className="rounded-lg border border-slate-200 bg-white px-3 py-3">
+                    <div className="text-[11px] font-black uppercase tracking-wide text-slate-600">{s.label}</div>
+                    <div className="text-2xl font-black text-slate-950 tabular-nums mt-1">{s.value}</div>
+                    <div className="text-[11px] font-bold text-slate-700 mt-1">{s.sub}</div>
+                  </div>
+                ))}
+              </div>
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 p-4 border-t border-slate-200 bg-white">
+                <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm">
+                  <div className="font-black text-emerald-900 mb-2">Sales breakdown (excl. VAT)</div>
+                  <div className="flex justify-between font-bold text-slate-800"><span>Gross sales</span><span className="tabular-nums">{formatAmount(d.salesExcl)}</span></div>
+                  <div className="flex justify-between font-bold text-slate-800 mt-1"><span>− Credit notes</span><span className="tabular-nums">{formatAmount(d.salesCnExcl)}</span></div>
+                  <div className="flex justify-between font-black text-emerald-950 mt-2 pt-2 border-t border-emerald-200"><span>Net → Row 1 Amount</span><span className="tabular-nums">{formatAmount(d.netSalesExcl)}</span></div>
+                  <div className="flex justify-between font-bold text-teal-800 mt-1"><span>Output VAT</span><span className="tabular-nums">{formatAmount(d.outputVat)}</span></div>
+                </div>
+                <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm">
+                  <div className="font-black text-rose-900 mb-2">Purchases breakdown (excl. VAT)</div>
+                  <div className="flex justify-between font-bold text-slate-800"><span>Gross purchases</span><span className="tabular-nums">{formatAmount(d.purchaseExcl)}</span></div>
+                  <div className="flex justify-between font-bold text-slate-800 mt-1"><span>− Credit notes</span><span className="tabular-nums">{formatAmount(d.purchaseCnExcl)}</span></div>
+                  <div className="flex justify-between font-black text-rose-950 mt-2 pt-2 border-t border-rose-200"><span>Net → Row 1 Amount</span><span className="tabular-nums">{formatAmount(d.netPurchaseExcl)}</span></div>
+                  <div className="flex justify-between font-bold text-rose-800 mt-1"><span>Input VAT</span><span className="tabular-nums">{formatAmount(d.inputVat)}</span></div>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+              <p className="text-xs font-bold text-slate-600">
+                Row 1 Amount = net taxable excl. VAT for this period · Adjustments = prior-period corrections only (usually 0)
+              </p>
+              <button
+                type="button"
+                onClick={() => {
+                  setZatcaSalesForm([
+                    { amount: d.netSalesExcl, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                  ]);
+                  setZatcaPurchaseForm([
+                    { amount: d.netPurchaseExcl, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                    { amount: 0, adjustment: 0 },
+                  ]);
+                }}
+                className="px-3 py-1.5 rounded-lg bg-slate-100 border border-slate-300 text-xs font-black text-slate-800 hover:bg-slate-200"
+              >
+                Reset to books
+              </button>
+            </div>
+
+            <FilingTable
+              title="Sales"
+              titleAr="المبيعات"
+              colLabel="Sales"
+              rowsMeta={salesFormRowsMeta}
+              rows={zatcaSalesForm}
+              kind="sales"
+              totalAmount={salesTotalAmount}
+              totalAdj={salesTotalAdj}
+            />
+
+            <FilingTable
+              title="Purchases"
+              titleAr="المشتريات"
+              colLabel="Purchases"
+              rowsMeta={purchaseFormRowsMeta}
+              rows={zatcaPurchaseForm}
+              kind="purchase"
+              totalAmount={purchaseTotalAmount}
+              totalAdj={purchaseTotalAdj}
+            />
+
+            <div className={`rounded-xl border-2 p-5 flex flex-wrap items-center justify-between gap-4 ${isDue ? 'bg-slate-950 border-slate-800' : 'bg-emerald-50 border-emerald-300'}`}>
+              <div className="flex items-center gap-4">
+                <div className={`w-12 h-12 rounded-xl flex items-center justify-center ${isDue ? 'bg-teal-500 text-white' : 'bg-emerald-600 text-white'}`}>
+                  <Scale size={22} />
+                </div>
+                <div>
+                  <div className={`text-[11px] font-black uppercase tracking-wider ${isDue ? 'text-teal-300' : 'text-emerald-800'}`}>
+                    {isDue ? t('vat.returnNetPayable') : t('vat.returnNetRefundable')}
+                  </div>
+                  <div className={`text-3xl font-black tabular-nums mt-1 ${isDue ? 'text-white' : 'text-emerald-950'}`}>
+                    ﷼ {formatAmount(Math.abs(formNetPayable))}
+                  </div>
+                  <div className={`text-sm font-bold mt-1 ${isDue ? 'text-slate-300' : 'text-emerald-900'}`}>
+                    Output VAT {formatAmount(formOutputVat)} − Input VAT {formatAmount(formInputVat)}
+                  </div>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => copyReturnAmount('net', Math.abs(formNetPayable))}
+                className={`px-4 py-2.5 rounded-lg font-black text-sm flex items-center gap-2 border-2 ${isDue ? 'bg-white text-slate-950 border-white' : 'bg-emerald-700 text-white border-emerald-800'}`}
+              >
+                {copiedReturnField === 'net' ? <CheckCircle size={16} /> : <Copy size={16} />}
+                {t('vat.returnCopyNet')}
+              </button>
+            </div>
+
+            <div className="rounded-xl border border-slate-300 bg-white p-5 shadow-sm">
+              <div className="flex items-center gap-3 mb-4">
+                <div className="w-10 h-10 rounded-lg bg-slate-900 text-white flex items-center justify-center">
+                  <ClipboardList size={18} />
+                </div>
+                <div>
+                  <h4 className="font-black text-slate-950">{t('vat.returnChecklistTitle')}</h4>
+                  <p className="text-sm font-semibold text-slate-600">{t('vat.returnChecklistSub')}</p>
+                </div>
+              </div>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                {[t('vat.returnCheck1'), t('vat.returnCheck2'), t('vat.returnCheck3'), t('vat.returnCheck4'), t('vat.returnCheck5'), t('vat.returnCheck6')].map((item, i) => (
+                  <div key={i} className="flex gap-3 items-start p-3.5 rounded-lg bg-slate-50 border border-slate-200">
+                    <div className="w-6 h-6 rounded-md bg-slate-900 text-white flex items-center justify-center text-[11px] font-black shrink-0">{i + 1}</div>
+                    <p className="text-sm font-bold text-slate-800 leading-snug">{item}</p>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-4 p-4 rounded-lg bg-amber-50 border border-amber-300">
+                <span className="text-amber-950 font-black uppercase tracking-wider text-[11px]">{t('vat.returnDisclaimerLabel')}</span>
+                <p className="mt-1.5 text-sm font-semibold text-amber-950 leading-relaxed">{t('vat.returnDisclaimer')}</p>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
       {/* QR Code Modal */}
       {selectedQRCode && (
         <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-start justify-center pt-[12vh] z-[60] p-4" onClick={() => setSelectedQRCode(null)}>

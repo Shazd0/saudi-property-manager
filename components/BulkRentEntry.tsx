@@ -166,6 +166,7 @@ const BulkRentEntry: React.FC<BulkRentEntryProps> = ({ currentUser }) => {
 
   // Submit all selected entries
   const handleSubmit = async () => {
+    if (submitting) return;
     if (selectedRows.length === 0) {
       showError('No units selected for rent entry');
       return;
@@ -582,10 +583,10 @@ const BulkRentEntry: React.FC<BulkRentEntryProps> = ({ currentUser }) => {
               </div>
             </div>
             <div className="px-5 py-3 border-t border-gray-100 flex justify-end gap-2">
-              <button onClick={() => setShowPreview(false)} className="px-4 py-2 rounded-xl text-sm font-semibold bg-gray-100 text-gray-600 hover:bg-gray-200 transition-all">{t('common.close')}</button>
-                <button onClick={() => { setShowPreview(false); handleSubmit(); }}
-                className="px-4 py-2 rounded-xl text-sm font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition-all">
-                {t('bulk.confirmSave')}
+              <button onClick={() => setShowPreview(false)} disabled={submitting} className="px-4 py-2 rounded-xl text-sm font-semibold bg-gray-100 text-gray-600 hover:bg-gray-200 transition-all disabled:opacity-60">{t('common.close')}</button>
+                <button onClick={() => { setShowPreview(false); handleSubmit(); }} disabled={submitting}
+                className="px-4 py-2 rounded-xl text-sm font-bold bg-emerald-600 text-white hover:bg-emerald-700 transition-all disabled:opacity-60 inline-flex items-center gap-2">
+                {submitting ? t('common.saving') : t('bulk.confirmSave')}
               </button>
             </div>
           </div>

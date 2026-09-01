@@ -28,6 +28,7 @@ const EmployeeManager: React.FC = () => {
     const [confirmTitle, setConfirmTitle] = useState('Confirm');
     const [confirmDanger, setConfirmDanger] = useState(false);
     const [confirmAction, setConfirmAction] = useState<null | (() => void)>(null);
+    const [saving, setSaving] = useState(false);
 
     const openConfirm = (message: string, onConfirm: () => void, opts?: { title?: string; danger?: boolean }) => {
         setConfirmTitle(opts?.title || 'Confirm');
@@ -93,6 +94,7 @@ const EmployeeManager: React.FC = () => {
 
     const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.name) {
         showWarning("Please enter employee name");
@@ -133,10 +135,15 @@ const EmployeeManager: React.FC = () => {
                         password: resolvedPassword,
         };
     
+                setSaving(true);
+                try {
                 await saveUser(newUser);
                 const usrs = await getUsers();
                 setEmployees(usrs || []);
     setView('LIST');
+                } finally {
+                setSaving(false);
+                }
     resetForm();
   };
 
@@ -851,9 +858,10 @@ const EmployeeManager: React.FC = () => {
                         <X size={18} />{t('common.cancel')}</button>
                     <button 
                         type="submit"
-                        className="pm-btn pm-btn-primary flex-1 flex items-center justify-center gap-2"
+                        disabled={saving}
+                        className="pm-btn pm-btn-primary flex-1 flex items-center justify-center gap-2 disabled:opacity-60"
                     >
-                        <Save size={18} /> Save Employee
+                        <Save size={18} /> {saving ? t('common.saving') : 'Save Employee'}
                     </button>
                 </div>
              </div>

@@ -8,6 +8,7 @@ import ConfirmDialog from './ConfirmDialog';
 import SoundService from '../services/soundService';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
+import { SkeletonBuildingCards } from './LoadingSkeleton';
 
 const BuildingManager: React.FC = () => {
     const { t, isRTL } = useLanguage();
@@ -44,6 +45,9 @@ const BuildingManager: React.FC = () => {
     const [confirmTitle, setConfirmTitle] = useState('Confirm');
     const [confirmDanger, setConfirmDanger] = useState(false);
     const [confirmAction, setConfirmAction] = useState<null | (() => void)>(null);
+    const [savingNewBuilding, setSavingNewBuilding] = useState(false);
+    const [savingBuilding, setSavingBuilding] = useState(false);
+    const [listLoading, setListLoading] = useState(true);
 
     const openConfirm = (message: string, onConfirm: () => void, opts?: { title?: string; danger?: boolean }) => {
         setConfirmTitle(opts?.title || 'Confirm');
@@ -58,13 +62,20 @@ const BuildingManager: React.FC = () => {
         setConfirmAction(null);
     };
 
-    useEffect(() => { (async () => { setBuildings(await getBuildings({ includeDeleted: true }) || []); setBanks(await getBanks() || []); setAllTransactions(await getTransactions() || []); })(); }, []);
+    useEffect(() => { (async () => {
+        setListLoading(true);
+        try {
+        setBuildings(await getBuildings({ includeDeleted: true }) || []);
+        setBanks(await getBanks() || []);
+        setAllTransactions(await getTransactions() || []);
+        } finally {
+        setListLoading(false);
+        }
+    })(); }, []);
 
     const loadBuildings = async () => {
         const fresh = await getBuildings({ includeDeleted: true }) || [];
         setBuildings(fresh);
-        setAllTransactions(await getTransactions() || []);
-        // Keep editingBuilding in sync with fresh Firestore data
         setEditingBuilding(prev => {
             if (!prev) return null;
             const updated = fresh.find(b => b.id === prev.id);
@@ -74,6 +85,7 @@ const BuildingManager: React.FC = () => {
 
     const handleAddBuilding = async (e: React.FormEvent) => {
         e.preventDefault();
+        if (savingNewBuilding) return;
         SoundService.play('submit');
         if (!newBuildingName.trim()) return;
         // Check for duplicate building name
@@ -93,6 +105,8 @@ const BuildingManager: React.FC = () => {
             propertyType: newPropertyType,
             vatApplicable: newPropertyType === 'NON_RESIDENTIAL' ? newVatApplicable : false
         };
+        setSavingNewBuilding(true);
+        try {
         await saveBuilding(newBuilding);
         setNewBuildingName('');
         setNewBuildingBank('');
@@ -100,6 +114,21 @@ const BuildingManager: React.FC = () => {
         setNewPropertyType('RESIDENTIAL');
         setNewVatApplicable(false);
         await loadBuildings();
+        } finally {
+        setSavingNewBuilding(false);
+        }
+    };
+
+    const saveEditingBuilding = async (successMessage = 'Saved') => {
+        if (!editingBuilding || savingBuilding) return;
+        setSavingBuilding(true);
+        try {
+            await saveBuilding(editingBuilding);
+            await loadBuildings();
+            showSuccess(successMessage);
+        } finally {
+            setSavingBuilding(false);
+        }
     };
 
     const handleDeleteBuilding = async (id: string) => {
@@ -487,12 +516,15 @@ const BuildingManager: React.FC = () => {
                                                     <button type="button" onClick={handleDeleteAll} className="px-2 sm:px-4 py-2 rounded-lg font-bold text-[10px] sm:text-xs flex-1 sm:flex-none bg-rose-50 text-rose-700 border border-rose-200 hover:bg-rose-100">{t('history.deleteAll')}</button>
                                             </>
                                     )}
-                                    <button type="submit" className="pm-btn pm-btn-primary pm-btn-sm flex items-center gap-1 sm:gap-2 flex-1 sm:flex-none whitespace-nowrap">
-                                            <Plus size={14} />{t('common.add')}</button>
+                                    <button type="submit" disabled={savingNewBuilding} className="pm-btn pm-btn-primary pm-btn-sm flex items-center gap-1 sm:gap-2 flex-1 sm:flex-none whitespace-nowrap disabled:opacity-60">
+                                            <Plus size={14} />{savingNewBuilding ? t('common.saving') : t('common.add')}</button>
                                 </div>
                          </form>
 
              {/* Buildings Grid */}
+             {listLoading ? (
+               <SkeletonBuildingCards count={6} />
+             ) : (
              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4 md:gap-6">
                 {buildings.filter(b => showDeleted ? (b as any).deleted === true : !(b as any).deleted).map(b => (
                     <div key={b.id} onClick={() => !showDeleted && startEdit(b)} className={`group ${showDeleted ? '' : 'cursor-pointer'} premium-card premium-card-interactive p-4 sm:p-5 relative`}>
@@ -567,6 +599,7 @@ const BuildingManager: React.FC = () => {
                     </div>
                 ))}
              </div>
+             )}
           </div>
         ) : (
           <div className="animate-slideUp max-w-4xl mx-auto">
@@ -620,15 +653,11 @@ const BuildingManager: React.FC = () => {
                                 </div>
                                 <div className="col-span-1 sm:col-span-2 pt-2">
                                     <button
-                                        onClick={async () => {
-                                            if (!editingBuilding) return;
-                                            await saveBuilding(editingBuilding);
-                                            await loadBuildings();
-                                            showSuccess('Building details saved!');
-                                        }}
-                                        className="w-full sm:w-auto px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-500 text-white font-bold rounded-xl hover:from-blue-600 hover:to-indigo-600 transition-all shadow-md flex items-center justify-center gap-2"
+                                        onClick={() => saveEditingBuilding('Building details saved!')}
+                                        disabled={savingBuilding}
+                                        className="w-full sm:w-auto px-6 py-2 bg-gradient-to-r from-blue-500 to-indigo-500 text-white font-bold rounded-xl hover:from-blue-600 hover:to-indigo-600 transition-all shadow-md flex items-center justify-center gap-2 disabled:opacity-60"
                                     >
-                                        <Save size={16} /> Save Property Details
+                                        <Save size={16} /> {savingBuilding ? t('common.saving') : 'Save Property Details'}
                                     </button>
                                 </div>
                                 {editingBuilding.propertyType === 'NON_RESIDENTIAL' && (
@@ -644,7 +673,7 @@ const BuildingManager: React.FC = () => {
                                     </div>
                                 )}
                                 <div className="flex items-end pt-2 sm:pt-0">
-                                    <button onClick={async () => { if (!editingBuilding) return; await saveBuilding(editingBuilding); await loadBuildings(); showSuccess('Saved'); }} className="w-full px-3 sm:px-4 py-2 bg-blue-600 text-white rounded-lg text-xs sm:text-sm font-bold">{t('common.save')}</button>
+                                    <button onClick={() => saveEditingBuilding('Saved')} disabled={savingBuilding} className="w-full px-3 sm:px-4 py-2 bg-blue-600 text-white rounded-lg text-xs sm:text-sm font-bold disabled:opacity-60">{savingBuilding ? t('common.saving') : t('common.save')}</button>
                                 </div>
                             </div>
                         </div>
@@ -1027,15 +1056,11 @@ const BuildingManager: React.FC = () => {
 
                                      {/* Save Lease Button */}
                                      <button
-                                         onClick={async () => {
-                                             if (!editingBuilding) return;
-                                             await saveBuilding(editingBuilding);
-                                             await loadBuildings();
-                                             showSuccess('Lease details saved!');
-                                         }}
-                                         className="w-full sm:w-auto px-6 py-2.5 bg-gradient-to-r from-orange-500 to-amber-500 text-white font-bold rounded-xl hover:from-orange-600 hover:to-amber-600 transition-all shadow-lg shadow-orange-200/50 flex items-center justify-center gap-2"
+                                         onClick={() => saveEditingBuilding('Lease details saved!')}
+                                         disabled={savingBuilding}
+                                         className="w-full sm:w-auto px-6 py-2.5 bg-gradient-to-r from-orange-500 to-amber-500 text-white font-bold rounded-xl hover:from-orange-600 hover:to-amber-600 transition-all shadow-lg shadow-orange-200/50 flex items-center justify-center gap-2 disabled:opacity-60"
                                      >
-                                         <Save size={16} /> {t('building.saveLease')}
+                                         <Save size={16} /> {savingBuilding ? t('common.saving') : t('building.saveLease')}
                                      </button>
                                  </div>
                                  );

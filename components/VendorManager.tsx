@@ -33,6 +33,7 @@ const VendorManager: React.FC = () => {
   const [confirmTitle, setConfirmTitle] = useState<string>('');
   const [confirmDanger, setConfirmDanger] = useState(false);
   const [confirmAction, setConfirmAction] = useState<null | (() => void)>(null);
+  const [saving, setSaving] = useState(false);
 
   // Excel import wizard
   const [importOpen, setImportOpen] = useState(false);
@@ -71,6 +72,7 @@ const VendorManager: React.FC = () => {
 
   const handleSave = async (e: React.FormEvent) => {
       e.preventDefault();
+      if (saving) return;
       SoundService.play('submit');
       
       // Check for duplicate vendor name (only if not editing the same vendor)
@@ -97,6 +99,8 @@ const VendorManager: React.FC = () => {
           ...formData,
           id: formData.id || crypto.randomUUID()
       };
+    setSaving(true);
+    try {
     await saveVendor(newVendor);
     setVendors(await getVendors());
       setIsFormOpen(false);
@@ -107,6 +111,9 @@ const VendorManager: React.FC = () => {
       if (returnTo) {
         navigate(returnTo, { state: { vendorId: newVendor.id } });
       }
+    } finally {
+      setSaving(false);
+    }
   };
 
   const handleDelete = async (id: string) => {
@@ -370,9 +377,10 @@ const VendorManager: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  className="px-7 py-2.5 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-200"
+                  disabled={saving}
+                  className="px-7 py-2.5 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-colors shadow-lg shadow-indigo-200 disabled:opacity-60"
                 >
-                  {t('common.save')}
+                  {saving ? t('common.saving') : t('common.save')}
                 </button>
               </div>
             </form>

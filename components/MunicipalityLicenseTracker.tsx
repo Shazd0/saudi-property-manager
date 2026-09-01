@@ -50,6 +50,7 @@ const MunicipalityLicenseTracker: React.FC = () => {
   const [confirmAction, setConfirmAction] = useState<(() => void) | null>(null);
   const [confirmMsg, setConfirmMsg] = useState('');
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -70,6 +71,7 @@ const MunicipalityLicenseTracker: React.FC = () => {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.buildingName || !formData.licenseNumber) { showError('Building and license number required'); return; }
     const license: MunicipalityLicense = {
@@ -80,6 +82,7 @@ const MunicipalityLicenseTracker: React.FC = () => {
       createdAt: formData.createdAt || Date.now(),
       createdBy: formData.createdBy || 'system',
     };
+    setSaving(true);
     try {
       await saveMunicipalityLicense(license);
       showSuccess(editId ? 'License updated' : 'Municipality license recorded');
@@ -88,6 +91,7 @@ const MunicipalityLicenseTracker: React.FC = () => {
       setFormData({ ...emptyForm });
       load();
     } catch (err: any) { showError(err.message || 'Failed to save license'); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (l: MunicipalityLicense) => { setFormData(l); setEditId(l.id); setIsFormOpen(true); };
@@ -237,7 +241,7 @@ const MunicipalityLicenseTracker: React.FC = () => {
               <div><label className="block text-xs font-medium text-slate-500 mb-1">{t('common.notes')}</label><textarea value={formData.notes || ''} onChange={e => setFormData({ ...formData, notes: e.target.value })} className="w-full border rounded-xl px-3 py-2 text-sm" rows={2} /></div>
               <div className="flex gap-2 justify-end">
                 <button type="button" onClick={() => setIsFormOpen(false)} className="px-4 py-2 border rounded-xl text-sm">{t('common.cancel')}</button>
-                <button type="submit" className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700">Save License</button>
+                <button type="submit" disabled={saving} className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700 disabled:opacity-60">{saving ? 'Saving...' : 'Save License'}</button>
               </div>
             </form>
           </div>

@@ -67,6 +67,7 @@ const ServiceAgreements: React.FC = () => {
   
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [confirmMessage, setConfirmMessage] = useState('');
+  const [saving, setSaving] = useState(false);
   const [confirmTitle, setConfirmTitle] = useState('Confirm');
   const [confirmDanger, setConfirmDanger] = useState(false);
   const [confirmAction, setConfirmAction] = useState<null | (() => void)>(null);
@@ -134,6 +135,7 @@ const ServiceAgreements: React.FC = () => {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     
     if (!formData.name.trim()) {
@@ -172,11 +174,16 @@ const ServiceAgreements: React.FC = () => {
       updatedAt: Date.now()
     };
     
+    setSaving(true);
+    try {
     await saveServiceAgreement(newAgreement);
     setAgreements(await getServiceAgreements());
     setIsFormOpen(false);
     resetForm();
     showSuccess(`Service agreement ${isRenewal ? 'renewed' : 'saved'}.`);
+    } finally {
+    setSaving(false);
+    }
   };
 
   const resetForm = () => {
@@ -740,8 +747,8 @@ const ServiceAgreements: React.FC = () => {
 
                 <div className="flex justify-end gap-3 pt-4">
                   <button type="button" onClick={() => { setIsFormOpen(false); resetForm(); }} className="px-4 py-2 text-slate-600 hover:bg-slate-100 rounded-xl">{t('common.cancel')}</button>
-                  <button type="submit" className="px-6 py-2 bg-emerald-600 text-white rounded-xl hover:bg-emerald-700">
-                    {formData.id ? t('service.updateAgreement') : t('service.saveAgreement')}
+                  <button type="submit" disabled={saving} className="px-6 py-2 bg-emerald-600 text-white rounded-xl hover:bg-emerald-700 disabled:opacity-60">
+                    {saving ? t('common.saving') : (formData.id ? t('service.updateAgreement') : t('service.saveAgreement'))}
                   </button>
                 </div>
               </form>

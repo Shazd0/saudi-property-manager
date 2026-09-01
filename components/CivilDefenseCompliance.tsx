@@ -50,6 +50,7 @@ const CivilDefenseCompliance: React.FC = () => {
   const [confirmAction, setConfirmAction] = useState<(() => void) | null>(null);
   const [confirmMsg, setConfirmMsg] = useState('');
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -70,6 +71,7 @@ const CivilDefenseCompliance: React.FC = () => {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.buildingName || !formData.inspectionType) { showError('Building and inspection type required'); return; }
     const record: CivilDefenseRecord = {
@@ -79,6 +81,7 @@ const CivilDefenseCompliance: React.FC = () => {
       createdAt: formData.createdAt || Date.now(),
       createdBy: formData.createdBy || 'system',
     };
+    setSaving(true);
     try {
       await saveCivilDefenseRecord(record);
       showSuccess(editId ? 'Record updated' : 'Civil defense record created');
@@ -87,6 +90,7 @@ const CivilDefenseCompliance: React.FC = () => {
       setFormData({ ...emptyForm });
       load();
     } catch (err: any) { showError(err.message || 'Failed to save record'); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (r: CivilDefenseRecord) => { setFormData(r); setEditId(r.id); setIsFormOpen(true); };
@@ -260,7 +264,7 @@ const CivilDefenseCompliance: React.FC = () => {
               <div><label className="block text-xs font-medium text-slate-500 mb-1">{t('common.notes')}</label><textarea value={formData.notes || ''} onChange={e => setFormData({ ...formData, notes: e.target.value })} className="w-full border rounded-xl px-3 py-2 text-sm" rows={2} /></div>
               <div className="flex gap-2 justify-end">
                 <button type="button" onClick={() => setIsFormOpen(false)} className="px-4 py-2 border rounded-xl text-sm">{t('common.cancel')}</button>
-                <button type="submit" className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700">Save Record</button>
+                <button type="submit" disabled={saving} className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700 disabled:opacity-60">{saving ? 'Saving...' : 'Save Record'}</button>
               </div>
             </form>
           </div>

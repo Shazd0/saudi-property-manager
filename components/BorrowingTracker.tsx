@@ -348,6 +348,7 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
     const [saving, setSaving] = useState(false);
   // ...existing code...
   const [deletingTx, setDeletingTx] = useState<Transaction | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
   const handleDeleteOpeningBalance = (tx: Transaction) => {
     setDeletingTx(tx);
@@ -355,15 +356,20 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
   };
 
   const confirmDeleteOpeningBalance = async () => {
-    if (!deletingTx) return;
+    if (!deletingTx || deleteBusy) return;
+    setDeleteBusy(true);
+    const txId = deletingTx.id;
     try {
-      await deleteTransaction(deletingTx.id);
-      showSuccess('Borrowing entry deleted');
+      await deleteTransaction(txId);
+      setAllTransactions((prev) => prev.filter((t) => t.id !== txId));
       setShowDeleteConfirm(false);
       setDeletingTx(null);
-      await loadData();
+      showSuccess('Borrowing entry deleted');
+      void loadData();
     } catch (err) {
       showError('Failed to delete entry');
+    } finally {
+      setDeleteBusy(false);
     }
   };
   const { showSuccess, showError } = useToast();
@@ -1239,14 +1245,16 @@ const BorrowingTracker: React.FC<BorrowingTrackerProps> = ({ currentUser }) => {
               </div>
               <div className="flex gap-3">
                 <button
-                  onClick={() => setShowDeleteConfirm(false)}
-                  className="flex-1 py-3 bg-slate-100 text-slate-700 rounded-xl text-sm font-bold hover:bg-slate-200 transition-all"
+                  onClick={() => { if (!deleteBusy) { setShowDeleteConfirm(false); setDeletingTx(null); } }}
+                  disabled={deleteBusy}
+                  className="flex-1 py-3 bg-slate-100 text-slate-700 rounded-xl text-sm font-bold hover:bg-slate-200 transition-all disabled:opacity-60"
                 >{t('common.cancel')}</button>
                 <button
                   onClick={confirmDeleteOpeningBalance}
-                  className="flex-1 py-3 bg-rose-500 text-white rounded-xl text-sm font-bold hover:bg-rose-600 shadow-lg shadow-rose-200 transition-all flex items-center justify-center gap-2"
+                  disabled={deleteBusy}
+                  className="flex-1 py-3 bg-rose-500 text-white rounded-xl text-sm font-bold hover:bg-rose-600 shadow-lg shadow-rose-200 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
                 >
-                  <Trash2 size={16} />{t('common.delete')}</button>
+                  <Trash2 size={16} />{deleteBusy ? t('common.processing') : t('common.delete')}</button>
               </div>
             </div>
           </div>

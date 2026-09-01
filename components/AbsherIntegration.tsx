@@ -54,6 +54,7 @@ const AbsherIntegration: React.FC = () => {
   const [confirmAction, setConfirmAction] = useState<(() => void) | null>(null);
   const [confirmMsg, setConfirmMsg] = useState('');
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -71,6 +72,7 @@ const AbsherIntegration: React.FC = () => {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.customerName || !formData.nationalId) { showError('Customer name and National/Iqama ID required'); return; }
     const record: AbsherRecord = {
@@ -79,6 +81,7 @@ const AbsherIntegration: React.FC = () => {
       createdAt: formData.createdAt || Date.now(),
       createdBy: formData.createdBy || 'system',
     };
+    setSaving(true);
     try {
       await saveAbsherRecord(record);
       showSuccess(editId ? 'Record updated' : 'Absher registration recorded');
@@ -87,6 +90,7 @@ const AbsherIntegration: React.FC = () => {
       setFormData({ ...emptyForm });
       load();
     } catch (err: any) { showError(err.message || 'Failed to save record'); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (r: AbsherRecord) => { setFormData(r); setEditId(r.id); setIsFormOpen(true); };
@@ -265,7 +269,7 @@ const AbsherIntegration: React.FC = () => {
               <div><label className="block text-xs font-medium text-slate-500 mb-1">{t('common.notes')}</label><textarea value={formData.notes || ''} onChange={e => setFormData({ ...formData, notes: e.target.value })} className="w-full border rounded-xl px-3 py-2 text-sm" rows={2} /></div>
               <div className="flex gap-2 justify-end">
                 <button type="button" onClick={() => setIsFormOpen(false)} className="px-4 py-2 border rounded-xl text-sm">{t('common.cancel')}</button>
-                <button type="submit" className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700">Save Registration</button>
+                <button type="submit" disabled={saving} className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700 disabled:opacity-60">{saving ? 'Saving...' : 'Save Registration'}</button>
               </div>
             </form>
           </div>

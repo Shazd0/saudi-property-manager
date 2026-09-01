@@ -204,6 +204,7 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
     const [editingBankOriginalName, setEditingBankOriginalName] = useState('');
     const [editingBankOriginalId, setEditingBankOriginalId] = useState('');
     const [savingBankEdit, setSavingBankEdit] = useState(false);
+    const [savingNewBank, setSavingNewBank] = useState(false);
     const [isAddingBank, setIsAddingBank] = useState(false);
     const [newBankName, setNewBankName] = useState('');
     const [newBankIban, setNewBankIban] = useState('');
@@ -1149,17 +1150,22 @@ const Settings: React.FC<SettingsProps> = ({ currentUser }) => {
                             </div>
                             <button
                                 onClick={async () => {
-                                    if (newBankName && newBankIban) {
+                                    if (!newBankName || !newBankIban || savingNewBank) return;
+                                    setSavingNewBank(true);
+                                    try {
                                         await saveBank({ name: newBankName, iban: newBankIban });
                                         await refreshBankManagement();
                                         setIsAddingBank(false);
                                         setNewBankName('');
                                         setNewBankIban('');
+                                    } finally {
+                                        setSavingNewBank(false);
                                     }
                                 }}
-                                className="w-full py-3 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2"
+                                disabled={savingNewBank}
+                                className="w-full py-3 bg-blue-600 text-white font-bold rounded-xl hover:bg-blue-700 transition-all flex items-center justify-center gap-2 disabled:opacity-60"
                             >
-                                <Save size={18}/>{t('entry.saveBank')}</button>
+                                <Save size={18}/>{savingNewBank ? t('common.saving') : t('entry.saveBank')}</button>
                         </div>
                     )}
 

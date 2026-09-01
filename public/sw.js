@@ -648,9 +648,16 @@ self.addEventListener('message', (event) => {
     return;
   }
   if (event.data?.type === 'AMLAK_CALL_WATCH') {
+    let apiBase = event.data.apiBase || self.location.origin;
+    try {
+      const configured = new URL(apiBase, self.location.origin);
+      if (configured.origin !== self.location.origin) apiBase = self.location.origin;
+    } catch {
+      apiBase = self.location.origin;
+    }
     callWatchConfig = {
       userId: event.data.userId,
-      apiBase: event.data.apiBase || self.location.origin,
+      apiBase,
       token: event.data.token || '',
     };
     if (callWatchTimer) clearInterval(callWatchTimer);

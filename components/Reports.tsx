@@ -25,6 +25,7 @@ import {
   Landmark, RefreshCw, Clock, AlertTriangle, CheckCircle, XCircle,
   Search, X
 } from 'lucide-react';
+import { SkeletonDashboard } from './LoadingSkeleton';
 
 // ── Types ──
 type ReportTab = 'overview' | 'financial' | 'occupancy' | 'tenant' | 'expense' | 'salary' | 'building' | 'collection' | 'bank' | 'ownerExpense';
@@ -2391,11 +2392,8 @@ const Reports: React.FC<ReportsProps> = ({ currentUser }) => {
 
   // ── Loading ──
   if (loading) return (
-    <div className="flex items-center justify-center min-h-[400px]">
-      <div className="text-center">
-        <div className="w-12 h-12 border-4 border-emerald-200 border-t-emerald-600 rounded-full animate-spin mx-auto mb-4" />
-        <p className="text-emerald-700 font-semibold animate-pulse">{t('reports.loading')}</p>
-      </div>
+    <div className="mobile-tab-shell tab-reports w-full max-w-full min-w-0 p-4 sm:p-6">
+      <SkeletonDashboard />
     </div>
   );
 

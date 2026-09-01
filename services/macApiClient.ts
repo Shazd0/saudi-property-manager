@@ -6,16 +6,13 @@ type ListOptions = {
   filters?: Record<string, string | number | boolean | undefined | null>;
 };
 
-const MAC_API_URL = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
+import { resolveMacRestApiBase } from '../utils/macApiBase';
+import { isMacApiPollingAllowed, reportMacApiFailure, reportMacApiSuccess } from '../utils/macApiHealth';
+
 const MAC_API_TOKEN = (import.meta as any).env?.VITE_MAC_API_TOKEN || '';
 
 function resolveApiBase(): string {
-  const raw = String(MAC_API_URL).trim();
-  if (!raw || raw === '/' || raw === './' || raw === 'same-origin') {
-    if (typeof window !== 'undefined') return window.location.origin;
-    return '';
-  }
-  return raw.replace(/\/+$/, '');
+  return resolveMacRestApiBase();
 }
 
 function headers(): HeadersInit {
@@ -27,6 +24,9 @@ function headers(): HeadersInit {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  if (!isMacApiPollingAllowed()) {
+    throw new Error('Mac API temporarily unavailable');
+  }
   const res = await fetch(`${resolveApiBase()}${path}`, {
     ...init,
     headers: {
@@ -35,9 +35,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     },
   });
   if (!res.ok) {
+    reportMacApiFailure(res.status);
     const text = await res.text().catch(() => '');
     throw new Error(`Mac API ${res.status}: ${text || res.statusText}`);
   }
+  reportMacApiSuccess();
   return res.json() as Promise<T>;
 }
 

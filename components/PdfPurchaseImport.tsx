@@ -150,50 +150,202 @@ function applyTableToMapState(
 }
 
 // ── PDF text / OCR extraction ──────────────────────────────────────────
+type PdfTextItem = { str: string; x: number; y: number; w: number };
+
+const AMOUNT_CELL_RE = /^[\d,]+\.?\d{0,3}$/;
+const DATE_CELL_RE = /^\d{1,4}[-\/\.]\d{1,2}[-\/\.]\d{2,4}$/;
+const TOTAL_ROW_RE = /^(total|sub.?total|grand|sum|balance|page|cont)\b/i;
+
+function isAmountLike(cell: string): boolean {
+  const cleaned = cell.replace(/[SAR ريال٪%\s]/gi, '').trim();
+  return AMOUNT_CELL_RE.test(cleaned);
+}
+
+function looksLikeInvoiceDataRow(cells: string[]): boolean {
+  const nonEmpty = cells.map((c) => c.trim()).filter(Boolean);
+  if (nonEmpty.length < 2) return false;
+  if (nonEmpty.length === 1 && TOTAL_ROW_RE.test(nonEmpty[0])) return false;
+  const amountCount = nonEmpty.filter(isAmountLike).length;
+  const hasDate = nonEmpty.some((c) => DATE_CELL_RE.test(c));
+  // Invoice rows usually have at least one amount, or date + several fields.
+  return amountCount >= 1 || (hasDate && nonEmpty.length >= 3) || nonEmpty.length >= 4;
+}
+
+/** Pad / trim a row to target width, keeping amount columns right-aligned when possible. */
+function alignRowToWidth(row: string[], width: number): string[] {
+  if (width <= 0) return row;
+  if (row.length === width) return [...row];
+  if (row.length > width) {
+    // Merge overflow from the left (vendor / description often splits into extra cells).
+    const keepTail = Math.min(4, width - 1);
+    const headSlots = Math.max(1, width - keepTail);
+    const headParts = row.slice(0, row.length - keepTail);
+    const tail = row.slice(row.length - keepTail);
+    const mergedHead: string[] = [];
+    if (headParts.length <= headSlots) {
+      mergedHead.push(...headParts);
+      while (mergedHead.length < headSlots) mergedHead.push('');
+    } else {
+      const chunk = Math.ceil(headParts.length / headSlots);
+      for (let i = 0; i < headSlots; i++) {
+        mergedHead.push(headParts.slice(i * chunk, (i + 1) * chunk).join(' ').trim());
+      }
+    }
+    return [...mergedHead.slice(0, headSlots), ...tail].slice(0, width);
+  }
+
+  // row.length < width — insert empties before trailing amounts.
+  const amountTail: string[] = [];
+  const head = [...row];
+  while (head.length && isAmountLike(head[head.length - 1])) {
+    amountTail.unshift(head.pop()!);
+  }
+  const amountCols = Math.min(Math.max(amountTail.length, 0), width);
+  while (amountTail.length < amountCols) amountTail.unshift('');
+  while (head.length + amountTail.length < width) head.push('');
+  while (head.length + amountTail.length < width) head.unshift('');
+  return [...head, ...amountTail].slice(0, width);
+}
+
+function clusterYRows(items: PdfTextItem[], yTol = 12): PdfTextItem[][] {
+  const sorted = [...items].sort((a, b) => b.y - a.y || a.x - b.x);
+  const rows: PdfTextItem[][] = [];
+  for (const item of sorted) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].y - item.y) <= yTol) {
+      last.push(item);
+    } else {
+      rows.push([item]);
+    }
+  }
+  return rows.map((r) => r.sort((a, b) => a.x - b.x));
+}
+
+/** Cluster X positions into column start centers from the densest rows. */
+function inferColumnCenters(rows: PdfTextItem[][], targetCols: number): number[] {
+  const xSamples: number[] = [];
+  for (const row of rows) {
+    if (row.length < Math.max(2, Math.floor(targetCols * 0.5))) continue;
+    for (const item of row) xSamples.push(item.x);
+  }
+  if (!xSamples.length) {
+    // Fallback: use all items
+    for (const row of rows) for (const item of row) xSamples.push(item.x);
+  }
+  xSamples.sort((a, b) => a - b);
+
+  // Greedy cluster: new column when gap is large vs median gap.
+  const gaps: number[] = [];
+  for (let i = 1; i < xSamples.length; i++) gaps.push(xSamples[i] - xSamples[i - 1]);
+  gaps.sort((a, b) => a - b);
+  const medianGap = gaps.length ? gaps[Math.floor(gaps.length / 2)] : 20;
+  const splitGap = Math.max(18, medianGap * 3);
+
+  const clusters: number[][] = [];
+  for (const x of xSamples) {
+    const cur = clusters[clusters.length - 1];
+    if (!cur || x - cur[cur.length - 1] > splitGap) clusters.push([x]);
+    else cur.push(x);
+  }
+
+  let centers = clusters.map((c) => c.reduce((s, v) => s + v, 0) / c.length);
+  // If we got too many columns, merge closest neighbors until targetCols.
+  while (centers.length > targetCols && centers.length > 2) {
+    let bestI = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < centers.length - 1; i++) {
+      const d = centers[i + 1] - centers[i];
+      if (d < bestDist) { bestDist = d; bestI = i; }
+    }
+    const merged = (centers[bestI] + centers[bestI + 1]) / 2;
+    centers = [...centers.slice(0, bestI), merged, ...centers.slice(bestI + 2)];
+  }
+  return centers;
+}
+
+function assignItemsToColumns(row: PdfTextItem[], centers: number[]): string[] {
+  const cells = centers.map(() => '');
+  for (const item of row) {
+    let best = 0;
+    let bestDist = Infinity;
+    for (let i = 0; i < centers.length; i++) {
+      const d = Math.abs(item.x - centers[i]);
+      if (d < bestDist) { bestDist = d; best = i; }
+    }
+    cells[best] = cells[best] ? `${cells[best]} ${item.str}`.trim() : item.str.trim();
+  }
+  return cells.map((c) => c.trim());
+}
+
+function estimateDominantColCount(rows: PdfTextItem[][]): number {
+  const freq: Record<number, number> = {};
+  for (const r of rows) {
+    if (r.length >= 2) freq[r.length] = (freq[r.length] || 0) + 1;
+  }
+  const modal = Object.entries(freq).sort((a, b) => Number(b[1]) - Number(a[1]))[0];
+  return modal ? Number(modal[0]) : 0;
+}
+
 async function extractEmbeddedTextRows(file: File): Promise<{ rows: string[][]; pageCount: number; charCount: number }> {
   const buf = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
-  const allRows: string[][] = [];
+  const allItemsByPage: PdfTextItem[][] = [];
   let charCount = 0;
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
     const content = await page.getTextContent();
-
-    // Group text items by y-coordinate (±10 px tolerance — wider handles slight misalignment)
-    const byY = new Map<number, { str: string; x: number }[]>();
+    const items: PdfTextItem[] = [];
     for (const rawItem of content.items) {
       const item = rawItem as any;
       if (!item.str?.trim()) continue;
       charCount += String(item.str).length;
-      const y = Math.round(item.transform[5]);
-      const x = item.transform[4];
-      let bucket = -1;
-      for (const k of byY.keys()) {
-        if (Math.abs(k - y) < 10) { bucket = k; break; }
-      }
-      if (bucket === -1) { bucket = y; byY.set(y, []); }
-      byY.get(bucket)!.push({ str: item.str, x });
+      const str = String(item.str).trim();
+      const x = Number(item.transform?.[4] ?? 0);
+      const y = Number(item.transform?.[5] ?? 0);
+      const w = Math.max(str.length * 4, Number(item.width) || 0);
+      items.push({ str, x, y, w });
     }
+    allItemsByPage.push(items);
+  }
 
-    // Sort rows top→bottom (descending y in PDF coords), items left→right
-    const sortedYs = [...byY.keys()].sort((a, b) => b - a);
-    for (const y of sortedYs) {
-      // Merge fragments that are very close on X axis (within 4px) into single cell
-      const sorted = byY.get(y)!.sort((a, b) => a.x - b.x);
+  // Build rows with Y clustering, then snap cells to shared column centers.
+  const physicalRows: PdfTextItem[][] = [];
+  for (const pageItems of allItemsByPage) {
+    physicalRows.push(...clusterYRows(pageItems, 12));
+  }
+
+  const dominantLen = Math.max(3, estimateDominantColCount(physicalRows));
+  const centers = inferColumnCenters(
+    physicalRows.filter((r) => r.length >= Math.max(2, dominantLen - 2)),
+    dominantLen,
+  );
+
+  const allRows: string[][] = [];
+  if (centers.length >= 2) {
+    for (const row of physicalRows) {
+      if (!row.length) continue;
+      const cells = assignItemsToColumns(row, centers);
+      // Keep row if it has any content
+      if (cells.some(Boolean)) allRows.push(cells);
+    }
+  } else {
+    // Fallback: gap-based merge without column snapping
+    for (const row of physicalRows) {
       const merged: { str: string; x: number }[] = [];
-      for (const item of sorted) {
+      for (const item of row) {
         const prev = merged[merged.length - 1];
-        if (prev && item.x - (prev.x + prev.str.length * 4) < 4) {
+        if (prev && item.x - (prev.x + prev.str.length * 4) < 6) {
           prev.str += item.str;
         } else {
-          merged.push({ ...item });
+          merged.push({ str: item.str, x: item.x });
         }
       }
-      const row = merged.map(c => c.str.trim()).filter(Boolean);
-      if (row.length > 0) allRows.push(row);
+      const cells = merged.map((c) => c.str.trim()).filter(Boolean);
+      if (cells.length) allRows.push(cells);
     }
   }
+
   return { rows: allRows, pageCount: pdf.numPages, charCount };
 }
 
@@ -202,7 +354,7 @@ function textToTableRows(text: string): string[][] {
   const lines = text
     .split(/\r?\n/)
     .map((l) => l.replace(/\u00A0/g, ' ').trim())
-    .filter((l) => l.length >= 4);
+    .filter((l) => l.length >= 2);
 
   const rows: string[][] = [];
   for (const line of lines) {
@@ -261,38 +413,61 @@ async function extractRowsViaOcr(
   return { rows: textToTableRows(ocrText), pageCount: pdf.numPages };
 }
 
+/**
+ * Keep every recoverable invoice-looking row. Short/long rows are aligned to the
+ * dominant column count instead of being dropped (that was cutting 31 → 25).
+ */
 function findDominantTable(rows: string[][]): { dominantLen: number; dataRows: string[][]; skipped: number } | null {
   const freq: Record<number, number> = {};
   for (const r of rows) {
-    if (r.length >= 3) freq[r.length] = (freq[r.length] || 0) + 1;
-    else if (r.length === 2) freq[2] = (freq[2] || 0) + 1; // OCR often collapses columns
+    const n = r.filter(Boolean).length;
+    if (n >= 3) freq[r.length] = (freq[r.length] || 0) + 1;
+    else if (n === 2) freq[Math.max(2, r.length)] = (freq[Math.max(2, r.length)] || 0) + 1;
   }
   const modalEntry = Object.entries(freq).sort((a, b) => Number(b[1]) - Number(a[1]))[0];
   if (!modalEntry) return null;
 
   const dominantLen = Number(modalEntry[0]);
-  const minLen = dominantLen >= 3 ? dominantLen - 1 : 2;
-  const dataRows = rows
-    .filter((r) => r.length >= minLen && r.length <= dominantLen + 1)
-    .map((r) => {
-      let next = [...r];
-      while (next.length < dominantLen) next.push('');
-      return next.slice(0, dominantLen);
-    });
+  const dataRows: string[][] = [];
+  let skipped = 0;
+
+  for (const r of rows) {
+    const nonEmpty = r.filter(Boolean);
+    if (!nonEmpty.length) {
+      skipped++;
+      continue;
+    }
+    // Pure title / total lines without amounts — skip only when clearly not an invoice
+    if (nonEmpty.length <= 2 && !nonEmpty.some(isAmountLike) && !looksLikeInvoiceDataRow(r)) {
+      skipped++;
+      continue;
+    }
+    if (!looksLikeInvoiceDataRow(r) && r.length < Math.max(2, dominantLen - 3)) {
+      skipped++;
+      continue;
+    }
+    dataRows.push(alignRowToWidth(r, dominantLen));
+  }
+
   if (dataRows.length === 0) return null;
-  return { dominantLen, dataRows, skipped: rows.length - dataRows.length };
+  return { dominantLen, dataRows, skipped };
 }
 
 async function extractRows(
   file: File,
   onProgress?: (msg: string) => void,
-): Promise<{ rows: string[][]; pageCount: number; usedOcr: boolean }> {
+): Promise<{ rows: string[][]; pageCount: number; usedOcr: boolean; skipped: number }> {
   onProgress?.('Reading PDF text…');
   const embedded = await extractEmbeddedTextRows(file);
   let table = findDominantTable(embedded.rows);
   // Scanned PDFs usually have almost no embedded text / no ≥3-column rows
   if (table && embedded.charCount >= 40) {
-    return { rows: table.dataRows, pageCount: embedded.pageCount, usedOcr: false };
+    return {
+      rows: table.dataRows,
+      pageCount: embedded.pageCount,
+      usedOcr: false,
+      skipped: table.skipped,
+    };
   }
 
   onProgress?.('No selectable text table found — running OCR…');
@@ -305,7 +480,12 @@ async function extractRows(
         'Try a clearer scan, or export the purchases as a text PDF / Excel and import again.',
     );
   }
-  return { rows: table.dataRows, pageCount: ocr.pageCount, usedOcr: true };
+  return {
+    rows: table.dataRows,
+    pageCount: ocr.pageCount,
+    usedOcr: true,
+    skipped: table.skipped,
+  };
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────
@@ -489,10 +669,8 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
       // ── Fast OCR / text table (default) — no Ollama ───────────────
       if (importMode === 'fast') {
         setParseStatus('Fast OCR / table parse…');
-        const { rows, usedOcr } = await extractRows(file, setParseStatus);
-        setAllRows(rows);
-        const table = findDominantTable(rows);
-        if (!table) {
+        const { rows, usedOcr, skipped } = await extractRows(file, setParseStatus);
+        if (!rows.length) {
           setParseError(
             'Could not detect invoice rows with Fast OCR' +
               (usedOcr ? '' : '') +
@@ -500,7 +678,8 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
           );
           return;
         }
-        applyTableToMapState(table.dataRows, table.dominantLen, table.skipped, mapSetters);
+        // rows already aligned by findDominantTable — do not filter again
+        applyTableToMapState(rows, rows[0]?.length || 0, skipped, mapSetters);
         return;
       }
 
@@ -541,9 +720,8 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
 
       setAiNotes(ai.notes || '');
       setParseStatus('AI found no invoices — falling back to Fast OCR…');
-      const { rows, usedOcr } = await extractRows(file, setParseStatus);
-      const table = findDominantTable(rows);
-      if (!table) {
+      const { rows, usedOcr, skipped } = await extractRows(file, setParseStatus);
+      if (!rows.length) {
         setParseError(
           'Could not detect invoices' +
             (usedOcr ? ' after OCR' : '') +
@@ -551,7 +729,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
         );
         return;
       }
-      applyTableToMapState(table.dataRows, table.dominantLen, table.skipped, mapSetters);
+      applyTableToMapState(rows, rows[0]?.length || 0, skipped, mapSetters);
     } catch (e: any) {
       setParseError(e?.message || 'Failed to parse PDF.');
     } finally {
@@ -568,29 +746,28 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
 
   // ── Build preview from mapping ──────────────────────────────────────
   const handleBuildPreview = useCallback(() => {
-    const dataRows = allRows
-      .filter(r => r.length >= colCount - 1 && r.length <= colCount + 1)
-      .map(r => { const p = [...r]; while (p.length < colCount) p.push(''); return p.slice(0, colCount); });
     const start = headerRowIndex >= 0 ? headerRowIndex + 1 : 0;
-    const rows  = dataRows.slice(start);
+    const candidateRows = allRows.slice(start);
 
-    // Rows excluded by column-count mismatch (completely different structure)
-    const structureMismatch = allRows
-      .filter(r => r.length < colCount - 1 || r.length > colCount + 1)
-      .map(r => ({ cells: r, reason: `${r.length} cells (expected ~${colCount})` }));
+    const SKIP_PATTERNS = TOTAL_ROW_RE;
+    const excluded: ExcludedRow[] = [];
+    const filtered: string[][] = [];
 
-    // Skip rows that look like totals/page breaks
-    const SKIP_PATTERNS = /(^total|^sub.?total|^grand|^sum|^balance|^page|^cont)/i;
-    const excluded: ExcludedRow[] = [...structureMismatch];
-    const filtered = rows.filter(r => {
-      const nonEmpty = r.filter(Boolean);
-      if (nonEmpty.length === 0) return false;
+    for (const r of candidateRows) {
+      const aligned = alignRowToWidth(r, colCount);
+      const nonEmpty = aligned.filter(Boolean);
+      if (nonEmpty.length === 0) continue;
       if (nonEmpty.length === 1 && SKIP_PATTERNS.test(nonEmpty[0])) {
         excluded.push({ cells: r, reason: 'Looks like a total / page-break row' });
-        return false;
+        continue;
       }
-      return true;
-    });
+      // Keep every recoverable row — align short/long rows instead of dropping them
+      if (!looksLikeInvoiceDataRow(aligned) && nonEmpty.length < 2) {
+        excluded.push({ cells: r, reason: 'Too few fields to be an invoice row' });
+        continue;
+      }
+      filtered.push(aligned);
+    }
 
     setExcludedRows(excluded);
     setShowExcluded(false);
@@ -609,6 +786,7 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
 
   // ── Import ──────────────────────────────────────────────────────────
   const handleImport = useCallback(async () => {
+    if (importing) return;
     const toImport = invoices.filter(inv => inv.selected && inv.valid);
     setImporting(true);
     let count = 0;
@@ -650,9 +828,9 @@ const PdfPurchaseImport: React.FC<Props> = ({ onClose, onImported, buildings }) 
   }, [invoices, defaultCategory, onImported, sourceFileName]);
 
   // ── Derived values ──────────────────────────────────────────────────
-  const dataRows      = allRows.filter(r => r.length >= colCount - 1 && r.length <= colCount + 1);
+  const dataRows      = allRows.map((r) => alignRowToWidth(r, colCount || r.length));
   const headerRow     = headerRowIndex >= 0 ? dataRows[headerRowIndex] : null;
-  const totalDataRows = dataRows.length - (headerRowIndex >= 0 ? 1 : 0);
+  const totalDataRows = Math.max(0, dataRows.length - (headerRowIndex >= 0 ? 1 : 0));
   const selectedInvs  = invoices.filter(i => i.selected);
   const selectedCount = selectedInvs.length;
   const sumExcl  = selectedInvs.reduce((s, i) => s + i.amountExcl, 0);

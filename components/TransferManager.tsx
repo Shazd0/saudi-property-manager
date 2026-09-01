@@ -2,7 +2,7 @@ import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { createPortal } from 'react-dom';
 import { User, Building, UserRole, Transaction, TransactionType, ExpenseCategory } from '../types';
 import { getBuildings, getTransfers, saveTransfer, getBanks, deleteTransfer, getTransactions, getUsersAcrossBooks, saveTransaction, saveTransactionInBook, getDataFromBook } from '../services/firestoreService';
-import { ArrowRightLeft, Building2, Landmark, TrendingDown, TrendingUp, Plus, Download, Upload, Calendar, Trash2, Check, X, RotateCcw, Wallet, UserCircle, Pencil, Shuffle, FileText, Sparkles, ChevronDown, Eye } from 'lucide-react';
+import { ArrowRightLeft, Building2, Landmark, TrendingDown, TrendingUp, Plus, Download, Upload, Calendar, Trash2, Check, X, RotateCcw, Wallet, UserCircle, Pencil, Shuffle, FileText, Sparkles, ChevronDown, Eye, RefreshCw } from 'lucide-react';
 import { Bank } from '../types';
 import { useToast } from './Toast';
 import ConfirmDialog from './ConfirmDialog';
@@ -11,6 +11,8 @@ import { fmtDate, fmtDateTime } from '../utils/dateFormat';
 import { useLanguage } from '../i18n';
 import { useBook } from '../contexts/BookContext';
 import SearchableSelect from './SearchableSelect';
+import LoadingOverlay from './LoadingOverlay';
+import { SkeletonTableRows } from './LoadingSkeleton';
 import * as XLSX from 'xlsx';
 
 // Building enriched with the book it belongs to. For the active book the `id`
@@ -130,6 +132,10 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   // Bulk import (CSV/XLSX)
   const [showImportModal, setShowImportModal] = useState(false);
   const [importBusy, setImportBusy] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+  const [actionProcessingId, setActionProcessingId] = useState<string | null>(null);
+  const [savingOpeningBal, setSavingOpeningBal] = useState(false);
+  const [listLoading, setListLoading] = useState(true);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Edit transfer state
@@ -573,7 +579,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
             }
             ok++;
           }
-          await loadData();
+          refreshAfterMutation();
           const parts = [`Converted ${ok} transaction(s) into Treasury transfers.`];
           if (skippedNoOwner) parts.push(`Skipped ${skippedNoOwner} (no owner).`);
           if (skippedNoBuilding) parts.push(`Skipped ${skippedNoBuilding} (no building on file).`);
@@ -642,7 +648,9 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [books.length, activeBookId, includeOtherBooksInTreasury]);
 
-  const loadData = async () => {
+  const loadData = async (opts?: { silent?: boolean }) => {
+    if (!opts?.silent) setListLoading(true);
+    try {
     const canCrossBookTreasury =
       currentUser.role === UserRole.ADMIN ||
       currentUser.role === 'HEAD' ||
@@ -786,7 +794,12 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
         String((t as any)._bookId || activeBookId) === String(activeBookId),
     );
     setHeadOfficeExpenses(hoExpenses);
+    } finally {
+    if (!opts?.silent) setListLoading(false);
+    }
   };
+
+  const refreshAfterMutation = () => { void loadData({ silent: true }); };
 
   const resetForm = () => {
     setDate(new Date().toISOString().split('T')[0]);
@@ -805,6 +818,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (submitting) return;
     SoundService.play('submit');
     if (!amount || parseFloat(amount) <= 0) {
       showError('Please enter a valid amount');
@@ -853,12 +867,16 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       isOfficeOpeningBalance: isOfficeOpeningBalance || undefined
     };
 
-    await saveTransfer(transfer);
-    
-    await loadData();
-    showSuccess('Transfer saved. Added to Amlak Sheets as posted.');
-    setView('LIST');
-    resetForm();
+    setSubmitting(true);
+    try {
+      await saveTransfer(transfer);
+      showSuccess('Transfer saved. Added to Amlak Sheets as posted.');
+      setView('LIST');
+      resetForm();
+      refreshAfterMutation();
+    } finally {
+      setSubmitting(false);
+    }
   };
 
   // Resolve a stored id against the multi-book building list.
@@ -984,18 +1002,19 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   const handleDelete = async (id: string) => {
     openConfirm('Move transfer to trash?', async () => {
       const transfer = transfers.find(t => t.id === id);
-      if (transfer) {
-        const updated = { ...transfer, deleted: true, deletedAt: Date.now() } as any;
+      if (!transfer) { closeConfirm(); return; }
+      closeConfirm();
+      const updated = { ...transfer, deleted: true, deletedAt: Date.now() } as any;
+      const txIds = collectLinkedTxIds(transfer);
+      try {
         await saveTransfer(updated);
-        // Soft-delete ALL linked transactions (inter-building transfers have two)
-        const txIds = collectLinkedTxIds(transfer);
         for (const txId of txIds) {
           const linkedTx = allTransactions.find((t: any) => t.id === txId);
           if (linkedTx) {
             await saveTransaction({ ...linkedTx, deleted: true, deletedAt: new Date().toISOString(), deletedBy: 'SYSTEM_TRANSFER_DELETE' } as any);
           }
         }
-        await loadData();
+        refreshAfterMutation();
         showToast('Transfer moved to trash.', 'info', 6000, 'Undo', async () => {
           await saveTransfer({ ...updated, deleted: false, deletedAt: undefined } as any);
           for (const txId of txIds) {
@@ -1005,17 +1024,22 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
             }
           }
           showSuccess('Transfer restored.');
-          await loadData();
+          refreshAfterMutation();
         });
+      } catch (e) {
+        console.error('Transfer delete failed', e);
+        showError('Failed to move transfer to trash.');
+        refreshAfterMutation();
       }
-      closeConfirm();
     });
   };
 
   const handleRestore = async (id: string) => {
     openConfirm('Restore this transfer?', async () => {
       const transfer = transfers.find(t => t.id === id);
-      if (transfer) {
+      if (!transfer) { closeConfirm(); return; }
+      closeConfirm();
+      try {
         const updated = { ...transfer, deleted: false, deletedAt: undefined } as any;
         await saveTransfer(updated);
         const txIds = collectLinkedTxIds(transfer);
@@ -1025,17 +1049,26 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
             await saveTransaction({ ...linkedTx, deleted: false, deletedAt: undefined, deletedBy: undefined } as any);
           }
         }
-        await loadData();
+        refreshAfterMutation();
+      } catch (e) {
+        console.error('Transfer restore failed', e);
+        showError('Failed to restore transfer.');
+        refreshAfterMutation();
       }
-      closeConfirm();
     });
   };
 
   const handlePermanentDelete = async (id: string) => {
     openConfirm('PERMANENTLY delete transfer? This cannot be undone!', async () => {
-      await deleteTransfer(id);
-      await loadData();
       closeConfirm();
+      try {
+        await deleteTransfer(id);
+        refreshAfterMutation();
+      } catch (e) {
+        console.error('Transfer permanent delete failed', e);
+        showError('Failed to delete transfer.');
+        refreshAfterMutation();
+      }
     }, { danger: true, title: 'Delete Transfer' });
   };
 
@@ -1043,20 +1076,25 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     const deleted = transfers.filter(t => (t as any).deleted);
     if (deleted.length === 0) return;
     openConfirm(`Restore all ${deleted.length} trashed transfers?`, async () => {
-      await Promise.all(deleted.map(async t => {
-        await saveTransfer({ ...t, deleted: false, deletedAt: undefined } as any);
-        // Also restore ALL linked transactions (includes inter-building dest tx)
-        const txIds = collectLinkedTxIds(t);
-        for (const txId of txIds) {
-          const linkedTx = allTransactions.find((tx: any) => tx.id === txId);
-          if (linkedTx) {
-            await saveTransaction({ ...linkedTx, deleted: false, deletedAt: undefined, deletedBy: undefined } as any);
-          }
-        }
-      }));
-      showSuccess('All trashed transfers restored.');
-      await loadData();
       closeConfirm();
+      try {
+        await Promise.all(deleted.map(async t => {
+          await saveTransfer({ ...t, deleted: false, deletedAt: undefined } as any);
+          const txIds = collectLinkedTxIds(t);
+          for (const txId of txIds) {
+            const linkedTx = allTransactions.find((tx: any) => tx.id === txId);
+            if (linkedTx) {
+              await saveTransaction({ ...linkedTx, deleted: false, deletedAt: undefined, deletedBy: undefined } as any);
+            }
+          }
+        }));
+        showSuccess('All trashed transfers restored.');
+        refreshAfterMutation();
+      } catch (e) {
+        console.error('Restore all transfers failed', e);
+        showError('Failed to restore all transfers.');
+        refreshAfterMutation();
+      }
     });
   };
 
@@ -1064,10 +1102,16 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     const deleted = transfers.filter(t => (t as any).deleted && !t.isOfficeOpeningBalance);
     if (deleted.length === 0) return;
     openConfirm(`PERMANENTLY delete all ${deleted.length} trashed transfers? This cannot be undone!`, async () => {
-      await Promise.all(deleted.map(tx => deleteTransfer(tx.id)));
-      showSuccess('All trashed transfers permanently deleted.');
-      await loadData();
       closeConfirm();
+      try {
+        await Promise.all(deleted.map(tx => deleteTransfer(tx.id)));
+        showSuccess('All trashed transfers permanently deleted.');
+        refreshAfterMutation();
+      } catch (e) {
+        console.error('Delete all transfers failed', e);
+        showError('Failed to delete all transfers.');
+        refreshAfterMutation();
+      }
     }, { danger: true, title: 'Delete All Transfers' });
   };
 
@@ -1165,19 +1209,31 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       await saveTransfer(updated);
       showSuccess('Transfer updated successfully. Added to Amlak Sheets as posted.');
       setShowEditTransferModal(false);
-      await loadData();
       closeConfirm();
+      refreshAfterMutation();
     }, { title: 'Confirm Edit Changes' });
   };
 
   const handleApprove = async (transfer: Transfer) => {
-    await saveTransfer({ ...transfer, status: 'COMPLETED' });
-    await loadData();
+    if (actionProcessingId) return;
+    setActionProcessingId(transfer.id);
+    try {
+      await saveTransfer({ ...transfer, status: 'COMPLETED' });
+      refreshAfterMutation();
+    } finally {
+      setActionProcessingId(null);
+    }
   };
 
   const handleReject = async (transfer: Transfer) => {
-    await saveTransfer({ ...transfer, status: 'CANCELLED' });
-    await loadData();
+    if (actionProcessingId) return;
+    setActionProcessingId(transfer.id);
+    try {
+      await saveTransfer({ ...transfer, status: 'CANCELLED' });
+      refreshAfterMutation();
+    } finally {
+      setActionProcessingId(null);
+    }
   };
 
   // Get staff's assigned buildings
@@ -1216,7 +1272,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     // CUSTOM: keep current values
   };
 
-  const filteredTransfers = transfers.filter(t => {
+  const filteredTransfers = useMemo(() => transfers.filter(t => {
     // First filter by deleted status
     if (showDeleted ? !(t as any).deleted : (t as any).deleted) return false;
     if (filterStatus !== 'ALL' && t.status !== filterStatus) return false;
@@ -1246,7 +1302,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
     }
     
     return true;
-  });
+  }), [transfers, showDeleted, filterStatus, filterFromDate, filterToDate, filterFromType, filterToType, filterBuildingIds, filterAccount, isStaff, userBuildingIds]);
 
   // Get office opening balance (sum of all opening balance entries)
   const officeOpeningBalance = transfers.filter(t => t.isOfficeOpeningBalance && !(t as any).deleted).reduce((s, t) => s + t.amount, 0);
@@ -1271,6 +1327,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
   const interBuildingTotal = interBuildingTransfers.reduce((s, t) => s + t.amount, 0);
 
   const handleSaveOpeningBalance = async () => {
+    if (savingOpeningBal) return;
     const newAmount = parseFloat(openingBalInput);
     if (isNaN(newAmount)) { showError('Enter a valid amount'); return; }
     const existing = transfers.find(t => t.isOfficeOpeningBalance && !(t as any).deleted);
@@ -1288,10 +1345,15 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       createdAt: existing?.createdAt || Date.now(),
       isOfficeOpeningBalance: true,
     };
-    await saveTransfer(entry);
-    await loadData();
-    setEditingOpeningBal(false);
-    showSuccess('Opening balance updated. Added to Amlak Sheets as posted.');
+    setSavingOpeningBal(true);
+    try {
+      await saveTransfer(entry);
+      refreshAfterMutation();
+      setEditingOpeningBal(false);
+      showSuccess('Opening balance updated. Added to Amlak Sheets as posted.');
+    } finally {
+      setSavingOpeningBal(false);
+    }
   };
 
   // Convert HEAD_OFFICE expenses to pseudo-transfer format for display
@@ -1856,7 +1918,8 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
       </div>
 
       {view === 'FORM' || isStaff ? (
-        <form onSubmit={handleSubmit} className="ios-card premium-card p-5 sm:p-6 space-y-6">
+        <form onSubmit={handleSubmit} className="ios-card premium-card p-5 sm:p-6 space-y-6 relative">
+          <LoadingOverlay visible={submitting} inline message={t('common.saving')} />
           <div className="flex justify-between items-start gap-3 pb-4 border-b border-slate-100">
             <div>
               <h2 className="text-xl font-bold text-slate-900">New Money Transfer</h2>
@@ -2196,9 +2259,10 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
           )}
 
           <div className="pt-6 border-t border-slate-100 flex justify-end gap-3">
-            <button type="button" onClick={() => setView('LIST')} className="px-6 py-3 rounded-xl font-bold text-slate-500 hover:bg-slate-50">{t('common.cancel')}</button>
-            <button type="submit" className="pm-btn pm-btn-primary flex items-center gap-2">
-              <ArrowRightLeft size={18} /> {isOfficeOpeningBalance ? 'Record Balance' : 'Record Transfer'}
+            <button type="button" onClick={() => setView('LIST')} disabled={submitting} className="px-6 py-3 rounded-xl font-bold text-slate-500 hover:bg-slate-50 disabled:opacity-60">{t('common.cancel')}</button>
+            <button type="submit" disabled={submitting} className="pm-btn pm-btn-primary flex items-center gap-2 disabled:opacity-60">
+              {submitting ? <RefreshCw size={18} className="animate-spin" /> : <ArrowRightLeft size={18} />}
+              {submitting ? t('common.saving') : (isOfficeOpeningBalance ? 'Record Balance' : 'Record Transfer')}
             </button>
           </div>
         </form>
@@ -2573,7 +2637,9 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
 
             {/* Mobile Cards */}
             <div className="md:hidden space-y-3">
-              {combinedEntries.map(tx => (
+              {listLoading ? (
+                <SkeletonTableRows count={6} columns={3} />
+              ) : combinedEntries.map(tx => (
                 <div
                   key={tx.id}
                   onClick={() => setDetailEntry(tx)}
@@ -2621,7 +2687,7 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
 	                      {tx.isOfficeOpeningBalance && editingOpeningBal ? (
 	                        <div className="flex items-center gap-1" onClick={(e) => e.stopPropagation()}>
 	                          <input type="number" value={openingBalInput} onChange={e => setOpeningBalInput(e.target.value)} className="w-24 px-2 py-1 border rounded-lg text-sm font-bold text-amber-700" autoFocus />
-	                          <button onClick={handleSaveOpeningBalance} className="p-1 bg-emerald-500 text-white rounded-lg"><Check size={14} /></button>
+	                          <button onClick={handleSaveOpeningBalance} disabled={savingOpeningBal} className="p-1 bg-emerald-500 text-white rounded-lg disabled:opacity-60"><Check size={14} /></button>
 	                          <button onClick={() => setEditingOpeningBal(false)} className="p-1 bg-slate-200 text-slate-600 rounded-lg"><X size={14} /></button>
                         </div>
                       ) : (
@@ -2650,8 +2716,8 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
 	                        </button>
 	                        {isAdminOrHead && tx.status === 'PENDING' && (
 	                          <>
-	                            <button onClick={() => handleApprove(tx as any)} className="p-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-[11px] font-bold">{t('approval.approve')}</button>
-	                            <button onClick={() => handleReject(tx as any)} className="p-1.5 bg-rose-50 text-rose-600 rounded-lg text-[11px] font-bold">{t('approval.reject')}</button>
+                            <button onClick={() => handleApprove(tx as any)} disabled={!!actionProcessingId} className="p-1.5 bg-emerald-50 text-emerald-600 rounded-lg text-[11px] font-bold disabled:opacity-60">{t('approval.approve')}</button>
+                            <button onClick={() => handleReject(tx as any)} disabled={!!actionProcessingId} className="p-1.5 bg-rose-50 text-rose-600 rounded-lg text-[11px] font-bold disabled:opacity-60">{t('approval.reject')}</button>
 	                          </>
 	                        )}
 	                        {isAdmin && !tx.isOfficeOpeningBalance && (
@@ -2688,7 +2754,9 @@ const TransferManager: React.FC<TransferManagerProps> = ({ currentUser }) => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {combinedEntries.map(tx => (
+                  {listLoading ? (
+                    <tr><td colSpan={7} className="p-4"><SkeletonTableRows count={8} columns={6} /></td></tr>
+                  ) : combinedEntries.map(tx => (
                     <tr
                       key={tx.id}
                       onClick={() => setDetailEntry(tx)}

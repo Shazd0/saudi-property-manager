@@ -112,6 +112,7 @@ const EjarIntegration: React.FC = () => {
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [buildings, setBuildings] = useState<Building[]>([]);
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   // ── UI State ──
   const [search, setSearch] = useState('');
@@ -288,6 +289,7 @@ const EjarIntegration: React.FC = () => {
   // ── Save / Edit / Delete ──
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.tenantName.trim()) { showError('Tenant name is required'); return; }
 
@@ -312,6 +314,7 @@ const EjarIntegration: React.FC = () => {
     // Auto-derive status unless user picked Terminated manually
     next.status = formData.status === 'Terminated' ? 'Terminated' : deriveStatus(next);
 
+    setSaving(true);
     try {
       await saveEjarContract(next);
       showSuccess(editId ? 'Ejar record updated' : 'Ejar registration created');
@@ -321,6 +324,8 @@ const EjarIntegration: React.FC = () => {
       load();
     } catch (err: any) {
       showError(err?.message || 'Failed to save Ejar record');
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -1050,7 +1055,7 @@ const EjarIntegration: React.FC = () => {
 
             <div className="flex gap-2 justify-end pt-2 border-t border-slate-100">
               <button type="button" onClick={() => setIsFormOpen(false)} className="px-4 py-2 border border-slate-200 rounded-xl text-sm font-semibold text-slate-600 hover:bg-slate-50">{t('common.cancel')}</button>
-              <button type="submit" className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-700 shadow-sm shadow-emerald-200">{t('common.save')}</button>
+              <button type="submit" disabled={saving} className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm font-bold hover:bg-emerald-700 shadow-sm shadow-emerald-200 disabled:opacity-60">{saving ? t('common.saving') : t('common.save')}</button>
             </div>
           </form>
         </Modal>

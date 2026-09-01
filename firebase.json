@@ -1,4 +1,19 @@
 {
+  "auth": {
+    "authorizedDomains": [
+      "localhost",
+      "amlak-app.com",
+      "www.amlak-app.com",
+      "saudi-property-manager.firebaseapp.com",
+      "saudi-property-manager.web.app"
+    ],
+    "providers": {
+      "googleSignIn": {
+        "oAuthBrandDisplayName": "Amlak",
+        "supportEmail": "amlakrealestateofficial@gmail.com"
+      }
+    }
+  },
   "functions": [
     {
       "source": "functions",

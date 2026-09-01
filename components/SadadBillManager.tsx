@@ -67,6 +67,7 @@ const SadadBillManager: React.FC = () => {
   const [confirmAction, setConfirmAction] = useState<(() => void) | null>(null);
   const [confirmMsg, setConfirmMsg] = useState('');
   const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
 
   const load = async () => {
     setLoading(true);
@@ -84,6 +85,7 @@ const SadadBillManager: React.FC = () => {
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (saving) return;
     SoundService.play('submit');
     if (!formData.customerName || !formData.amount) { showError('Customer and amount are required'); return; }
     const vatAmt = Number(formData.amount) * 0.15;
@@ -97,6 +99,7 @@ const SadadBillManager: React.FC = () => {
       createdAt: formData.createdAt || Date.now(),
       createdBy: formData.createdBy || 'system',
     };
+    setSaving(true);
     try {
       await saveSadadBill(bill);
       showSuccess(editId ? 'Bill updated' : 'SADAD bill created');
@@ -105,6 +108,7 @@ const SadadBillManager: React.FC = () => {
       setFormData({ ...emptyBill });
       load();
     } catch (err: any) { showError(err.message || 'Failed to save bill'); }
+    finally { setSaving(false); }
   };
 
   const handleEdit = (b: SadadBill) => {
@@ -339,7 +343,7 @@ const SadadBillManager: React.FC = () => {
               </div>
               <div className="flex gap-2 justify-end">
                 <button type="button" onClick={() => setIsFormOpen(false)} className="px-4 py-2 border rounded-xl text-sm">{t('common.cancel')}</button>
-                <button type="submit" className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700">Save Bill</button>
+                <button type="submit" disabled={saving} className="px-4 py-2 bg-emerald-600 text-white rounded-xl text-sm hover:bg-emerald-700 disabled:opacity-60">{saving ? 'Saving...' : 'Save Bill'}</button>
               </div>
             </form>
           </div>

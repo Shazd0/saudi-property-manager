@@ -1,4 +1,6 @@
 import type { VoiceCallSession } from './voiceCallService';
+import { resolveMacRestApiBase, resolveMacWsApiBase } from '../utils/macApiBase';
+import { isMacApiPollingAllowed, reportMacApiFailure, reportMacApiSuccess } from '../utils/macApiHealth';
 
 type SignalingMessage =
   | { type: 'connected'; userId: string }
@@ -9,38 +11,14 @@ type SignalingMessage =
 
 type MessageHandler = (msg: SignalingMessage) => void;
 
-const MAC_API_URL = (import.meta as any).env?.VITE_MAC_API_URL || 'http://mac-mini.local:8787';
 const MAC_API_TOKEN = (import.meta as any).env?.VITE_MAC_API_TOKEN || '';
 
 function resolveApiBase(): string {
-  const raw = String(MAC_API_URL).trim();
-  if (!raw || raw === '/' || raw === './' || raw === 'same-origin') {
-    if (typeof window !== 'undefined') return window.location.origin;
-    return '';
-  }
-  return raw.replace(/\/+$/, '');
+  return resolveMacRestApiBase();
 }
 
 function resolveWsBase(): string {
-  const wsOverride = String((import.meta as any).env?.VITE_MAC_WS_URL || '').trim();
-  if (wsOverride) {
-    return wsOverride.replace(/^http/i, 'ws').replace(/\/+$/, '');
-  }
-
-  const base = resolveApiBase();
-  if (!base) return '';
-
-  // Netlify (and most static hosts) proxy /api for REST but cannot upgrade WebSocket.
-  if (typeof window !== 'undefined' && base === window.location.origin) {
-    const host = window.location.hostname;
-    const isLocal = ['localhost', '127.0.0.1', '::1', '[::1]'].includes(host);
-    if (!isLocal) {
-      const direct = String((import.meta as any).env?.VITE_MAC_PROXY_TARGET || 'https://api.amlak-app.com').trim();
-      if (direct) return direct.replace(/^http/i, 'ws').replace(/\/+$/, '');
-    }
-  }
-
-  return base.replace(/^http/i, 'ws');
+  return resolveMacWsApiBase();
 }
 
 class MacSignalingClient {
@@ -94,19 +72,25 @@ class MacSignalingClient {
 
   async fetchPendingRings(userId: string): Promise<SignalingMessage[]> {
     const base = resolveApiBase();
-    if (!base || this.callsApiUnavailable) return [];
+    if (!base || this.callsApiUnavailable || !isMacApiPollingAllowed()) return [];
     try {
       const res = await fetch(`${base}/api/calls/pending?userId=${encodeURIComponent(userId)}`, {
         headers: MAC_API_TOKEN ? { Authorization: `Bearer ${MAC_API_TOKEN}` } : {},
       });
-      if (res.status === 404 || res.status === 502 || res.status === 503) {
+      if (res.status === 404 || res.status === 502 || res.status === 503 || res.status === 504) {
         this.callsApiUnavailable = true;
+        reportMacApiFailure(res.status);
         return [];
       }
-      if (!res.ok) return [];
+      if (!res.ok) {
+        reportMacApiFailure(res.status);
+        return [];
+      }
+      reportMacApiSuccess();
       const data = await res.json();
       return (data.rings || []) as SignalingMessage[];
     } catch {
+      reportMacApiFailure(0);
       return [];
     }
   }
@@ -124,7 +108,7 @@ class MacSignalingClient {
   }
 
   private openSocket() {
-    if (!this.shouldConnect || !this.userId || this.callsApiUnavailable) return;
+    if (!this.shouldConnect || !this.userId || this.callsApiUnavailable || !isMacApiPollingAllowed()) return;
     const wsBase = resolveWsBase();
     if (!wsBase) return;
 

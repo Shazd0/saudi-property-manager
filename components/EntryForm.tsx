@@ -12,7 +12,7 @@ import {
 import SearchableSelect from './SearchableSelect';
 import { useToast } from './Toast';
 import SoundService from '../services/soundService';
-import { fmtDate, isDateInCurrentMonth, contractDateToYmd } from '../utils/dateFormat';
+import { fmtDate, isDateInCurrentMonth, contractDateToYmd, localDateStr } from '../utils/dateFormat';
 import { getInstallmentRange } from '../utils/installmentSchedule';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
@@ -127,7 +127,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
   const [type, setType] = useState<TransactionType>(TransactionType.INCOME);
   const [showVATModal, setShowVATModal] = useState(false);
   const [vatModalType, setVatModalType] = useState<VATQuickEntryType>('SALES');
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  const [date, setDate] = useState(localDateStr());
   const [buildingId, setBuildingId] = useState('');
     const [unitNumber, setUnitNumber] = useState('');
     const isAdmin = currentUser.role === UserRole.ADMIN;
@@ -180,6 +180,9 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
   const [originalCreatedAt, setOriginalCreatedAt] = useState<number | undefined>(undefined);
   const [originalCreatedBy, setOriginalCreatedBy] = useState<string | undefined>(undefined);
   const [lastModifiedAt, setLastModifiedAt] = useState<number | undefined>(undefined);
+  /** Preserved when admin/staff edits an existing rental payment so save does not drop the contract link. */
+  const [linkedContractId, setLinkedContractId] = useState<string | undefined>(undefined);
+  const editingSourceTxRef = useRef<Transaction | null>(null);
 
     // Property Rent (Leased Building) Installment Tracking
     const [leaseInstallmentInfo, setLeaseInstallmentInfo] = useState<{
@@ -199,6 +202,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
   // Expense category should not default to "General Expense" — user must choose (especially for purchases).
   const [expenseCategory, setExpenseCategory] = useState<string>('');
   const [targetEmployeeId, setTargetEmployeeId] = useState('');
+  const [salaryPeriodInput, setSalaryPeriodInput] = useState('');
+  const [salaryPeriodManual, setSalaryPeriodManual] = useState(false);
   const [isExternalBorrower, setIsExternalBorrower] = useState(false);
   const [externalBorrowerName, setExternalBorrowerName] = useState('');
   const [targetOwnerId, setTargetOwnerId] = useState('');
@@ -254,18 +259,21 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
             isDateInCurrentMonth(transaction.date);
         setStaffOpenedCurrentMonthFullEdit(!!staffEligible);
         setId(transaction.id);
+        editingSourceTxRef.current = transaction;
+        setLinkedContractId(transaction.contractId || undefined);
         setType(transaction.type);
-        setDate(transaction.date);
-        if (transaction.isVATApplicable && transaction.type === TransactionType.INCOME) {
-            const incl = getVatInclusiveEditAmount(transaction);
-            setAmount((incl || 0).toFixed(2));
-        } else if (transaction.isVATApplicable && transaction.type === TransactionType.EXPENSE) {
-            const extras = transaction.extraAmount || 0;
-            const discounts = transaction.discountAmount || 0;
+        const editDate = contractDateToYmd(transaction.date);
+        setDate(editDate || localDateStr());
+        // Stored `amount` / inclusive totals are net of extra & discount. Restore the
+        // Amount field the user originally entered so edit doesn't subtract discount twice.
+        const extras = transaction.extraAmount || 0;
+        const discounts = transaction.discountAmount || 0;
+        if (transaction.isVATApplicable) {
             const origInclusive = Math.max(0, getVatInclusiveEditAmount(transaction) - extras + discounts);
             setAmount(origInclusive.toFixed(2));
         } else {
-            setAmount((transaction.amount || 0).toString());
+            const origAmount = Math.max(0, (Number(transaction.amount) || 0) - extras + discounts);
+            setAmount(String(origAmount));
         }
         setDetails(transaction.details);
         setPaymentMethod(transaction.paymentMethod);
@@ -275,7 +283,9 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
         setVatInvoiceNumber(transaction.vatInvoiceNumber || '');
         if (transaction.bankName) setBankName(transaction.bankName);
         if (transaction.chequeNo) setChequeNo(transaction.chequeNo);
-        if (transaction.chequeDueDate) setChequeDueDate(transaction.chequeDueDate);
+        if (transaction.chequeDueDate) {
+            setChequeDueDate(contractDateToYmd(transaction.chequeDueDate) || String(transaction.chequeDueDate).slice(0, 10));
+        }
         if (transaction.createdAt) setOriginalCreatedAt(transaction.createdAt);
         if (transaction.createdBy) setOriginalCreatedBy(transaction.createdBy);
         if (transaction.borrowingType) setBorrowingType(transaction.borrowingType as 'BORROW' | 'REPAYMENT');
@@ -298,6 +308,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
             }
             if (transaction.buildingId) setBuildingId(transaction.buildingId);
             if (transaction.unitNumber) setUnitNumber(transaction.unitNumber);
+            setSalaryPeriodManual(false);
+            setSalaryPeriodInput('');
         } else {
             if (transaction.buildingId) setBuildingId(transaction.buildingId);
             if (transaction.expenseCategory) setExpenseCategory(transaction.expenseCategory);
@@ -305,11 +317,17 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                 setBonus(String((transaction as any).bonusAmount || 0));
                 setDeduction(String((transaction as any).deductionAmount || 0));
                 setBorrowDeduction(String((transaction as any).borrowDeductionAmount || 0));
-                const txPeriod = (transaction as any).salaryPeriod || getPeriodFromDate(transaction.date || '');
-                if (txPeriod) {
+                const storedPeriod = String((transaction as any).salaryPeriod || '').trim();
+                const txPeriod = /^\d{4}-\d{2}$/.test(storedPeriod)
+                    ? storedPeriod
+                    : (contractDateToYmd(storedPeriod) || editDate).slice(0, 7);
+                if (/^\d{4}-\d{2}$/.test(txPeriod)) {
                     setSalaryPeriodInput(txPeriod);
                     setSalaryPeriodManual(true);
                 }
+            } else {
+                setSalaryPeriodManual(false);
+                setSalaryPeriodInput('');
             }
         }
     }, [currentUser.role]);
@@ -351,7 +369,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
 
     const resetForm = useCallback(() => {
         setId(null);
-        setDate(new Date().toISOString().split('T')[0]);
+        setDate(localDateStr());
         setBuildingId('');
         setUnitNumber('');
         setAmount('');
@@ -367,6 +385,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
         setActiveContract(undefined);
         setSmartInstallmentMsg('');
         setTargetEmployeeId('');
+        setSalaryPeriodManual(false);
+        setSalaryPeriodInput('');
         setTargetOwnerId('');
         setTargetVendorId('');
         setSelectedServiceAgreementId('');
@@ -385,6 +405,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
         setOriginalCreatedAt(undefined);
         setOriginalCreatedBy(undefined);
         setLastModifiedAt(undefined);
+        setLinkedContractId(undefined);
+        editingSourceTxRef.current = null;
     }, []);
 
     // Auto-clear form when switching between Income / Expense
@@ -407,15 +429,16 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
 
     const getPeriodFromDate = (dateStr: string) => {
         if (!dateStr) return '';
-        const d = new Date(dateStr);
-        if (isNaN(d.getTime())) return '';
-        return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        const ymd = contractDateToYmd(dateStr);
+        return ymd ? ymd.slice(0, 7) : '';
     };
 
     const getPrevMonthPeriod = (dateStr: string) => {
-        const d = new Date(dateStr);
-        if (isNaN(d.getTime())) return '';
-        d.setMonth(d.getMonth() - 1);
+        const ymd = contractDateToYmd(dateStr);
+        if (!ymd) return '';
+        const [y, m] = ymd.split('-').map(n => parseInt(n, 10));
+        if (!y || !m) return '';
+        const d = new Date(y, m - 2, 1);
         return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
     };
 
@@ -487,24 +510,18 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
         // If last period still has a remaining balance, stay on it
         if (!isLastPeriodFullyPaid) return lastPaidSalaryPeriod;
         if (lastPaidSalaryPeriod === currentPeriod) {
-            const day = new Date(date).getDate();
+            const ymd = contractDateToYmd(date);
+            const day = ymd ? parseInt(ymd.slice(8, 10), 10) : new Date().getDate();
             return day >= 25 ? getNextMonthPeriod(lastPaidSalaryPeriod) : lastPaidSalaryPeriod;
         }
         return getNextMonthPeriod(lastPaidSalaryPeriod);
     }, [targetEmployeeId, lastPaidSalaryPeriod, isLastPeriodFullyPaid, currentPeriod, prevPeriod, date]);
-
-    const [salaryPeriodInput, setSalaryPeriodInput] = useState('');
-    const [salaryPeriodManual, setSalaryPeriodManual] = useState(false);
 
     useEffect(() => {
         if (!salaryPeriodManual) {
             setSalaryPeriodInput(autoSalaryPeriod);
         }
     }, [autoSalaryPeriod, salaryPeriodManual]);
-
-    useEffect(() => {
-        setSalaryPeriodManual(false);
-    }, [targetEmployeeId]);
 
     const selectedSalaryPeriod = salaryPeriodManual && salaryPeriodInput ? salaryPeriodInput : autoSalaryPeriod;
     const salaryPeriodLabel = useMemo(() => formatSalaryPeriod(selectedSalaryPeriod), [selectedSalaryPeriod]);
@@ -697,7 +714,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
             const prefill = (location.state as any)?.prefill;
             if (prefill && !id) {
                     setType(prefill.type || TransactionType.INCOME);
-                    setDate(prefill.date || new Date().toISOString().split('T')[0]);
+                    setDate(contractDateToYmd(prefill.date) || localDateStr());
                     setBuildingId(prefill.buildingId || '');
                     setUnitNumber(prefill.unitNumber || '');
                     setAmount(prefill.amount ? String(prefill.amount) : '');
@@ -747,7 +764,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
           if (voice.category) setExpenseCategory(voice.category);
           if (voice.description) setDetails(voice.description);
           setPaymentMethod(PaymentMethod.CASH);
-          setDate(voice.date || new Date().toISOString().split('T')[0]);
+          setDate(contractDateToYmd(voice.date) || localDateStr());
           window.history.replaceState({}, document.title);
       }
   }, [location, id]);
@@ -854,38 +871,36 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                      priorOldContractMetaRef.current = { period, contractNo };
                                  }
 
-                                 // --- INSTALLMENT DETECTION: use EXCLUSIVE amounts (consistent with contract values) ---
                                  // Non-residential: fees may be logged as separate feesEntry rows — exclude from rent installment schedule only then.
                                  const nonResContract = isNonResidentialBuildingForContract(buildings, contract as any);
                                  const rentPayments = nonResContract
                                    ? prevPayments.filter(t => !(t as any).feesEntry)
                                    : prevPayments;
-                                 const totalPaidExcl = rentPayments.reduce((sum, t) => sum + (Number(t.amount) || 0) + ((t as any).discountAmount || 0), 0);
-                                 const totalPaidEffective = totalPaidExcl + upfrontPaid;
-                                 const otherInstAmtExcl = Number(contract.otherInstallment || 0);
-                                 let firstInstAmtExcl = Number(contract.firstInstallment || 0) + upfrontPaid;
-                                 const effectiveTotalExcl = totalValueStored + upfrontPaid;
+                                 const otherInstAmtStored = Number(contract.otherInstallment || 0);
+                                 let firstInstAmtStored = Number(contract.firstInstallment || 0) + upfrontPaid;
+                                 const effectiveTotalStored = totalValueStored + upfrontPaid;
 
-                                 // --- DISPLAY: use inclusive so user sees actual money collected ---
+                                 // VAT / non-residential: ContractForm stores rentValue, totalValue, and
+                                 // installment amounts as FINAL (inclusive) prices. Schedule against cash
+                                 // (amountIncludingVAT). Residential stays on exclusive `amount`.
                                  const isVATBuilding = (() => {
                                      const b = buildings.find(bb => bb.id === buildingId);
                                      return b?.propertyType === 'NON_RESIDENTIAL' || b?.vatApplicable === true;
                                  })();
-                                 const rentValue = Number((contract as any).rentValue || 0);
-                                 const vatOnRent = isVATBuilding ? rentValue * 0.15 : 0;
-                                 const vatOnOneTime = isVATBuilding ? Math.max(0, firstInstAmtExcl - otherInstAmtExcl) * 0.15 : 0;
+                                 const totalPaidExcl = rentPayments.reduce((sum, t) => sum + (Number(t.amount) || 0) + ((t as any).discountAmount || 0), 0);
                                  const totalPaidIncl = rentPayments.reduce((sum, t) => sum + (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) + ((t as any).discountAmount || 0), 0);
                                  const totalPaidDisplayEffective = totalPaidIncl + upfrontPaid;
-                                 const effectiveTotalIncl = totalValueStored + upfrontPaid + vatOnRent + vatOnOneTime;
+                                 const schedulePaidBase = (isVATBuilding ? totalPaidIncl : totalPaidExcl) + upfrontPaid;
+                                 // Do not add 15% on top of VAT leases — totals are already final prices.
+                                 const effectiveTotalIncl = effectiveTotalStored;
                                  const totalDueAllIncl = effectiveTotalIncl + priorO;
                                  const remaining = Math.max(0, totalDueAllIncl - totalPaidDisplayEffective);
 
                                  setContractPayments(prevPayments);
 
-                                 // Use exclusive installment amounts for loop
-                                 let firstInstAmt = firstInstAmtExcl;
-                                 const otherInstAmt = otherInstAmtExcl;
-                                 const effectiveTotal = effectiveTotalExcl;
+                                 let firstInstAmt = firstInstAmtStored;
+                                 const otherInstAmt = otherInstAmtStored;
+                                 const effectiveTotal = effectiveTotalStored;
 
                          // --- SMART INSTALLMENT CALCULATION ---
                          const sumInstallments = firstInstAmt + (otherInstAmt * Math.max(0, totalInst - 1));
@@ -899,7 +914,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                return;
              }
 
-             let schedulePaidExcl = totalPaidEffective;
+             let schedulePaidTowardInst = schedulePaidBase;
              let currentInstallment = 1;
              let recommendedAmount = 0;
              let isPartial = false;
@@ -907,7 +922,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
              // FIFO: payments apply to prior-lease balance (renewal) before new lease installments
              if (priorO > 0 && totalPaidDisplayEffective < priorO) {
                currentInstallment = 0;
-               schedulePaidExcl = 0;
+               schedulePaidTowardInst = 0;
                recommendedAmount = Math.round((priorO - totalPaidDisplayEffective) * 100) / 100;
                isPartial = totalPaidDisplayEffective > 0;
                setCurrentInstallmentRemaining(Math.max(0, recommendedAmount));
@@ -953,13 +968,9 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                }
              } else {
                // After prior is cleared, only the remainder applies to the new lease schedule.
-               // priorO is stored in the same inclusive basis as contract list balance; map to exclusive for the schedule loop when VAT applies.
-               const paidAfterPriorIncl = Math.max(0, totalPaidDisplayEffective - priorO);
+               // priorO and schedule amounts share the same cash/final-price basis.
                if (priorO > 0) {
-                 schedulePaidExcl =
-                   isVATBuilding && effectiveTotalIncl > 0
-                     ? (paidAfterPriorIncl * effectiveTotalExcl) / effectiveTotalIncl
-                     : paidAfterPriorIncl;
+                 schedulePaidTowardInst = Math.max(0, schedulePaidBase - priorO);
                }
 
              // Build cumulative amounts for each installment (schedule only, after prior cleared)
@@ -968,12 +979,12 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                const instAmount = i === 1 ? firstInstAmt : otherInstAmt;
                cumulative += instAmount;
                
-                             if (schedulePaidExcl < cumulative) {
+                             if (schedulePaidTowardInst < cumulative) {
                  // This is the first unpaid installment
                  currentInstallment = i;
                  const prevCumulative = i === 1 ? 0 : (firstInstAmt + (i - 2) * otherInstAmt);
                  const amountDueForThisInst = instAmount;
-                                 const amountPaidTowardsThis = Math.max(0, schedulePaidExcl - prevCumulative);
+                                 const amountPaidTowardsThis = Math.max(0, schedulePaidTowardInst - prevCumulative);
                  recommendedAmount = amountDueForThisInst - amountPaidTowardsThis;
                  
                  if (amountPaidTowardsThis > 0) {
@@ -986,8 +997,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                }
              }
              
-             // Check if fully paid on schedule (exclusive) — whole obligation already handled above
-                         if (schedulePaidExcl >= Math.min(cumulative, effectiveTotal)) {
+             // Check if fully paid on schedule — whole obligation already handled above
+                         if (schedulePaidTowardInst >= Math.min(cumulative, effectiveTotal)) {
                setOverpaymentWarning('Contract Fully Paid! Cannot add more Income.');
                setAmount('0');
                return;
@@ -998,7 +1009,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                remaining,
                installmentNo: currentInstallment,
                priorOutstanding: priorO,
-               paidExclSchedule: schedulePaidExcl,
+               paidExclSchedule: schedulePaidTowardInst,
              });
 
              if (keepPrefillAmountRef.current) {
@@ -1042,6 +1053,89 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
         };
         checkContract();
     }, [buildingId, unitNumber, type, allTransactions, buildings]); 
+
+    // Edit mode: restore the linked contract for display/save (new-entry effect skips when `id` is set).
+    // Also compute remaining excluding this transaction so save is not blocked as "overpayment".
+    useEffect(() => {
+        if (!id || type !== TransactionType.INCOME || incomeSubType !== 'RENTAL') return;
+        let cancelled = false;
+        (async () => {
+            try {
+                const catalogAll = (await getContracts({ includeDeleted: true })) || [];
+                const catalog = catalogAll.filter((c: any) => !c.deleted);
+                let contract =
+                    (linkedContractId && catalog.find((c: any) => c.id === linkedContractId)) ||
+                    undefined;
+                if (!contract && buildingId && unitNumber) {
+                    contract = (await getActiveContract(buildingId, unitNumber)) || undefined;
+                    if (!contract) {
+                        const unitContracts = catalog.filter(
+                            (c: any) =>
+                                c.buildingId === buildingId && contractIncludesUnit(c.unitName, unitNumber),
+                        );
+                        contract = pickBestContractForUnit(unitContracts) || undefined;
+                    }
+                }
+                if (cancelled) return;
+                setActiveContract(contract as any);
+                if (!contract) {
+                    setContractStats({
+                        paid: 0,
+                        remaining: 0,
+                        installmentNo: 1,
+                        priorOutstanding: 0,
+                        paidExclSchedule: 0,
+                    });
+                    return;
+                }
+                setAutoCustomerName(
+                    formatCustomerFromMap(contract.customerName, contract.customerId, buildCustomerRoomMap(customers)),
+                );
+                if (!linkedContractId && contract.id) setLinkedContractId(contract.id);
+
+                const prevPayments = allTransactions.filter(t => {
+                    if (t.id === id) return false;
+                    if (t.status !== TransactionStatus.APPROVED && t.status) return false;
+                    if (t.type === TransactionType.EXPENSE) return false;
+                    return transactionAppliesToContract(t, contract as any, catalog);
+                });
+                const upfrontPaid = Number((contract as any).upfrontPaid || 0);
+                const totalValueStored = Number(contract.totalValue || 0);
+                const priorO = Math.max(0, Number((contract as any).priorLeaseOutstandingAtRenewal) || 0);
+                const nonResContract = isNonResidentialBuildingForContract(buildings, contract as any);
+                const rentPayments = nonResContract
+                    ? prevPayments.filter(t => !(t as any).feesEntry)
+                    : prevPayments;
+                const totalPaidIncl = rentPayments.reduce(
+                    (sum, t) =>
+                        sum +
+                        (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) +
+                        ((t as any).discountAmount || 0),
+                    0,
+                );
+                const totalPaidDisplayEffective = totalPaidIncl + upfrontPaid;
+                // VAT leases store final prices — do not add 15% again.
+                const effectiveTotalIncl = totalValueStored + upfrontPaid;
+                const totalDueAllIncl = effectiveTotalIncl + priorO;
+                const remaining = Math.max(0, totalDueAllIncl - totalPaidDisplayEffective);
+                if (cancelled) return;
+                setContractPayments(prevPayments);
+                setContractStats({
+                    paid: totalPaidDisplayEffective,
+                    remaining,
+                    installmentNo: 1,
+                    priorOutstanding: priorO,
+                    paidExclSchedule: 0,
+                });
+                setOverpaymentWarning('');
+            } catch (e) {
+                console.warn('edit contract resolve failed', e);
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [id, type, incomeSubType, buildingId, unitNumber, linkedContractId, customers, allTransactions, buildings]);
 
     // Update enteredRemaining when amount changes + carry-forward detection
     useEffect(() => {
@@ -1268,6 +1362,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
 
   const handleEmployeeSelect = (empId: string) => {
       setTargetEmployeeId(empId);
+      if (!id) setSalaryPeriodManual(false);
       const emp = employees.find(e => e.id === empId);
       if (emp) {
           // Amount will be auto-set by the salary balance useEffect
@@ -1289,6 +1384,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
 
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
+        if (loading) return;
         SoundService.play('submit');
         setLoading(true);
 
@@ -1302,11 +1398,21 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
         showError('Please select a bank.'); setLoading(false); return;
     }
     
-    // Strict Overpayment Check - only block if exceeds entire contract remaining
+    // Strict Overpayment Check - only block if exceeds entire contract remaining.
+    // On edit, remaining excludes this tx once stats load; fall back to original covered amount if not yet loaded.
     if (activeContract && type === TransactionType.INCOME && incomeSubType === 'RENTAL') {
         const netPayment = parseFloat(amount) + (parseFloat(extraAmount) || 0) - (parseFloat(discountAmount) || 0);
-        if (netPayment > contractStats.remaining + 100) { // +100 tolerance
-             showWarning(`Net amount (${netPayment.toLocaleString()}) exceeds total contract remaining (${contractStats.remaining.toLocaleString()})`); setLoading(false); return;
+        const src = editingSourceTxRef.current;
+        const originalCovered =
+            id && src
+                ? (Number((src as any).amountIncludingVAT ?? (src as any).totalWithVat ?? src.amount) || 0) +
+                  (Number((src as any).discountAmount) || 0)
+                : 0;
+        const maxAllowed = id
+            ? Math.max(Number(contractStats.remaining) || 0, originalCovered)
+            : (Number(contractStats.remaining) || 0);
+        if (netPayment > maxAllowed + 100) { // +100 tolerance
+             showWarning(`Net amount (${netPayment.toLocaleString()}) exceeds total contract remaining (${maxAllowed.toLocaleString()})`); setLoading(false); return;
         }
     }
 
@@ -1474,12 +1580,14 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
       vatRate: vatApplicableEffective ? 15 : undefined,
       vendorVATNumber: (vatApplicableEffective && type === TransactionType.EXPENSE && targetVendorId) ? vendors.find(v => v.id === targetVendorId)?.vatNumber || vendors.find(v => v.id === targetVendorId)?.vatNo : undefined,
       customerVATNumber: (vatApplicableEffective && type === TransactionType.INCOME && activeContract) ? customers.find(c => c.id === activeContract.customerId)?.vatNumber : undefined,
-      customerName: type === TransactionType.INCOME && activeContract
-        ? formatCustomerFromMap(activeContract.customerName, activeContract.customerId, buildCustomerRoomMap(customers))
+      customerName: type === TransactionType.INCOME
+        ? (activeContract
+            ? formatCustomerFromMap(activeContract.customerName, activeContract.customerId, buildCustomerRoomMap(customers))
+            : editingSourceTxRef.current?.customerName)
         : undefined,
       customerId:
-        type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract?.customerId
-          ? activeContract.customerId
+        type === TransactionType.INCOME && incomeSubType === 'RENTAL'
+          ? (activeContract?.customerId || editingSourceTxRef.current?.customerId)
           : undefined,
             details: details || (type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SALARY
                 ? `Salary ${salaryPeriodLabel || ''} - ${empName}`.trim()
@@ -1496,9 +1604,13 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
       createdBy: id && originalCreatedBy ? originalCreatedBy : currentUser.id,
       createdByName: id && originalCreatedBy ? (allTransactions.find(t=>t.id===id)?.createdByName || currentUser.name) : currentUser.name,
       lastModifiedAt: id ? Date.now() : undefined,
-      contractId: incomeSubType === 'RENTAL' ? activeContract?.id : undefined,
-      expectedAmount: (incomeSubType === 'RENTAL' && activeContract && currentInstallmentRemaining > 0) ? currentInstallmentRemaining : undefined,
-      electricityMeter: incomeSubType === 'RENTAL' ? activeContract?.electricityMeter : undefined,
+      contractId: incomeSubType === 'RENTAL' ? (activeContract?.id || linkedContractId || editingSourceTxRef.current?.contractId) : undefined,
+      expectedAmount: (incomeSubType === 'RENTAL' && activeContract && currentInstallmentRemaining > 0)
+        ? currentInstallmentRemaining
+        : (id && incomeSubType === 'RENTAL' ? editingSourceTxRef.current?.expectedAmount : undefined),
+      electricityMeter: incomeSubType === 'RENTAL'
+        ? (activeContract?.electricityMeter ?? editingSourceTxRef.current?.electricityMeter)
+        : undefined,
       status,
       serviceAgreementId: (type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SERVICE_AGREEMENT && selectedServiceAgreementId) ? selectedServiceAgreementId : undefined,
       serviceAgreementStartDate: (type === TransactionType.EXPENSE && expenseCategory === ExpenseCategory.SERVICE_AGREEMENT && selectedServiceAgreementId) ? serviceAgreements.find(a => a.id === selectedServiceAgreementId)?.startDate : undefined,
@@ -1533,13 +1645,23 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
             };
           }
         }
-        if (type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract && contractStats.installmentNo > 0) {
+        if (type === TransactionType.INCOME && incomeSubType === 'RENTAL' && activeContract && contractStats.installmentNo > 0 && !id) {
           const instNo = contractStats.installmentNo;
           const { startDate, endDate } = getContractInstallmentRange(activeContract, Math.max(1, instNo));
           return {
             installmentNumber: instNo,
             installmentStartDate: contractDateToYmd(startDate),
             installmentEndDate: contractDateToYmd(endDate),
+          };
+        }
+        // Editing: keep original installment / fees flags (setDoc replaces the whole doc).
+        if (id && editingSourceTxRef.current) {
+          const src = editingSourceTxRef.current as any;
+          return {
+            ...(src.installmentNumber != null ? { installmentNumber: src.installmentNumber } : {}),
+            ...(src.installmentStartDate ? { installmentStartDate: src.installmentStartDate } : {}),
+            ...(src.installmentEndDate ? { installmentEndDate: src.installmentEndDate } : {}),
+            ...(src.feesEntry ? { feesEntry: true } : {}),
           };
         }
         return {};
@@ -1964,10 +2086,8 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                 const b = buildings.find(bb => bb.id === buildingId);
                                 return b?.propertyType === 'NON_RESIDENTIAL' || b?.vatApplicable === true;
                             })();
-                            const rentValue = Number((activeContract as any).rentValue || 0);
-                            const vatOnRent = isVATBuilding ? rentValue * 0.15 : 0;
-                            const vatOnOneTime = isVATBuilding ? Math.max(0, firstInstAmt - otherInstAmt) * 0.15 : 0;
-                            const effectiveTotalIncl = totalValueStored + upfrontPaid + vatOnRent + vatOnOneTime;
+                            // VAT leases store final prices on the contract — no extra 15%.
+                            const effectiveTotalIncl = totalValueStored + upfrontPaid;
                             const grandTotalDue = effectiveTotalIncl + priorO;
                             const schedulePaidTowardInst = contractStats.paidExclSchedule;
 
@@ -2015,6 +2135,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                 firstInstAmt,
                                 otherInstAmt,
                                 totalInst,
+                                scheduleBasis: isVATBuilding ? 'incl' : 'excl',
                             });
                             const priorCoverage = paymentCoverage.prior.allocations;
                             const currentInstCoverage =
@@ -2069,7 +2190,7 @@ export default function EntryForm({ currentUser, prefillCategory: propPrefillCat
                                             {priorO > 0 ? t('entry.totalDueGrand') : t('common.total')}
                                         </div>
                                         <div className="text-sm sm:text-base font-black text-slate-800 mt-0.5">
-                                            {(priorO > 0 ? grandTotalDue : isVATBuilding ? effectiveTotalIncl : effectiveTotalExcl).toLocaleString()}
+                                            {(priorO > 0 ? grandTotalDue : effectiveTotalIncl).toLocaleString()}
                                         </div>
                                         <div className="text-[8px] text-slate-400">{priorO > 0 ? t('entry.inclPriorNote') : t('common.sar')}</div>
                                     </div>

@@ -20,10 +20,6 @@ export function computeContractBalance(
     transactions: ReadonlyArray<any>;
   },
 ): { paid: number; effectiveTotal: number; remaining: number; percent: number } {
-  const bld =
-    opts.buildings.find((b) => b.id === c.buildingId) ||
-    opts.buildings.find((b) => (b.name || '').trim() === String((c as any).buildingName || '').trim());
-  const isVAT = bld?.propertyType === 'NON_RESIDENTIAL' || bld?.vatApplicable === true;
   const nonResContract = isNonResidentialBuildingForContract(opts.buildings, c as any);
   const paidRaw = opts.transactions
     .filter((t) => {
@@ -41,12 +37,9 @@ export function computeContractBalance(
     );
   const upfrontPaid = Number((c as any).upfrontPaid || 0);
   const paid = paidRaw + upfrontPaid;
-  const rentValue = Number((c as any).rentValue || 0);
-  const vatOnRent = isVAT ? rentValue * 0.15 : 0;
-  const otherAmtExcl = Number(c.otherInstallment || 0);
-  const firstAmtExcl = Number(c.firstInstallment || 0) + upfrontPaid;
-  const vatOnOneTime = isVAT ? Math.max(0, firstAmtExcl - otherAmtExcl) * 0.15 : 0;
-  const effectiveTotal = (c.totalValue || 0) + upfrontPaid + vatOnRent + vatOnOneTime;
+  // VAT / non-residential contracts store rentValue, totalValue, and installment
+  // amounts as final (inclusive) prices — do not add 15% again.
+  const effectiveTotal = (c.totalValue || 0) + upfrontPaid;
   const priorOutstanding = Math.max(0, Number((c as any).priorLeaseOutstandingAtRenewal) || 0);
   const totalDueIncludingPrior = effectiveTotal + priorOutstanding;
   const remaining = Math.max(0, effectiveTotal - paid);

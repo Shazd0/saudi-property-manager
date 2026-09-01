@@ -53,6 +53,10 @@ export const localDateStr = (): string => {
 /** Contract / Firestore date fields → `YYYY-MM-DD` in local calendar (for comparisons & renewal anchors). */
 export const contractDateToYmd = (v: unknown): string => {
   if (v == null || v === '') return '';
+  if (typeof v === 'number') {
+    const d = new Date(v);
+    return isNaN(d.getTime()) ? '' : dateToLocalStr(d);
+  }
   if (typeof v === 'string') {
     const s = v.trim();
     const m = s.match(/^(\d{4}-\d{2}-\d{2})/);

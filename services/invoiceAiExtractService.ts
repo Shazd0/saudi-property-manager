@@ -469,7 +469,15 @@ export async function extractInvoicesWithVision(
   const invoices = normalizeAiInvoices(allRaw, defaultPaymentMethod);
   const seen = new Set<string>();
   const deduped = invoices.filter((inv) => {
-    const key = `${inv.invoiceNumber}|${inv.amountIncl}|${inv.vendorVAT}`.toLowerCase();
+    // Only dedupe when invoice # is present — blank numbers with same amount are different rows
+    const invNo = String(inv.invoiceNumber || '').trim();
+    if (!invNo || /^AI-/i.test(invNo)) {
+      const key = `${inv.date}|${inv.vendorName}|${inv.amountIncl}|${inv.amountExcl}|${inv.vendorVAT}`.toLowerCase();
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    }
+    const key = `${invNo}|${inv.amountIncl}|${inv.vendorVAT}`.toLowerCase();
     if (seen.has(key)) return false;
     seen.add(key);
     return true;
