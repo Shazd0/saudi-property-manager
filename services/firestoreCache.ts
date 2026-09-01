@@ -4,7 +4,7 @@ type CacheEntry<T> = { data: T; at: number };
 
 const store = new Map<string, CacheEntry<unknown>>();
 
-export const FIRESTORE_CACHE_TTL_MS = 45_000;
+export const FIRESTORE_CACHE_TTL_MS = 90_000;
 
 export function getCached<T>(key: string, ttlMs = FIRESTORE_CACHE_TTL_MS): T | null {
   const hit = store.get(key);
@@ -28,4 +28,10 @@ export function invalidateFirestoreCache(prefix?: string): void {
   for (const key of store.keys()) {
     if (key.startsWith(prefix)) store.delete(key);
   }
+}
+
+/** Invalidate cached reads for one collection in the active (or given) book. */
+export function invalidateCollectionCache(collectionName: string, bookId?: string): void {
+  const bid = bookId || 'default';
+  invalidateFirestoreCache(`col:${bid}:${collectionName}:`);
 }
