@@ -15,11 +15,14 @@
     "desktop:dev": "electron .",
     "desktop:assets": "powershell -ExecutionPolicy Bypass -File ./tools/generate-installer-assets.ps1",
     "desktop:build": "npm run desktop:assets && npm run build && electron-builder --win nsis",
-    "desktop:build:unsigned": "npm run desktop:assets && npm run build && electron-builder --win nsis --config.win.signAndEditExecutable=false"
+    "desktop:build:unsigned": "npm run desktop:assets && npm run build && electron-builder --win nsis --config.win.signAndEditExecutable=false",
+    "auto-push": "node scripts/auto-push-watch.mjs",
+    "auto-push:install-hook": "node scripts/install-auto-push-hook.mjs"
   },
   "dependencies": {
     "@google-cloud/storage": "^6.12.0",
     "firebase": "^12.12.1",
+    "firebase-admin": "^13.10.0",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.1",
     "lucide-react": "^0.555.0",

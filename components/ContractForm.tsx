@@ -1,7 +1,7 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect, useMemo, useRef } from 'react';
 import { User, Building, Customer, Contract, Task, TaskStatus, Transaction, TransactionType, PaymentMethod, TransactionStatus } from '../types';
-import { getBuildings, getCustomers, saveContract, getContracts, isUnitOccupied, saveTask, getTransactions, requestContractFinalize, requestContractDelete, getActiveContract, deleteContract, saveEjarContract } from '../services/firestoreService';
-import { Save, RefreshCw, Calculator, CalendarClock, Building2, User as UserIcon, List, PlusCircle, Search, AlertTriangle, Archive, Repeat, CheckCircle, Copy, Clock, Calendar, Wifi, ArrowLeft, ArrowRight, Receipt, Printer, Trash2, RotateCcw, X, Pencil, AlertCircle, FileText } from 'lucide-react';
+import { getBuildings, getCustomers, saveContract, getContracts, isUnitOccupied, saveTask, getTransactions, requestContractFinalize, requestContractReverse, requestContractDelete, getActiveContract, deleteContract, saveEjarContract } from '../services/firestoreService';
+import { Save, RefreshCw, Calculator, CalendarClock, Building2, User as UserIcon, List, PlusCircle, Search, AlertTriangle, Archive, Repeat, CheckCircle, Copy, Clock, Calendar, Wifi, ArrowLeft, ArrowRight, Receipt, Printer, Trash2, RotateCcw, Undo2, X, Pencil, AlertCircle, FileText } from 'lucide-react';
 import SavedFilters from './SavedFilters';
 import SearchableSelect from './SearchableSelect';
 import { useToast } from './Toast';
@@ -13,6 +13,8 @@ import { useNavigate, useLocation } from 'react-router-dom';
 import ConfirmDialog from './ConfirmDialog';
 import LoadingOverlay from './LoadingOverlay';
 import { useLanguage } from '../i18n';
+import { isApprovalPending } from '../services/approvalPendingStore';
+import { useApprovalPending } from '../hooks/useApprovalPending';
 import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
 import { computeContractBalance, type RenewalPriorBalanceSnap } from '../utils/contractBalance';
 import { buildContractSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
@@ -23,6 +25,19 @@ function entryUnitForContract(c: { unitName?: string }): string {
   const units = parseContractUnits(c.unitName);
   return units[0] || String(c.unitName || '').trim();
 }
+
+const ContractApprovalBadge: React.FC<{ contractId: string }> = ({ contractId }) => {
+  const { t } = useLanguage();
+  const finalizePending = useApprovalPending('contract_finalize', contractId);
+  const deletePending = useApprovalPending('contract_delete', contractId);
+  const reversePending = useApprovalPending('contract_reverse', contractId);
+  if (!finalizePending && !deletePending && !reversePending) return null;
+  return (
+    <span className="text-[10px] font-black uppercase tracking-wide px-2 py-0.5 rounded-full bg-amber-100 text-amber-700 border border-amber-200">
+      {t('approval.pendingBadge')}
+    </span>
+  );
+};
 
 interface ContractFormProps {
   currentUser: User;
@@ -109,9 +124,12 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   
   // UI: confirmation modal
   const [confirmOpen, setConfirmOpen] = useState(false);
-  const [confirmAction, setConfirmAction] = useState<'finalize' | 'renew' | 'delete' | 'restore' | 'permanentDelete' | null>(null);
+  const [confirmAction, setConfirmAction] = useState<'finalize' | 'reverse' | 'renew' | 'delete' | 'restore' | 'permanentDelete' | null>(null);
   const [confirmContract, setConfirmContract] = useState<Contract | null>(null);
   const [confirmMessage, setConfirmMessage] = useState('');
+  const [confirmPreparing, setConfirmPreparing] = useState(false);
+  const [confirmBusy, setConfirmBusy] = useState(false);
+  const ledgerTxRef = useRef<any[]>([]);
   const [bulkConfirmOpen, setBulkConfirmOpen] = useState(false);
   const [bulkConfirmMessage, setBulkConfirmMessage] = useState('');
   const [bulkConfirmTitle, setBulkConfirmTitle] = useState('Confirm');
@@ -355,6 +373,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     const all = await getContracts({ includeDeleted: true }) || [];
     const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
     const txs = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }) || [];
+    ledgerTxRef.current = txs;
     setExistingContracts([...all]);
     
     const catalog = all.filter((x: any) => !x.deleted);
@@ -467,6 +486,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     const unitsToCheck = selectedUnits.length > 0 ? selectedUnits : [unitName];
     
     // Validate all selected units
+    setLoading(true);
     for (const unit of unitsToCheck) {
       if (!unit) continue;
       const occupied = await isUnitOccupied(buildingId, unit);
@@ -474,6 +494,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
         const active = await getActiveContract(buildingId, unit).catch(() => null);
         if (active && active.id !== renewalSourceId && active.id !== editingContractId) {
           setErrorMsg(t('contract.unitOccupied', { unit, contractNo: active.contractNo }));
+          setLoading(false);
           return;
         }
       }
@@ -481,8 +502,6 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     
     // Use comma-separated units if multiple selected
     const finalUnitName = selectedUnits.length > 0 ? selectedUnits.join(', ') : unitName;
-
-    setLoading(true);
     const building = buildings.find(b => b.id === buildingId);
     const customer = customers.find(c => c.id === customerId);
     const persistWater = toNum(waterFee);
@@ -784,6 +803,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     openConfirm('finalize', c);
   };
 
+  const handleReverseFinalize = async (e: React.MouseEvent, c: Contract) => {
+    e.stopPropagation();
+    openConfirm('reverse', c);
+  };
+
   const handleRenew = (e: React.MouseEvent, c: Contract) => {
     e.stopPropagation();
     openConfirm('renew', c);
@@ -804,11 +828,40 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     openConfirm('permanentDelete', c);
   };
 
-  const openConfirm = async (action: 'finalize' | 'renew' | 'delete' | 'restore' | 'permanentDelete', c: Contract) => {
+  const resolveStatusAfterReverse = (c: Contract): 'Active' | 'Expired' => {
+    const endStr = c.toDate || (c as any).endDate || '';
+    if (!endStr) return 'Active';
+    const end = new Date(endStr + 'T00:00:00');
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    return end.getTime() < today.getTime() ? 'Expired' : 'Active';
+  };
+
+  const openConfirm = async (action: 'finalize' | 'reverse' | 'renew' | 'delete' | 'restore' | 'permanentDelete', c: Contract) => {
+    const pendingTypeByAction: Partial<Record<typeof action, string>> = {
+      finalize: 'contract_finalize',
+      reverse: 'contract_reverse',
+      delete: 'contract_delete',
+    };
+    const pendingType = pendingTypeByAction[action];
+    const isPrivileged = currentUser.role === 'ADMIN' || currentUser.role === 'MANAGER';
+    if (pendingType && !isPrivileged && isApprovalPending(pendingType, c.id)) {
+      showWarning(t('approval.alreadySent'));
+      return;
+    }
     setRenewConfirmBalance(null);
-    // Check if contract has payment transactions
+    setConfirmAction(action);
+    setConfirmContract(c);
+    setConfirmMessage(t('common.pleaseWait'));
+    setConfirmOpen(true);
+    setConfirmPreparing(true);
+    try {
     const userBuildingIds = (currentUser as any).buildingIds && (currentUser as any).buildingIds.length > 0 ? (currentUser as any).buildingIds : (currentUser.buildingId ? [currentUser.buildingId] : []);
-    const allTx = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }) || [];
+    let allTx = ledgerTxRef.current;
+    if (!allTx.length) {
+      allTx = await getTransactions({ userId: currentUser.id, role: currentUser.role, buildingIds: userBuildingIds }) || [];
+      ledgerTxRef.current = allTx;
+    }
     const contractTransactions = allTx.filter(t => t.contractId === c.id && !(t as any).deleted);
     
     if (action === 'finalize' && contractTransactions.length > 0) {
@@ -821,6 +874,19 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
       return;
     }
 
+    if (action === 'reverse') {
+      const units = parseContractUnits(c.unitName);
+      for (const unit of units) {
+        const occupied = await isUnitOccupied(c.buildingId, unit);
+        if (!occupied) continue;
+        const active = await getActiveContract(c.buildingId, unit);
+        if (active && active.id !== c.id) {
+          showError(t('contract.cannotReverseOccupied', { unit, contractNo: active.contractNo }));
+          return;
+        }
+      }
+    }
+
     if ((action === 'delete' || action === 'permanentDelete') && contractTransactions.length > 0) {
       showError(t('contract.cannotDeleteLinked', { 'c.contractNo': c.contractNo, count: String(contractTransactions.length) }));
       return;
@@ -829,6 +895,7 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     setConfirmAction(action);
     setConfirmContract(c);
     if (action === 'finalize') setConfirmMessage(t('contract.finalizeConfirm', { 'c.contractNo': c.contractNo }));
+    if (action === 'reverse') setConfirmMessage(t('contract.reverseConfirm', { 'c.contractNo': c.contractNo }));
     if (action === 'renew') {
       const allC = (await getContracts({ includeDeleted: true })) || [];
       const catalog = allC.filter((x: any) => !x.deleted);
@@ -843,7 +910,9 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
     if (action === 'delete') setConfirmMessage(t('contract.moveToTrash', { 'c.contractNo': c.contractNo }));
     if (action === 'restore') setConfirmMessage(t('contract.restore', { 'c.contractNo': c.contractNo }));
     if (action === 'permanentDelete') setConfirmMessage(t('contract.permanentDelete', { 'c.contractNo': c.contractNo }));
-    setConfirmOpen(true);
+    } finally {
+      setConfirmPreparing(false);
+    }
   };
 
   const closeConfirm = () => {
@@ -855,22 +924,40 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
   };
 
   const handleConfirm = async () => {
-    if (!confirmAction || !confirmContract) { closeConfirm(); return; }
+    if (confirmBusy || confirmPreparing || !confirmAction || !confirmContract) { closeConfirm(); return; }
+    setConfirmBusy(true);
     const c = confirmContract;
-    if (confirmAction === 'finalize') {
+    const action = confirmAction;
+    try {
+    if (action === 'finalize') {
       if (currentUser.role === 'ADMIN' || currentUser.role === 'MANAGER') {
         const updated: Contract = { ...c, status: 'Terminated' };
         await saveContract(updated);
         setSuccess(t('contract.finalized'));
       } else {
         const updated: Contract = { ...c, status: 'Terminated' };
-        await requestContractFinalize(currentUser.id, c.id, updated);
-        setSuccess(t('contract.finalizeSubmitted'));
+        const result = await requestContractFinalize(currentUser.id, c.id, updated);
+        if (result.duplicate) showWarning(t('approval.alreadySent'));
+        else setSuccess(t('contract.finalizeSubmitted'));
       }
-      await refreshContracts();
+      void refreshContracts();
     }
 
-    if (confirmAction === 'delete') {
+    if (action === 'reverse') {
+      const nextStatus = resolveStatusAfterReverse(c);
+      const updated: Contract = { ...c, status: nextStatus };
+      if (currentUser.role === 'ADMIN' || currentUser.role === 'MANAGER') {
+        await saveContract(updated);
+        setSuccess(t('contract.reversed', { status: nextStatus }));
+      } else {
+        const result = await requestContractReverse(currentUser.id, c.id, updated);
+        if (result.duplicate) showWarning(t('approval.alreadySent'));
+        else setSuccess(t('contract.reverseSubmitted'));
+      }
+      void refreshContracts();
+    }
+
+    if (action === 'delete') {
       if (currentUser.role === 'ADMIN' || currentUser.role === 'MANAGER') {
         const updated = { ...c, deleted: true, deletedAt: Date.now(), deletedBy: currentUser.id } as any;
         await saveContract(updated);
@@ -878,17 +965,18 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
           const restored = { ...updated, deleted: false, deletedAt: undefined, deletedBy: undefined } as any;
           await saveContract(restored);
           showSuccess(t('contract.restored', { 'c.contractNo': c.contractNo }));
-          await refreshContracts();
+          void refreshContracts();
         });
       } else {
         const payload = { ...c, deleted: true, deletedAt: Date.now(), deletedBy: currentUser.id };
-        await requestContractDelete(currentUser.id, c.id, payload);
-        setSuccess(t('contract.deleteSubmitted'));
+        const result = await requestContractDelete(currentUser.id, c.id, payload);
+        if (result.duplicate) showWarning(t('approval.alreadySent'));
+        else setSuccess(t('contract.deleteSubmitted'));
       }
-      await refreshContracts();
+      void refreshContracts();
     }
 
-    if (confirmAction === 'restore') {
+    if (action === 'restore') {
       if (currentUser.role === 'ADMIN') {
         const updated = { ...c, deleted: false, deletedAt: undefined, deletedBy: undefined } as any;
         await saveContract(updated);
@@ -896,20 +984,20 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
       } else {
         showError(t('contract.onlyAdminRestore'));
       }
-      await refreshContracts();
+      void refreshContracts();
     }
 
-    if (confirmAction === 'permanentDelete') {
+    if (action === 'permanentDelete') {
       if (currentUser.role === 'ADMIN') {
         await deleteContract(c.id);
         showSuccess(t('contract.permanentlyDeleted', { 'c.contractNo': c.contractNo }));
       } else {
         showError(t('contract.onlyAdminDelete'));
       }
-      await refreshContracts();
+      void refreshContracts();
     }
 
-    if (confirmAction === 'renew') {
+    if (action === 'renew') {
       setCarriedRenewalBalance(renewConfirmBalance);
       setRenewalSourceId(c.id);
       setBuildingId(c.buildingId); setUnitName(c.unitName); setCustomerId(c.customerId);
@@ -954,6 +1042,9 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
 
     setTimeout(() => setSuccess(''), 2500);
     closeConfirm();
+    } finally {
+      setConfirmBusy(false);
+    }
   };
 
   const renderConfirmModal = () => {
@@ -983,8 +1074,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
             </div>
           )}
           <div className="flex justify-end gap-3">
-            <button onClick={closeConfirm} className="px-4 py-2 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50">{t('common.cancel')}</button>
-            <button onClick={handleConfirm} className="px-4 py-2 rounded-xl bg-emerald-500 text-white font-bold">{t('common.confirm')}</button>
+            <button onClick={closeConfirm} disabled={confirmBusy || confirmPreparing} className="px-4 py-2 rounded-xl bg-white border border-slate-200 text-slate-700 hover:bg-slate-50 disabled:opacity-60">{t('common.cancel')}</button>
+            <button onClick={handleConfirm} disabled={confirmBusy || confirmPreparing} className="px-4 py-2 rounded-xl bg-emerald-500 text-white font-bold inline-flex items-center gap-2 disabled:opacity-60">
+              {(confirmBusy || confirmPreparing) && <RefreshCw size={14} className="animate-spin" />}
+              {confirmBusy ? t('common.processing') : confirmPreparing ? t('common.pleaseWait') : t('common.confirm')}
+            </button>
           </div>
         </div>
       </div>
@@ -3009,8 +3103,9 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                       <div className={`absolute start-0 top-0 bottom-0 w-1.5 ${c.status === 'Active' && c.daysRemaining >= 0 && c.daysRemaining <= EXPIRING_THRESHOLD_DAYS ? 'bg-orange-500' : c.status === 'Active' ? 'bg-emerald-500' : c.status === 'Expired' ? 'bg-rose-500' : 'bg-slate-300'}`}></div>
                       <div className="flex flex-col md:flex-row gap-6 items-center ps-4">
                           <div className="flex-1">
-                              <div className="flex items-center gap-2 mb-1">
+                              <div className="flex items-center gap-2 mb-1 flex-wrap">
                                   <span className="text-xs font-mono font-bold text-slate-400">#{c.contractNo}</span>
+                        <ContractApprovalBadge contractId={c.id} />
                         {(c as any).autoPayment && <span className="text-[9px] bg-blue-50 text-blue-600 px-1.5 py-0.5 rounded font-bold flex items-center gap-1"><Repeat size={9}/> {t('history.autoPayment')}</span>}
                         {showDeleted && <span className="text-[9px] bg-rose-100 text-rose-700 px-1.5 py-0.5 rounded font-bold">{t('history.deleted')}</span>}
                                   {c.daysRemaining >= 0 && c.daysRemaining <= EXPIRING_THRESHOLD_DAYS && c.status === 'Active' && <span className="text-[9px] bg-orange-100 text-orange-700 px-1.5 py-0.5 rounded font-bold flex items-center gap-0.5"><AlertCircle size={8}/> {t('contract.expiringDays', { days: String(c.daysRemaining) })}</span>}
@@ -3098,7 +3193,11 @@ const ContractForm: React.FC<ContractFormProps> = ({ currentUser }) => {
                                 <>
                                   <button onClick={(e) => {e.stopPropagation(); handleEditContract(e, c)}} className="p-2 text-blue-500 hover:bg-blue-50 hover:text-blue-700 rounded-lg transition-colors" title={t('contract.editContract')}><Pencil size={18}/></button>
                                   <button onClick={(e) => {e.stopPropagation(); handleRenew(e, c)}} className="p-2 text-emerald-600 hover:bg-emerald-50 hover:text-emerald-700 rounded-lg transition-colors" title={t('common.renew')}><RefreshCw size={18}/></button>
-                                  <button onClick={(e) => {e.stopPropagation(); handleFinalize(e, c)}} className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg" title={t('common.finalize')}><Archive size={18}/></button>
+                                  {c.status === 'Terminated' ? (
+                                    <button onClick={(e) => {e.stopPropagation(); handleReverseFinalize(e, c)}} className="p-2 text-amber-600 hover:text-amber-700 hover:bg-amber-50 rounded-lg transition-colors" title={t('common.reverseFinalize')}><Undo2 size={18}/></button>
+                                  ) : (
+                                    <button onClick={(e) => {e.stopPropagation(); handleFinalize(e, c)}} className="p-2 text-slate-400 hover:text-rose-600 hover:bg-rose-50 rounded-lg" title={t('common.finalize')}><Archive size={18}/></button>
+                                  )}
                                   <button onClick={(e) => {e.stopPropagation(); handleDelete(e, c)}} className="p-2 text-slate-400 hover:text-red-600 hover:bg-red-50 rounded-lg transition-colors" title={t('history.moveToTrash')}><Trash2 size={18}/></button>
                                 </>
                               )}

@@ -12,6 +12,7 @@ import { syncTransactionIntoAmlakWorkbooks } from "../utils/amlakWorkbookTransac
 import { bankAccountKey, bankReferencePatch, countRecordsByBank, type BankReferenceField } from "../utils/bankAccounts";
 import { getCached, setCached, invalidateFirestoreCache, invalidateCollectionCache } from "./firestoreCache";
 import { macDeleteDocument, macGetDocument, macListCollection, macSaveDocument } from "./macApiClient";
+import { setPendingApprovalKeysFromList } from "./approvalPendingStore";
 import { getMacApiUrlEnv, isBrowserLocalHost, isPrivateOrLocalBackendUrl, resolveMacRestApiBase } from "../utils/macApiBase";
 
 /** Hash a password with SHA-256 using the Web Crypto API (browser-compatible). */
@@ -630,21 +631,20 @@ export const deleteTransaction = async (id: string, opts?: { skipStockRestore?: 
 };
 
 
-export const requestTransactionDeletion = async (requestorId: string, txId: string) => {
+export const requestTransactionDeletion = async (requestorId: string, txId: string): Promise<ApprovalSubmitResult> => {
   const req = sanitize({ type: 'transaction_delete', targetCollection: 'transactions', targetId: txId, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  const r = await submitApprovalRequest(req);
+  if (r.duplicate) return r;
   if (useMacCollection('approvals')) {
-    const r = await macSave('approvals', req);
     runInBackground(macSave('audit', { action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
-    return { id: (r as any).id } as any;
+  } else {
+    runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+    runInBackground(async () => {
+      const { notifyAdminsOfRequest } = await import('./pushNotificationService');
+      const userName = await getUserName(requestorId);
+      notifyAdminsOfRequest({ approvalId: r.id, type: 'transaction_delete', requestedBy: userName, targetId: txId }).catch(() => {});
+    }, 'approval notification');
   }
-  const r = await addDoc(fsCollection( 'approvals'), req);
-  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_DELETE', details: `Deletion requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
-  // Notify admins via push notification
-  runInBackground(async () => {
-    const { notifyAdminsOfRequest } = await import('./pushNotificationService');
-    const userName = await getUserName(requestorId);
-    notifyAdminsOfRequest({ approvalId: r.id, type: 'transaction_delete', requestedBy: userName, targetId: txId }).catch(() => {});
-  }, 'approval notification');
   return r;
 };
 
@@ -1070,22 +1070,43 @@ export const deleteUser = async (id: string) => {
 };
 
 async function findUserByField(field: 'id' | 'firebaseUid', value: string): Promise<{ user: any; bookId: string; colPath: string } | null> {
-  const q = query(_colRef(assertDb(), 'users'), where(field, '==', value));
+  const db = assertDb();
+
+  if (field === 'id') {
+    const directDefault = await getDoc(bookDoc('default', 'users', value));
+    if (directDefault.exists()) {
+      return { user: { id: value, ...directDefault.data() }, bookId: 'default', colPath: 'users' };
+    }
+  }
+
+  const q = query(bookCol('default', 'users'), where(field, '==', value));
   const snap = await getDocs(q as any);
   const arr = toArray(snap);
   if (arr[0]) return { user: arr[0], bookId: 'default', colPath: 'users' };
+
+  const bookIds = new Set<string>();
   try {
-    const booksSnap = await getDocs(_colRef(assertDb(), 'books'));
-    for (const bDoc of booksSnap.docs) {
-      const bookId = bDoc.id;
-      const bq = query(_colRef(assertDb(), `book_${bookId}_users`), where(field, '==', value));
-      const bSnap = await getDocs(bq as any);
-      const bArr = toArray(bSnap);
-      if (bArr[0]) return { user: bArr[0], bookId, colPath: `book_${bookId}_users` };
-    }
+    const booksSnap = await getDocs(bookCol('default', 'books'));
+    booksSnap.docs.forEach((bDoc) => {
+      if (bDoc.id && bDoc.id !== 'default') bookIds.add(bDoc.id);
+    });
   } catch {
     /* books collection may not exist yet */
   }
+
+  for (const bookId of bookIds) {
+    if (field === 'id') {
+      const direct = await getDoc(bookDoc(bookId, 'users', value));
+      if (direct.exists()) {
+        return { user: { id: value, ...direct.data() }, bookId, colPath: `book_${bookId}_users` };
+      }
+    }
+    const bq = query(bookCol(bookId, 'users'), where(field, '==', value));
+    const bSnap = await getDocs(bq as any);
+    const bArr = toArray(bSnap);
+    if (bArr[0]) return { user: bArr[0], bookId, colPath: `book_${bookId}_users` };
+  }
+
   return null;
 }
 
@@ -1744,21 +1765,69 @@ export const resetSystem = async () => {
 };
 
 // ---- Approval Workflow Helpers ----
-export const requestTransactionEdit = async (requestorId: string, txId: string, newData: any) => {
-  const req = sanitize({ type: 'transaction_edit', targetCollection: 'transactions', targetId: txId, payload: newData, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+export type ApprovalSubmitResult = { id: string; duplicate?: boolean };
+
+export function dedupeApprovalsList(arr: any[]): any[] {
+  const map = new Map<string, any>();
+  for (const a of arr || []) {
+    if (!a?.type || !a?.targetId) continue;
+    const key = `${a.type}|${a.targetId}`;
+    const existing = map.get(key);
+    if (!existing || Number(a.requestedAt || 0) > Number(existing.requestedAt || 0)) {
+      map.set(key, a);
+    }
+  }
+  return Array.from(map.values()).sort((a, b) => Number(b.requestedAt || 0) - Number(a.requestedAt || 0));
+}
+
+async function findPendingApproval(type: string, targetId: string): Promise<{ id: string } | null> {
+  if (useMacCollection('approvals')) {
+    const rows = await getApprovals('PENDING').catch(() => []);
+    const match = (rows || []).find((a: any) => a.type === type && a.targetId === targetId);
+    return match?.id ? { id: match.id } : null;
+  }
+  const q = query(fsCollection('approvals'), where('status', '==', 'PENDING'));
+  const snap = await getDocs(q as any).catch(() => null);
+  if (!snap) return null;
+  const match = snap.docs.find((d) => {
+    const data = d.data() as any;
+    return data.type === type && data.targetId === targetId;
+  });
+  return match ? { id: match.id } : null;
+}
+
+async function submitApprovalRequest(req: Record<string, unknown>): Promise<ApprovalSubmitResult> {
+  const type = String(req.type || '');
+  const targetId = String(req.targetId || '');
+  const existing = await findPendingApproval(type, targetId);
+  if (existing) return { id: existing.id, duplicate: true };
+
   if (useMacCollection('approvals')) {
     const r = await macSave('approvals', req);
-    runInBackground(macSave('audit', { action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
-    return { id: (r as any).id } as any;
+    return { id: String((r as any).id) };
   }
-  const r = await addDoc(fsCollection( 'approvals'), req);
-  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
-  // Notify admins via push notification
-  runInBackground(async () => {
-    const { notifyAdminsOfRequest } = await import('./pushNotificationService');
-    const userName = await getUserName(requestorId);
-    notifyAdminsOfRequest({ approvalId: r.id, type: 'transaction_edit', requestedBy: userName, targetId: txId }).catch(() => {});
-  }, 'approval notification');
+  const r = await addDoc(fsCollection('approvals'), req);
+  return { id: r.id };
+}
+
+export const isApprovalPendingForTarget = async (type: string, targetId: string) => {
+  const existing = await findPendingApproval(type, targetId);
+  return !!existing;
+};
+export const requestTransactionEdit = async (requestorId: string, txId: string, newData: any): Promise<ApprovalSubmitResult> => {
+  const req = sanitize({ type: 'transaction_edit', targetCollection: 'transactions', targetId: txId, payload: newData, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  const r = await submitApprovalRequest(req);
+  if (r.duplicate) return r;
+  if (useMacCollection('approvals')) {
+    runInBackground(macSave('audit', { action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
+  } else {
+    runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_EDIT', details: `Edit requested for tx ${txId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+    runInBackground(async () => {
+      const { notifyAdminsOfRequest } = await import('./pushNotificationService');
+      const userName = await getUserName(requestorId);
+      notifyAdminsOfRequest({ approvalId: r.id, type: 'transaction_edit', requestedBy: userName, targetId: txId }).catch(() => {});
+    }, 'approval notification');
+  }
   return r;
 };
 
@@ -1773,7 +1842,9 @@ export const listenApprovals = (callback: (arr: any[]) => void, status = 'PENDIN
     let cancelled = false;
     const load = async () => {
       const rows = await getApprovals(status === 'ALL' ? '' : status).catch(() => []);
-      if (!cancelled) callback(rows);
+      const filtered = dedupeApprovalsList(rows || []);
+      setPendingApprovalKeysFromList(filtered);
+      if (!cancelled) callback(filtered);
     };
     void load();
     const timer = window.setInterval(load, 10000);
@@ -1791,16 +1862,12 @@ export const listenApprovals = (callback: (arr: any[]) => void, status = 'PENDIN
     const unsub = onSnapshot(q as any, (snap) => {
       try {
         const all = toArray(snap || { docs: [] });
-        const filtered = (all || [])
+        const filtered = dedupeApprovalsList((all || [])
           .filter((a: any) => {
             if (!status || status === 'ALL') return true;
             return (a.status || 'PENDING') === status;
-          })
-          .sort((a: any, b: any) => {
-          const ta = a.requestedAt ? new Date(a.requestedAt).getTime() : 0;
-          const tb = b.requestedAt ? new Date(b.requestedAt).getTime() : 0;
-          return tb - ta; // descending
-        });
+          }));
+        setPendingApprovalKeysFromList(filtered);
         callback(filtered);
       } catch (e) {
         console.error('listenApprovals snapshot processing error', e);
@@ -1966,55 +2033,54 @@ export const getAllUsersGlobal = async (): Promise<any[]> => {
   return all;
 };
 
-export const requestContractFinalize = async (requestorId: string, contractId: string, payload: any) => {
+export const requestContractFinalize = async (requestorId: string, contractId: string, payload: any): Promise<ApprovalSubmitResult> => {
   const req = sanitize({ type: 'contract_finalize', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  const r = await submitApprovalRequest(req);
+  if (r.duplicate) return r;
   if (useMacCollection('approvals')) {
-    const r = await macSave('approvals', req);
     runInBackground(macSave('audit', { action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
-    return { id: (r as any).id } as any;
+  } else {
+    runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+    runInBackground(async () => {
+      const { notifyAdminsOfRequest } = await import('./pushNotificationService');
+      const userName = await getUserName(requestorId);
+      notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_finalize', requestedBy: userName, targetId: contractId }).catch(() => {});
+    }, 'approval notification');
   }
-  const r = await addDoc(fsCollection( 'approvals'), req);
-  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_FINALIZE', details: `Finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
-  // Notify admins via push notification
-  runInBackground(async () => {
-    const { notifyAdminsOfRequest } = await import('./pushNotificationService');
-    const userName = await getUserName(requestorId);
-    notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_finalize', requestedBy: userName, targetId: contractId }).catch(() => {});
-  }, 'approval notification');
   return r;
 };
 
-export const requestContractReverse = async (requestorId: string, contractId: string, payload: any) => {
+export const requestContractReverse = async (requestorId: string, contractId: string, payload: any): Promise<ApprovalSubmitResult> => {
   const req = sanitize({ type: 'contract_reverse', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  const r = await submitApprovalRequest(req);
+  if (r.duplicate) return r;
   if (useMacCollection('approvals')) {
-    const r = await macSave('approvals', req);
     runInBackground(macSave('audit', { action: 'REQUEST_CONTRACT_REVERSE', details: `Reverse finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
-    return { id: (r as any).id } as any;
+  } else {
+    runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_REVERSE', details: `Reverse finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+    runInBackground(async () => {
+      const { notifyAdminsOfRequest } = await import('./pushNotificationService');
+      const userName = await getUserName(requestorId);
+      notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_reverse', requestedBy: userName, targetId: contractId }).catch(() => {});
+    }, 'approval notification');
   }
-  const r = await addDoc(fsCollection( 'approvals'), req);
-  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_REVERSE', details: `Reverse finalize requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
-  runInBackground(async () => {
-    const { notifyAdminsOfRequest } = await import('./pushNotificationService');
-    const userName = await getUserName(requestorId);
-    notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_reverse', requestedBy: userName, targetId: contractId }).catch(() => {});
-  }, 'approval notification');
   return r;
 };
 
-export const requestContractDelete = async (requestorId: string, contractId: string, payload: any) => {
+export const requestContractDelete = async (requestorId: string, contractId: string, payload: any): Promise<ApprovalSubmitResult> => {
   const req = sanitize({ type: 'contract_delete', targetCollection: 'contracts', targetId: contractId, payload, requestedBy: requestorId, requestedAt: Date.now(), status: 'PENDING' });
+  const r = await submitApprovalRequest(req);
+  if (r.duplicate) return r;
   if (useMacCollection('approvals')) {
-    const r = await macSave('approvals', req);
     runInBackground(macSave('audit', { action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() }).catch(() => {}), 'approval audit');
-    return { id: (r as any).id } as any;
+  } else {
+    runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
+    runInBackground(async () => {
+      const { notifyAdminsOfRequest } = await import('./pushNotificationService');
+      const userName = await getUserName(requestorId);
+      notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_delete', requestedBy: userName, targetId: contractId }).catch(() => {});
+    }, 'approval notification');
   }
-  const r = await addDoc(fsCollection( 'approvals'), req);
-  runInBackground(addDoc(fsCollection( 'audit'), sanitize({ action: 'REQUEST_CONTRACT_DELETE', details: `Delete requested for contract ${contractId}`, userId: requestorId, timestamp: Date.now() })).catch(() => {}), 'approval audit');
-  runInBackground(async () => {
-    const { notifyAdminsOfRequest } = await import('./pushNotificationService');
-    const userName = await getUserName(requestorId);
-    notifyAdminsOfRequest({ approvalId: r.id, type: 'contract_delete', requestedBy: userName, targetId: contractId }).catch(() => {});
-  }, 'approval notification');
   return r;
 };
 
@@ -3071,8 +3137,11 @@ export const getBooks = async (): Promise<BookRecord[]> => {
   try {
     const snap = await getDocs(_colRef(assertDb(), 'books'));
     return snap.docs.map(d => ({ id: d.id, ...(d.data() as any) }) as BookRecord);
-  } catch (e) {
-    console.error('getBooks error', e);
+  } catch (e: any) {
+    const code = String(e?.code || '');
+    if (code !== 'permission-denied') {
+      console.error('getBooks error', e);
+    }
     return [];
   }
 };

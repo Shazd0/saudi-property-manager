@@ -2,10 +2,26 @@
   command = "npm run build"
   publish = "dist"
 
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+
 [build.environment]
   VITE_OWNER_AUTOMATION_URL = "/owner-api"
 
-# Same-origin proxy for admin action history (avoids Cloudflare Access CORS on cross-origin fetch).
+# Same-origin staff password migration (Netlify Function — no CORS).
+[[redirects]]
+  from = "/api/staff-migrate-login"
+  to = "/.netlify/functions/staff-migrate-login"
+  status = 200
+  force = true
+
+[[redirects]]
+  from = "/api/report-runtime-error"
+  to = "/.netlify/functions/report-runtime-error"
+  status = 200
+  force = true
+
 [[redirects]]
   from = "/owner-api/*"
   to = "https://mcp.amlak-app.com/owner/:splat"

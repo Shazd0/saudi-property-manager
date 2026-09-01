@@ -1,4 +1,6 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import { onAuthStateChanged } from 'firebase/auth';
+import { auth } from '../firebase';
 import { setCurrentBook, getBooks, saveBook, deleteBook, BookRecord } from '../services/firestoreService';
 
 export type Book = BookRecord;
@@ -36,7 +38,7 @@ export const BookProvider: React.FC<{ children: React.ReactNode }> = ({ children
     localStorage.getItem(STORAGE_KEY) || 'default'
   );
   const [books, setBooks] = useState<Book[]>([DEFAULT_BOOK]);
-  const [loading, setLoading] = useState(true);
+  const [loading, setLoading] = useState(false);
 
   const loadBooks = useCallback(async () => {
     try {
@@ -49,12 +51,20 @@ export const BookProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, []);
 
+  // Only load books after Firebase Auth — avoids permission-denied on login screen.
   useEffect(() => {
-    setLoading(true);
-    loadBooks().finally(() => setLoading(false));
+    const unsub = onAuthStateChanged(auth, (firebaseUser) => {
+      if (!firebaseUser) {
+        setBooks([DEFAULT_BOOK]);
+        setLoading(false);
+        return;
+      }
+      setLoading(true);
+      loadBooks().finally(() => setLoading(false));
+    });
+    return unsub;
   }, [loadBooks]);
 
-  // Keep module-level variable in sync
   useEffect(() => {
     setCurrentBook(activeBookId);
     localStorage.setItem(STORAGE_KEY, activeBookId);
@@ -64,7 +74,6 @@ export const BookProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setCurrentBook(id);
     setActiveBookId(id);
     localStorage.setItem(STORAGE_KEY, id);
-    // Navigate to dashboard to avoid stale data
     window.location.hash = '#/';
   }, []);
 

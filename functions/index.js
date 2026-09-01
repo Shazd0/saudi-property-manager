@@ -36,6 +36,48 @@ function normalizeRole(role, isOwner) {
   return "EMPLOYEE";
 }
 
+async function lookupStaffInCollection(db, collectionName, userId) {
+  let snap = await db.collection(collectionName).doc(userId).get();
+  if (!snap.exists) {
+    const q = await db.collection(collectionName).where("id", "==", userId).limit(1).get();
+    if (!q.empty) snap = q.docs[0];
+  }
+  return snap.exists ? snap : null;
+}
+
+/** Find staff user in default or any book_{teamCode}_users collection. */
+async function findStaffUserAcrossBooks(db, userId, hintBookId) {
+  const hint = String(hintBookId || "default").trim() || "default";
+  const tried = new Set();
+
+  async function tryBook(bookId) {
+    const key = bookId || "default";
+    if (tried.has(key)) return null;
+    tried.add(key);
+    const col = key === "default" ? "users" : `book_${key}_users`;
+    const snap = await lookupStaffInCollection(db, col, userId);
+    if (snap) return { snap, bookId: key, usersCol: col };
+    return null;
+  }
+
+  if (hint !== "default") {
+    const hinted = await tryBook(hint);
+    if (hinted) return hinted;
+  }
+  const defaultHit = await tryBook("default");
+  if (defaultHit) return defaultHit;
+
+  const cols = await db.listCollections();
+  for (const col of cols) {
+    const match = /^book_([A-Z0-9]+)_users$/i.exec(col.id);
+    if (!match) continue;
+    const bookId = match[1].toUpperCase();
+    const found = await tryBook(bookId);
+    if (found) return found;
+  }
+  return null;
+}
+
 /**
  * Post-cutover password migration:
  * Verify the old SHA-256 / plaintext password from Firestore users/{id},
@@ -43,9 +85,33 @@ function normalizeRole(role, isOwner) {
  *
  * POST { userId, oldPassword, newPassword, bookId? }
  */
+const ALLOWED_ORIGIN_PATTERNS = [
+  /^https:\/\/amlakrrgroup\.netlify\.app$/,
+  /^https:\/\/[a-z0-9-]+--amlakrrgroup\.netlify\.app$/,
+  /^https:\/\/(www\.)?amlak-app\.com$/,
+  /^http:\/\/localhost(:\d+)?$/,
+  /^http:\/\/127\.0\.0\.1(:\d+)?$/,
+];
+
+function applyCors(req, res) {
+  const origin = String(req.get("Origin") || req.get("origin") || "").trim();
+  const allowed = !origin
+    || ALLOWED_ORIGIN_PATTERNS.some((pattern) => pattern.test(origin));
+  if (allowed && origin) {
+    res.set("Access-Control-Allow-Origin", origin);
+    res.set("Vary", "Origin");
+  } else if (!origin) {
+    res.set("Access-Control-Allow-Origin", "*");
+  }
+  res.set("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.set("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.set("Access-Control-Max-Age", "3600");
+}
+
 exports.staffMigrateLogin = onRequest(
-  { timeoutSeconds: 30, memory: "256MiB", cors: true },
+  { timeoutSeconds: 30, memory: "256MiB", invoker: "public" },
   async (req, res) => {
+    applyCors(req, res);
     if (req.method === "OPTIONS") return res.status(204).send("");
     if (req.method !== "POST") return res.status(405).json({ error: "POST only" });
 
@@ -64,16 +130,12 @@ exports.staffMigrateLogin = onRequest(
     try {
       const db = getFirestore();
       const auth = getAuth();
-      const usersCol = bookId === "default" ? "users" : `book_${bookId}_users`;
-      let snap = await db.collection(usersCol).doc(userId).get();
-      if (!snap.exists) {
-        const q = await db.collection(usersCol).where("id", "==", userId).limit(1).get();
-        if (!q.empty) snap = q.docs[0];
-      }
-      if (!snap.exists) {
+      const located = await findStaffUserAcrossBooks(db, userId, bookId);
+      if (!located) {
         return res.status(404).json({ error: "User ID not found" });
       }
 
+      const { snap, bookId: resolvedBookId, usersCol } = located;
       const data = snap.data() || {};
       if (data.hasSystemAccess === false) {
         return res.status(403).json({ error: "Account does not have system access" });
@@ -82,7 +144,7 @@ exports.staffMigrateLogin = onRequest(
         return res.status(401).json({ error: "Current password is incorrect" });
       }
 
-      const email = String(data.email || "").trim() || syntheticEmail(userId, bookId);
+      const email = String(data.email || "").trim() || syntheticEmail(userId, resolvedBookId);
       const normalizedEmail = email.toLowerCase();
       let record;
       try {
@@ -105,7 +167,7 @@ exports.staffMigrateLogin = onRequest(
       const kind = String(data.role || "").toUpperCase() === "OWNER" || data.isOwner ? "owner" : "staff";
       await db.collection("authIndex").doc(record.uid).set({
         userId,
-        bookId,
+        bookId: resolvedBookId,
         role,
         kind,
         email: normalizedEmail,
@@ -124,7 +186,7 @@ exports.staffMigrateLogin = onRequest(
         userId,
         email: normalizedEmail,
         uid: record.uid,
-        bookId,
+        bookId: resolvedBookId,
       });
     } catch (err) {
       console.error("staffMigrateLogin failed", err);

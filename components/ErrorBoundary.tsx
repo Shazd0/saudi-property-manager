@@ -1,5 +1,6 @@
 import React, { Component } from 'react';
 import { useLanguage } from '../i18n';
+import { reportRuntimeError } from '../services/runtimeErrorReporter';
 
 interface ErrorBoundaryProps {
   children: React.ReactNode;
@@ -20,6 +21,12 @@ class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error('UI error boundary caught an error:', error, info);
+    void reportRuntimeError({
+      kind: 'react-boundary',
+      message: error?.message || 'React render error',
+      stack: error?.stack,
+      extra: { componentStack: info?.componentStack },
+    });
   }
 
   handleReload = () => {

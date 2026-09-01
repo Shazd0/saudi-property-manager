@@ -780,3 +780,22 @@ export interface BugReport {
   status: 'open' | 'resolved';
   adminNote?: string;
 }
+
+export interface RuntimeErrorReport {
+  id: string;
+  message: string;
+  stack?: string | null;
+  kind: string;
+  url: string;
+  route: string;
+  userAgent?: string;
+  userId?: string | null;
+  bookId?: string | null;
+  source?: string | null;
+  line?: number | null;
+  column?: number | null;
+  status: 'open' | 'resolved';
+  cursorStatus?: 'pending' | 'sent' | 'failed' | 'skipped';
+  cursorError?: string;
+  createdAt: string;
+}

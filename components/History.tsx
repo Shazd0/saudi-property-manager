@@ -111,7 +111,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
     const location = useLocation();
     const [searchParams, setSearchParams] = useSearchParams();
     const openedTxIdRef = useRef<string | null>(null);
-    const { showSuccess, showInfo, showError, showToast } = useToast();
+    const { showSuccess, showInfo, showError, showWarning, showToast } = useToast();
     const { t, language } = useLanguage();
     const isPostedFromAmlakSheets = (tx: Transaction | any) =>
         tx?.postedFromAmlakSheets === true || tx?.source === 'amlak_sheets';
@@ -1066,9 +1066,12 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                     });
                 }
             } else {
-                // Non-admins create a deletion request for approval
-                await requestTransactionDeletion(currentUser.id, txToDelete.id);
-                showInfo('Deletion request has been sent to admin for approval. If accepted, the transaction will be deleted.');
+                const result = await requestTransactionDeletion(currentUser.id, txToDelete.id);
+                if (result.duplicate) {
+                    showWarning(t('approval.alreadySent'));
+                } else {
+                    showInfo(t('approval.deletionSent'));
+                }
                 setShowDeleteModal(false);
                 setTxToDelete(null);
             }

@@ -1,4 +1,3 @@
-import { collection, getDocs, query, where } from 'firebase/firestore';
 import { signInWithEmailAndPassword, sendPasswordResetEmail, type User as FirebaseUser } from 'firebase/auth';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { auth, getDb } from '../firebase';
@@ -31,6 +30,27 @@ export function staffEmailForLogin(loginId: string, bookId?: string): string {
   return `${safeId}@${book}.amlak.internal`.toLowerCase();
 }
 
+/** Resolve staff profile + Firebase Auth email across all books (default + book_{teamCode}_users). */
+export async function resolveStaffLoginTarget(loginId: string): Promise<{
+  profile: User;
+  bookId: string;
+  email: string;
+} | null> {
+  const id = normalizeLoginId(loginId);
+  if (!id) return null;
+
+  const profile = await loadUserByLoginId(id);
+  if (!profile) return null;
+
+  const bookId = String(profile.bookId || getCurrentBookId() || 'default').trim() || 'default';
+  const storedEmail = String(profile.email || '').trim();
+  const email = storedEmail.includes('@')
+    ? storedEmail.toLowerCase()
+    : staffEmailForLogin(id, bookId);
+
+  return { profile, bookId, email };
+}
+
 export async function ensureAuthIndexForStaff(
   uid: string,
   staff: { id: string; role?: string; isOwner?: boolean; email?: string; bookId?: string },
@@ -52,44 +72,15 @@ export async function ensureAuthIndexForStaff(
   }, { merge: true });
 }
 
-async function loadStaffByLoginId(loginId: string): Promise<User | null> {
-  const id = normalizeLoginId(loginId);
-  if (!id) return null;
-  const db = getDb();
-
-  const direct = await getDoc(doc(db, 'users', id));
-  if (direct.exists()) {
-    return { ...(direct.data() as User), id, bookId: 'default' };
-  }
-
-  const q = query(collection(db, 'users'), where('id', '==', id));
-  const snap = await getDocs(q);
-  if (!snap.empty) {
-    const data = snap.docs[0].data() as User;
-    return { ...data, id: data.id || id, bookId: 'default' };
-  }
-
-  return null;
-}
-
 export async function resolveStaffUserAfterAuth(firebaseUser: FirebaseUser, loginIdHint?: string): Promise<User | null> {
   const uid = firebaseUser.uid;
   const loginId = normalizeLoginId(loginIdHint || String(firebaseUser.email || '').split('@')[0]);
 
   let staff: User | null = null;
-  if (loginId) {
-    try {
-      staff = await loadStaffByLoginId(loginId);
-    } catch (error) {
-      console.warn('loadStaffByLoginId failed', error);
-    }
-  }
-  if (!staff) {
-    try {
-      staff = await loadUserByFirebaseUid(uid);
-    } catch (error) {
-      console.warn('loadUserByFirebaseUid failed', error);
-    }
+  try {
+    staff = await loadUserByFirebaseUid(uid);
+  } catch (error) {
+    console.warn('loadUserByFirebaseUid failed', error);
   }
   if (!staff && loginId) {
     try {
@@ -115,34 +106,57 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
   const id = normalizeLoginId(loginId);
   if (!id || !password) return null;
 
-  const bookId = getCurrentBookId() || 'default';
-  const email = staffEmailForLogin(id, bookId);
+  const activeBook = getCurrentBookId() || 'default';
+  const candidateEmails: string[] = [];
+  const seen = new Set<string>();
+  const addCandidate = (email: string) => {
+    const normalized = String(email || '').trim().toLowerCase();
+    if (!normalized || seen.has(normalized)) return;
+    seen.add(normalized);
+    candidateEmails.push(normalized);
+  };
 
-  const credential = await signInWithEmailAndPassword(auth, email, password);
-  const user = await resolveStaffUserAfterAuth(credential.user, id);
-  if (!user) {
-    throw new Error('Signed in but no staff profile found. Contact admin to link your Firebase account.');
+  if (id.includes('@')) addCandidate(id);
+  addCandidate(staffEmailForLogin(id, activeBook));
+  if (activeBook !== 'default') addCandidate(staffEmailForLogin(id, 'default'));
+
+  let lastError: unknown = null;
+  for (const email of candidateEmails) {
+    try {
+      const credential = await signInWithEmailAndPassword(auth, email, password);
+      const user = await resolveStaffUserAfterAuth(credential.user, id);
+      if (user) return user;
+      throw new Error('Signed in but no staff profile found. Contact admin to link your Firebase account.');
+    } catch (error: any) {
+      lastError = error;
+      const code = String(error?.code || '');
+      if (code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password') {
+        continue;
+      }
+      throw error;
+    }
   }
-  return user;
+
+  if (lastError) throw lastError;
+  return null;
 }
 
 export async function requestPasswordReset(loginId: string): Promise<void> {
-  const id = normalizeLoginId(loginId);
-  const bookId = getCurrentBookId() || 'default';
-  const email = staffEmailForLogin(id, bookId);
-  await sendPasswordResetEmail(auth, email);
+  const target = await resolveStaffLoginTarget(loginId);
+  if (!target) throw new Error('User ID not found');
+  await sendPasswordResetEmail(auth, target.email);
 }
 
 /**
- * Cutover helper: verify old Mac/Firestore password via Cloud Function Admin SDK,
- * then create/update Firebase Auth password so normal login works.
+ * Verify old Firestore password and set Firebase Auth password (self-service cutover).
+ * Book is resolved automatically by searching all books — no manual --book needed in UI.
  */
 export async function migrateStaffPasswordWithLegacy(
   loginId: string,
   oldPassword: string,
   newPassword: string,
-  bookId = 'default',
-): Promise<{ email: string }> {
+  bookId?: string,
+): Promise<{ email: string; bookId: string }> {
   const id = normalizeLoginId(loginId);
   if (!id || !oldPassword || !newPassword) {
     throw new Error('User ID, current password, and new password are required');
@@ -151,7 +165,10 @@ export async function migrateStaffPasswordWithLegacy(
     throw new Error('New password must be at least 6 characters');
   }
 
+  const resolvedBookId = bookId || getCurrentBookId() || 'default';
+
   const endpoints = [
+    '/api/staff-migrate-login',
     'https://me-central2-saudi-property-manager.cloudfunctions.net/staffMigrateLogin',
     'https://us-central1-saudi-property-manager.cloudfunctions.net/staffMigrateLogin',
   ];
@@ -166,7 +183,7 @@ export async function migrateStaffPasswordWithLegacy(
           userId: id,
           oldPassword,
           newPassword,
-          bookId: bookId || 'default',
+          bookId: resolvedBookId,
         }),
       });
       const data = await res.json().catch(() => ({}));
@@ -175,7 +192,10 @@ export async function migrateStaffPasswordWithLegacy(
         if (res.status === 404 && url.includes('me-central2')) continue;
         throw new Error(lastError);
       }
-      return { email: String(data.email || staffEmailForLogin(id, bookId)) };
+      return {
+        email: String(data.email || staffEmailForLogin(id, resolvedBookId)),
+        bookId: String(data.bookId || resolvedBookId),
+      };
     } catch (error: any) {
       lastError = error?.message || String(error);
       if (String(lastError).includes('Failed to fetch') || String(lastError).includes('NetworkError')) {
@@ -185,6 +205,6 @@ export async function migrateStaffPasswordWithLegacy(
     }
   }
   throw new Error(
-    `${lastError}. Deploy staffMigrateLogin, or on Mac run: cd mac-cloud && npm run migrate:set-password -- --id ${id} --password 'YourNewPassword'`,
+    `${lastError}. Deploy staffMigrateLogin, or on Mac run: cd mac-cloud && npm run migrate:set-password -- --id ${id} --password 'YourNewPassword' --book ${resolvedBookId}`,
   );
 }

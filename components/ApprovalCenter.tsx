@@ -1,5 +1,5 @@
 import React, { useEffect, useState, useCallback, useRef } from 'react';
-import { Bell, Check, X, Trash2, Edit3, FileSignature, Clock, User, AlertTriangle, RefreshCw, Shield, ChevronDown, ChevronUp, Zap, Sparkles, Building2, CreditCard, CalendarDays, Tag, Hash, FileText, DollarSign, ArrowRightLeft, Eye, KeyRound } from 'lucide-react';
+import { Bell, Check, X, Trash2, Edit3, FileSignature, Undo2, Clock, User, AlertTriangle, RefreshCw, Shield, ChevronDown, ChevronUp, Zap, Sparkles, Building2, CreditCard, CalendarDays, Tag, Hash, FileText, DollarSign, ArrowRightLeft, Eye, KeyRound } from 'lucide-react';
 import SoundService from '../services/soundService';
 import { useLanguage } from '../i18n';
 import { formatCustomerFromMap } from '../utils/customerDisplay';
@@ -25,6 +25,7 @@ const TYPE_CONFIG: Record<string, { label: string; icon: any; color: string; bgC
   transaction_delete: { label: 'Delete Transaction', icon: Trash2, color: 'text-rose-600', bgColor: 'bg-rose-50 border-rose-200' },
   transaction_edit: { label: 'Edit Transaction', icon: Edit3, color: 'text-amber-600', bgColor: 'bg-amber-50 border-amber-200' },
   contract_finalize: { label: 'Finalize Contract', icon: FileSignature, color: 'text-blue-600', bgColor: 'bg-blue-50 border-blue-200' },
+  contract_reverse: { label: 'Reverse Finalize Contract', icon: Undo2, color: 'text-amber-600', bgColor: 'bg-amber-50 border-amber-200' },
   contract_delete: { label: 'Delete Contract', icon: Trash2, color: 'text-rose-600', bgColor: 'bg-rose-50 border-rose-200' },
   password_reset: { label: 'Password Reset', icon: KeyRound, color: 'text-orange-600', bgColor: 'bg-orange-50 border-orange-200' },
 };
@@ -168,8 +169,8 @@ const TransactionDetailView: React.FC<{ payload: any; type: string; users: Recor
     );
   }
 
-  // Contract finalize or delete
-  if (type === 'contract_finalize' || type === 'contract_delete') {
+  // Contract finalize, reverse, or delete
+  if (type === 'contract_finalize' || type === 'contract_reverse' || type === 'contract_delete') {
     return (
       <div className="space-y-3">
         {/* Contract header */}
@@ -334,6 +335,7 @@ const ApprovalCenter: React.FC<ApprovalCenterProps> = ({ currentUser }) => {
       transaction_delete: t('approval.deleteTransaction'),
       transaction_edit: t('approval.editTransaction'),
       contract_finalize: t('approval.finalizeContract'),
+      contract_reverse: t('approval.reverseContract'),
       contract_delete: t('approval.deleteContract'),
       password_reset: t('approval.passwordReset'),
     };

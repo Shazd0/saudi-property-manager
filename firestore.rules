@@ -79,15 +79,20 @@ service cloud.firestore {
       return isSignedIn()
         && userId.size() > 0
         && request.auth.token.email != null
-        && request.auth.token.email.matches('^' + userId + '@.*');
+        && (
+          request.auth.token.email.matches('^' + userId + '@.*')
+          || (resource != null && resource.data.email == request.auth.token.email)
+        );
     }
 
     function signedInEmailMatchesDoc() {
       return isSignedIn()
         && resource != null
-        && resource.data.id is string
         && request.auth.token.email != null
-        && request.auth.token.email.matches('^' + resource.data.id + '@.*');
+        && (
+          (resource.data.id is string && request.auth.token.email.matches('^' + resource.data.id + '@.*'))
+          || resource.data.email == request.auth.token.email
+        );
     }
 
     function canReadCollection(col) {
@@ -124,6 +129,11 @@ service cloud.firestore {
       allow read: if isSignedIn() && (request.auth.uid == uid || isAdmin());
       allow create, update: if isAdmin() || (isSignedIn() && request.auth.uid == uid);
       allow delete: if isAdmin();
+    }
+
+    match /runtime_errors/{errorId} {
+      allow read: if isAdmin();
+      allow write: if false;
     }
 
     match /books/{bookId} {

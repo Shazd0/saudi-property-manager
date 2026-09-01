@@ -3,6 +3,9 @@ import ReactDOM from 'react-dom/client';
 import App from './App';
 import { LanguageProvider } from './i18n';
 import PermissionGate from './components/PermissionGate';
+import { initRuntimeErrorReporter } from './services/runtimeErrorReporter';
+
+initRuntimeErrorReporter();
 
 // Polyfill: Ensure crypto.randomUUID exists across browsers
 (function ensureRandomUUID() {

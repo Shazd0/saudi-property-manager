@@ -57,6 +57,7 @@ import VoiceCallManager from './components/VoiceCallManager';
 import { NotificationBell, NotificationPanel, useNotifications } from './components/Notifications';
 import QuickActions, { QuickActionButton, QuickActionFAB } from './components/QuickActions';
 import { ToastProvider } from './components/Toast';
+import RuntimeErrorNotice from './components/RuntimeErrorNotice';
 import ErrorBoundary from './components/ErrorBoundary';
 import VoiceAssistant from './components/VoiceAssistant';
 import ChatBubble from './components/ChatBubble';
@@ -538,7 +539,8 @@ const AppContent: React.FC = () => {
         const svc = await import('./services/firestoreService');
         if (svc && svc.listenApprovals) {
           unsub = svc.listenApprovals((arr: any[]) => {
-            const count = (arr || []).length;
+            const deduped = svc.dedupeApprovalsList ? svc.dedupeApprovalsList(arr || []) : (arr || []);
+            const count = deduped.filter((a: any) => (a.status || 'PENDING') === 'PENDING').length;
             setPendingApprovals(count);
 
             // Track the latest approval ID so badge count updates correctly.
@@ -546,7 +548,7 @@ const AppContent: React.FC = () => {
             // (via notifyAdminsOfRequest → push-server → onBackgroundMessage) already
             // shows the notification. Having both caused duplicate notifications.
             if (isAdmin && arr && arr.length > 0) {
-              const newest = arr[0];
+              const newest = deduped[0];
               if (newest) lastNotifiedApprovalRef.current = newest.id;
             }
             prevApprovalCountRef.current = count;
@@ -830,6 +832,7 @@ const AppContent: React.FC = () => {
   // Add the bug report button to always show on main app UI
   return (
     <ToastProvider>
+      <RuntimeErrorNotice />
       <HashRouter>
         <Routes>
           <Route path="/landing" element={<ImmersiveLanding />} />
