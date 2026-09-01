@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { HashRouter, Routes, Route, Navigate } from 'react-router-dom';
-import { onAuthStateChanged } from "firebase/auth"; 
+import { onAuthStateChanged } from "firebase/auth";
+import { resolveStaffUserAfterAuth } from "./services/authService"; 
 import { auth } from "./firebase"; 
 import GlobalSearchWithResults from './components/GlobalSearchWithResults';
 import { setupCloudBackup } from './services/cloudBackupService';
@@ -303,31 +304,46 @@ const AppContent: React.FC = () => {
     return () => document.removeEventListener('click', handleGlobalClick, true);
   }, []);
 
-  // 1. Firebase Auth Listener
+  // 1. Firebase Auth Listener — require Firebase session (mock localStorage login no longer works with Firestore rules)
   useEffect(() => {
-    // Restore saved session (mock-login users that don't go through Firebase Auth)
-    const savedSession = localStorage.getItem('savedUserSession');
-    if (savedSession && !user) {
-      try {
-        const parsed = JSON.parse(savedSession);
-        if (parsed && parsed.id && parsed.role) {
-          setUser(parsed);
-          setLoading(false);
-          return;
-        }
-      } catch { /* corrupt data, ignore */ }
-    }
-
-    // Fallback: if Firebase auth doesn't resolve within 5s, stop loading anyway
     const timeout = setTimeout(() => {
       setLoading(false);
-    }, 5000);
+    }, 8000);
 
-    const unsub = onAuthStateChanged(auth, (u) => {
+    const unsub = onAuthStateChanged(auth, async (firebaseUser) => {
       clearTimeout(timeout);
-      if (u) {
-        setUser(u);
-      } else if (!savedSession) {
+      if (!firebaseUser) {
+        localStorage.removeItem('savedUserSession');
+        setUser(null);
+        setLoading(false);
+        return;
+      }
+      try {
+        const staff = await resolveStaffUserAfterAuth(firebaseUser);
+        if (staff) {
+          const sessionData = {
+            id: staff.id,
+            name: staff.name,
+            email: staff.email,
+            role: staff.role,
+            buildingId: staff.buildingId,
+            buildingIds: staff.buildingIds,
+            hasSystemAccess: staff.hasSystemAccess,
+            status: staff.status,
+            bookId: staff.bookId,
+            onVacation: staff.onVacation,
+            vacationNote: staff.vacationNote,
+            vacationUpdatedAt: staff.vacationUpdatedAt,
+          };
+          localStorage.setItem('savedUserSession', JSON.stringify(sessionData));
+          setUser(staff);
+        } else {
+          await auth.signOut();
+          localStorage.removeItem('savedUserSession');
+          setUser(null);
+        }
+      } catch (error) {
+        console.error('Failed to resolve staff profile after Firebase auth', error);
         setUser(null);
       }
       setLoading(false);

@@ -68,6 +68,17 @@ service cloud.firestore {
       return col == 'product_licenses' || col == 'license_gift_reveals' || col == 'product_zatca_jobs' || col == '_server';
     }
 
+    function isSelfProfile() {
+      return isSignedIn()
+        && resource != null
+        && resource.data.firebaseUid == request.auth.uid;
+    }
+
+    function canReadCollection(col) {
+      return isSelfProfile()
+        || (isStaff() && canAccessCollection(col) && !isRegistryCollection(col));
+    }
+
     function noNewPasswordField() {
       return !('password' in request.resource.data)
         || (resource != null
@@ -109,13 +120,13 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow read: if isStaff() && canAccessCollection('users');
+      allow read: if isSelfProfile() || (isStaff() && canAccessCollection('users'));
       allow create, update: if (isAdmin() || canWriteOps()) && noNewPasswordField() && canAccessCollection('users');
       allow delete: if isAdmin();
     }
 
     match /{collection}/{docId} {
-      allow read: if isStaff() && canAccessCollection(collection) && !isRegistryCollection(collection);
+      allow read: if canReadCollection(collection);
       allow create, update: if canWriteOps() && canAccessCollection(collection) && !isRegistryCollection(collection);
       allow delete: if isAdmin() && canAccessCollection(collection) && !isRegistryCollection(collection);
     }
