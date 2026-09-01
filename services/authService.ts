@@ -1,3 +1,4 @@
+import { collection, getDocs, query, where } from 'firebase/firestore';
 import { signInWithEmailAndPassword, sendPasswordResetEmail, type User as FirebaseUser } from 'firebase/auth';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { auth, getDb } from '../firebase';
@@ -51,12 +52,51 @@ export async function ensureAuthIndexForStaff(
   }, { merge: true });
 }
 
-export async function resolveStaffUserAfterAuth(firebaseUser: FirebaseUser): Promise<User | null> {
+async function loadStaffByLoginId(loginId: string): Promise<User | null> {
+  const id = normalizeLoginId(loginId);
+  if (!id) return null;
+  const db = getDb();
+
+  const direct = await getDoc(doc(db, 'users', id));
+  if (direct.exists()) {
+    return { ...(direct.data() as User), id, bookId: 'default' };
+  }
+
+  const q = query(collection(db, 'users'), where('id', '==', id));
+  const snap = await getDocs(q);
+  if (!snap.empty) {
+    const data = snap.docs[0].data() as User;
+    return { ...data, id: data.id || id, bookId: 'default' };
+  }
+
+  return null;
+}
+
+export async function resolveStaffUserAfterAuth(firebaseUser: FirebaseUser, loginIdHint?: string): Promise<User | null> {
   const uid = firebaseUser.uid;
-  let staff = await loadUserByFirebaseUid(uid);
+  const loginId = normalizeLoginId(loginIdHint || String(firebaseUser.email || '').split('@')[0]);
+
+  let staff: User | null = null;
+  if (loginId) {
+    try {
+      staff = await loadStaffByLoginId(loginId);
+    } catch (error) {
+      console.warn('loadStaffByLoginId failed', error);
+    }
+  }
   if (!staff) {
-    const loginId = String(firebaseUser.email || '').split('@')[0]?.trim();
-    if (loginId) staff = await loadUserByLoginId(loginId);
+    try {
+      staff = await loadUserByFirebaseUid(uid);
+    } catch (error) {
+      console.warn('loadUserByFirebaseUid failed', error);
+    }
+  }
+  if (!staff && loginId) {
+    try {
+      staff = await loadUserByLoginId(loginId);
+    } catch (error) {
+      console.warn('loadUserByLoginId failed', error);
+    }
   }
   if (!staff) return null;
 
@@ -76,17 +116,10 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
   if (!id || !password) return null;
 
   const bookId = getCurrentBookId() || 'default';
-  let email = staffEmailForLogin(id, bookId);
-
-  try {
-    const profile = await loadUserByLoginId(id);
-    if (profile?.email) email = String(profile.email).trim();
-  } catch {
-    // Pre-login profile lookup may be blocked until authIndex exists — synthetic email is fine.
-  }
+  const email = staffEmailForLogin(id, bookId);
 
   const credential = await signInWithEmailAndPassword(auth, email, password);
-  const user = await resolveStaffUserAfterAuth(credential.user);
+  const user = await resolveStaffUserAfterAuth(credential.user, id);
   if (!user) {
     throw new Error('Signed in but no staff profile found. Contact admin to link your Firebase account.');
   }

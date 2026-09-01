@@ -74,8 +74,25 @@ service cloud.firestore {
         && resource.data.firebaseUid == request.auth.uid;
     }
 
+    // Signed-in staff can read their own users/{loginId} doc before authIndex exists.
+    function signedInEmailMatchesUser(userId) {
+      return isSignedIn()
+        && userId.size() > 0
+        && request.auth.token.email != null
+        && request.auth.token.email.matches('^' + userId + '@.*');
+    }
+
+    function signedInEmailMatchesDoc() {
+      return isSignedIn()
+        && resource != null
+        && resource.data.id is string
+        && request.auth.token.email != null
+        && request.auth.token.email.matches('^' + resource.data.id + '@.*');
+    }
+
     function canReadCollection(col) {
       return isSelfProfile()
+        || signedInEmailMatchesDoc()
         || (isStaff() && canAccessCollection(col) && !isRegistryCollection(col));
     }
 
@@ -120,7 +137,7 @@ service cloud.firestore {
     }
 
     match /users/{userId} {
-      allow read: if isSelfProfile() || (isStaff() && canAccessCollection('users'));
+      allow read: if signedInEmailMatchesUser(userId) || isSelfProfile() || (isStaff() && canAccessCollection('users'));
       allow create, update: if (isAdmin() || canWriteOps()) && noNewPasswordField() && canAccessCollection('users');
       allow delete: if isAdmin();
     }
