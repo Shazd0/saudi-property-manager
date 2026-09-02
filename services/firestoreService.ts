@@ -1207,6 +1207,12 @@ export const changeUserPassword = async (userId: string, oldPass: string, newPas
   if (!await verifyPassword(oldPass, user.password || '')) throw new Error('Current password is incorrect');
   const hashedNew = await hashPassword(newPass);
   await setDoc(_docRef(assertDb(), userColPath, user.id), { ...user, password: hashedNew }, { merge: true } as any);
+  try {
+    const { provisionStaffFirebaseAuth } = await import('./authService');
+    await provisionStaffFirebaseAuth(userId, newPass, userColPath === 'users' ? 'default' : userColPath.replace(/^book_/, '').replace(/_users$/, ''));
+  } catch (syncErr) {
+    console.warn('Firebase auth sync after password change failed', syncErr);
+  }
   return true;
 };
 
@@ -1234,6 +1240,14 @@ export const requestPasswordReset = async (userId: string, newPassword: string) 
   // Hash and store the new password
   const hashedNewPassword = await hashPassword(newPassword);
   await setDoc(_docRef(assertDb(), userColPath, user.id), { password: hashedNewPassword }, { merge: true } as any);
+
+  try {
+    const { provisionStaffFirebaseAuth } = await import('./authService');
+    const bookId = userColPath === 'users' ? 'default' : userColPath.replace(/^book_/, '').replace(/_users$/, '');
+    await provisionStaffFirebaseAuth(userId, newPassword, bookId);
+  } catch (syncErr) {
+    console.warn('Firebase auth sync after password reset request failed', syncErr);
+  }
 
   // Audit log
   await addDoc(fsCollection( 'audit'), sanitize({ action: 'PASSWORD_RESET', details: `Password reset by ${user.name || userId} (self-service)`, userId, timestamp: Date.now() })).catch(() => {});
@@ -1954,7 +1968,20 @@ export const approveRequest = async (approvalId: string, approverId: string, app
           }
         } catch (_) {}
       }
-      await setDoc(_docRef(assertDb(), foundCol, ap.targetId), { password: ap.payload.newPassword }, { merge: true } as any);
+      const plainPassword = String(ap.payload.newPassword || '');
+      const hashedPassword = /^[0-9a-f]{64}$/i.test(plainPassword)
+        ? plainPassword
+        : await hashPassword(plainPassword);
+      await setDoc(_docRef(assertDb(), foundCol, ap.targetId), { password: hashedPassword }, { merge: true } as any);
+      if (plainPassword && plainPassword.length >= 6) {
+        try {
+          const { provisionStaffFirebaseAuth } = await import('./authService');
+          const bookId = foundCol === 'users' ? 'default' : foundCol.replace(/^book_/, '').replace(/_users$/, '');
+          await provisionStaffFirebaseAuth(ap.targetId, plainPassword, bookId);
+        } catch (syncErr) {
+          console.warn('Firebase auth sync after approved password reset failed', syncErr);
+        }
+      }
     } else if (ap.payload && ap.targetCollection && ap.targetId) {
       const data = sanitize(ap.payload);
       await setDoc(fsDoc( ap.targetCollection, ap.targetId), data, { merge: true } as any);

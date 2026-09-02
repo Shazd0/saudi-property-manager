@@ -138,6 +138,18 @@ const EmployeeManager: React.FC = () => {
                 setSaving(true);
                 try {
                 await saveUser(newUser);
+                if (passwordInput && formData.hasSystemAccess) {
+                    try {
+                        const { provisionStaffFirebaseAuth } = await import('../services/authService');
+                        await provisionStaffFirebaseAuth(finalId, passwordInput, activeBookId);
+                    } catch (syncErr: any) {
+                        console.warn('Firebase auth sync after staff save failed', syncErr);
+                        showWarning(
+                            syncErr?.message
+                                || 'Staff saved but login sync failed — use Forgot Password on the login page.',
+                        );
+                    }
+                }
                 const usrs = await getUsers();
                 setEmployees(usrs || []);
     setView('LIST');

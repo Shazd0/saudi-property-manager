@@ -121,14 +121,15 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
       try {
         user = await loginWithFirebaseAuth(id, password);
       } catch (authErr: any) {
-        const code = String(authErr?.code || '');
-        if (code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password') {
-          setError(isRTL
-            ? 'كلمة المرور غير صحيحة. استخدم «نسيت كلمة المرور» لإنشاء كلمة مرور Firebase جديدة.'
-            : 'Invalid password. Use Forgot Password to set your new Firebase password (old passwords were not migrated).');
+        const msg = String(authErr?.message || '');
+        if (msg && msg !== 'Invalid ID or password') {
+          setError(msg);
           return;
         }
-        throw authErr;
+        setError(isRTL
+          ? 'معرف المستخدم أو كلمة المرور غير صحيحة. إذا تم تعيين كلمة مرور جديدة من الإدارة، استخدم «نسيت كلمة المرور» لتأكيدها.'
+          : 'Invalid User ID or password. If admin set a new password, use Forgot Password to confirm it and finish setup.');
+        return;
       }
       if (user) {
         if(user.status === 'Inactive') {
@@ -337,8 +338,8 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                   <KeyRound size={24} />
                 </div>
                 <div>
-                  <h3 className="text-xl font-black">Set Firebase Password</h3>
-                  <p className="text-white/80 text-xs">Use your old password once, then log in with the new one</p>
+                  <h3 className="text-xl font-black">Reset Password</h3>
+                  <p className="text-white/80 text-xs">Enter your current password (from admin or your old login), then choose a new one</p>
                 </div>
               </div>
             </div>
@@ -358,7 +359,7 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                   await migrateStaffPasswordWithLegacy(forgotId.trim(), forgotOldPass, forgotNewPass);
                   setForgotMsg({
                     type: 'success',
-                    text: 'Firebase password set! Close this and log in with your NEW password.',
+                    text: 'Password updated! Close this window and log in with your NEW password.',
                   });
                   setForgotOldPass('');
                   setForgotNewPass('');
@@ -397,7 +398,7 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                     value={forgotOldPass}
                     onChange={e => setForgotOldPass(e.target.value)}
                     className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-400 outline-none text-sm font-medium"
-                    placeholder="Your old password (before Firebase)"
+                    placeholder="Current password (admin-set or your old password)"
                   />
                 </div>
               </div>
