@@ -5,7 +5,6 @@ import {
   getCurrentBookId,
   loadUserByFirebaseUid,
   loadUserByLoginId,
-  verifyPassword,
 } from './firestoreService';
 import type { User } from '../types';
 
@@ -35,7 +34,9 @@ export function staffEmailForLogin(loginId: string, bookId?: string): string {
   return `${safeId}@${book}.amlak.internal`.toLowerCase();
 }
 
-/** Resolve staff profile + Firebase Auth email across all books (default + book_{teamCode}_users). */
+/** Resolve staff profile + Firebase Auth email across all books (default + book_{teamCode}_users).
+ * Requires Firebase Auth already — unauthenticated reads hit permission-denied.
+ */
 export async function resolveStaffLoginTarget(loginId: string): Promise<{
   profile: User;
   bookId: string;
@@ -44,16 +45,24 @@ export async function resolveStaffLoginTarget(loginId: string): Promise<{
   const id = normalizeLoginId(loginId);
   if (!id) return null;
 
-  const profile = await loadUserByLoginId(id);
-  if (!profile) return null;
+  try {
+    const profile = await loadUserByLoginId(id);
+    if (!profile) return null;
 
-  const bookId = String(profile.bookId || getCurrentBookId() || 'default').trim() || 'default';
-  const storedEmail = String(profile.email || '').trim();
-  const email = storedEmail.includes('@')
-    ? storedEmail.toLowerCase()
-    : staffEmailForLogin(id, bookId);
+    const bookId = String(profile.bookId || getCurrentBookId() || 'default').trim() || 'default';
+    const storedEmail = String(profile.email || '').trim();
+    const email = storedEmail.includes('@')
+      ? storedEmail.toLowerCase()
+      : staffEmailForLogin(id, bookId);
 
-  return { profile, bookId, email };
+    return { profile, bookId, email };
+  } catch (error: any) {
+    const code = String(error?.code || error?.message || '');
+    if (code.includes('permission-denied') || code.includes('Missing or insufficient permissions')) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 export async function ensureAuthIndexForStaff(
@@ -175,8 +184,9 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
   const id = normalizeLoginId(loginId);
   if (!id || !password) return null;
 
-  const target = await resolveStaffLoginTarget(id);
-  const candidateEmails = buildLoginEmailCandidates(id, target);
+  // Never read Firestore before Auth — rules block unauthenticated user lookups
+  // and surface as "Missing or insufficient permissions".
+  const candidateEmails = buildLoginEmailCandidates(id, null);
 
   try {
     const user = await signInWithEmailCandidates(id, password, candidateEmails);
@@ -185,22 +195,32 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
     if (!isFirebaseCredentialError(error)) throw error;
   }
 
-  // Firestore password is valid but Firebase Auth was never synced (common after admin reset).
-  if (target?.profile) {
-    const storedHash = String((target.profile as any).password || '');
-    if (storedHash && await verifyPassword(password, storedHash)) {
-      try {
-        await provisionStaffFirebaseAuth(id, password, target.bookId);
-        const syncedUser = await signInWithEmailCandidates(id, password, candidateEmails);
-        if (syncedUser) return syncedUser;
-      } catch (syncError) {
-        console.warn('Auto-sync Firebase password failed', syncError);
-        throw new Error(
-          'Your password is correct in the system but Firebase login is not set up yet. '
-          + 'Use Forgot Password with your current password, or ask admin to reset again after this update is deployed.',
-        );
-      }
+  // Firebase Auth not set / wrong email yet — try server-side legacy password cutover
+  // (Admin SDK finds the user across books; no client Firestore read needed).
+  try {
+    const synced = await migrateStaffPasswordWithLegacy(id, password, password);
+    const emailsAfterSync = buildLoginEmailCandidates(id, {
+      email: synced.email,
+      bookId: synced.bookId,
+    });
+    const syncedUser = await signInWithEmailCandidates(id, password, emailsAfterSync);
+    if (syncedUser) return syncedUser;
+  } catch (syncError: any) {
+    const msg = String(syncError?.message || syncError || '');
+    // Wrong password / unknown user → fall through to invalid credentials
+    if (
+      /incorrect|invalid|not found|401|403/i.test(msg)
+      && !/FIREBASE_SERVICE_ACCOUNT|unavailable|Failed to fetch/i.test(msg)
+    ) {
+      throw new Error('Invalid ID or password');
     }
+    if (/FIREBASE_SERVICE_ACCOUNT|unavailable|Failed to fetch|password sync/i.test(msg)) {
+      throw new Error(
+        'Firebase login is not set up for this account yet. '
+        + 'Use Forgot Password with your current password, then sign in with the new password.',
+      );
+    }
+    console.warn('Auto-sync Firebase password failed', syncError);
   }
 
   throw new Error('Invalid ID or password');
@@ -230,8 +250,8 @@ export async function migrateStaffPasswordWithLegacy(
     throw new Error('New password must be at least 6 characters');
   }
 
-  const target = await resolveStaffLoginTarget(id);
-  const resolvedBookId = bookId || target?.bookId || getCurrentBookId() || 'default';
+  // Server finds the user across books (Admin SDK). Avoid client Firestore reads while logged out.
+  const resolvedBookId = bookId || getCurrentBookId() || 'default';
 
   const endpoints = [
     '/api/staff-migrate-login',
@@ -255,7 +275,7 @@ export async function migrateStaffPasswordWithLegacy(
       const data = await res.json().catch(() => ({}));
       if (!res.ok) {
         lastError = data?.error || `HTTP ${res.status}`;
-        if (res.status === 404 && url.includes('me-central2')) continue;
+        if (res.status === 404 && url.includes('cloudfunctions.net')) continue;
         throw new Error(lastError);
       }
       return {
