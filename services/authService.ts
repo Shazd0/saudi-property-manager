@@ -184,9 +184,31 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
   const id = normalizeLoginId(loginId);
   if (!id || !password) return null;
 
-  // Never read Firestore before Auth — rules block unauthenticated user lookups
-  // and surface as "Missing or insufficient permissions".
-  const candidateEmails = buildLoginEmailCandidates(id, null);
+  // Prefer server cutover first: verifies legacy Firestore password with Admin SDK,
+  // ensures Firebase Auth exists, and returns the real email. Avoids a storm of
+  // identitytoolkit 400s from guessing synthetic emails before Auth is ready.
+  let syncedEmail: string | null = null;
+  let syncedBookId: string | null = null;
+  let migrateDenied = false;
+  try {
+    const synced = await migrateStaffPasswordWithLegacy(id, password, password);
+    syncedEmail = synced.email;
+    syncedBookId = synced.bookId;
+  } catch (syncError: any) {
+    const msg = String(syncError?.message || syncError || '');
+    if (/incorrect|invalid|not found|401|403/i.test(msg)
+      && !/FIREBASE_SERVICE_ACCOUNT|unavailable|Failed to fetch/i.test(msg)) {
+      migrateDenied = true;
+    } else if (/FIREBASE_SERVICE_ACCOUNT|unavailable|Failed to fetch|password sync/i.test(msg)) {
+      console.warn('Password sync service unavailable; trying Firebase Auth directly', syncError);
+    } else {
+      console.warn('Password sync skipped', syncError);
+    }
+  }
+
+  const candidateEmails = syncedEmail
+    ? buildLoginEmailCandidates(id, { email: syncedEmail, bookId: syncedBookId || 'default' })
+    : buildLoginEmailCandidates(id, null);
 
   try {
     const user = await signInWithEmailCandidates(id, password, candidateEmails);
@@ -195,35 +217,14 @@ export async function loginWithFirebaseAuth(loginId: string, password: string): 
     if (!isFirebaseCredentialError(error)) throw error;
   }
 
-  // Firebase Auth not set / wrong email yet — try server-side legacy password cutover
-  // (Admin SDK finds the user across books; no client Firestore read needed).
-  try {
-    const synced = await migrateStaffPasswordWithLegacy(id, password, password);
-    const emailsAfterSync = buildLoginEmailCandidates(id, {
-      email: synced.email,
-      bookId: synced.bookId,
-    });
-    const syncedUser = await signInWithEmailCandidates(id, password, emailsAfterSync);
-    if (syncedUser) return syncedUser;
-  } catch (syncError: any) {
-    const msg = String(syncError?.message || syncError || '');
-    // Wrong password / unknown user → fall through to invalid credentials
-    if (
-      /incorrect|invalid|not found|401|403/i.test(msg)
-      && !/FIREBASE_SERVICE_ACCOUNT|unavailable|Failed to fetch/i.test(msg)
-    ) {
-      throw new Error('Invalid ID or password');
-    }
-    if (/FIREBASE_SERVICE_ACCOUNT|unavailable|Failed to fetch|password sync/i.test(msg)) {
-      throw new Error(
-        'Firebase login is not set up for this account yet. '
-        + 'Use Forgot Password with your current password, then sign in with the new password.',
-      );
-    }
-    console.warn('Auto-sync Firebase password failed', syncError);
+  if (migrateDenied) {
+    throw new Error('Invalid ID or password');
   }
 
-  throw new Error('Invalid ID or password');
+  throw new Error(
+    'Invalid ID or password. If an admin recently set your password, open Forgot Password, '
+    + 'enter that current password, choose a new one, then sign in.',
+  );
 }
 
 export async function requestPasswordReset(loginId: string): Promise<void> {
