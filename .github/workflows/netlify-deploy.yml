@@ -22,12 +22,22 @@ jobs:
       - name: Install and build
         run: npm ci && npm run build
 
-      - name: Deploy to Netlify
+      - name: Deploy via Netlify CLI (token)
+        if: ${{ secrets.NETLIFY_AUTH_TOKEN != '' }}
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: npx netlify-cli deploy --prod --dir=dist --site=cc538477-6a12-4b0f-b45d-781318e15f7b --message "GitHub Actions deploy"
+
+      - name: Trigger Netlify build hook
+        if: ${{ secrets.NETLIFY_AUTH_TOKEN == '' && secrets.NETLIFY_BUILD_HOOK != '' }}
+        env:
+          NETLIFY_BUILD_HOOK: ${{ secrets.NETLIFY_BUILD_HOOK }}
         run: |
-          if [ -z "$NETLIFY_AUTH_TOKEN" ]; then
-            echo "::error::NETLIFY_AUTH_TOKEN secret is not set in GitHub repository secrets"
-            exit 1
-          fi
-          npx netlify-cli deploy --prod --dir=dist --site=cc538477-6a12-4b0f-b45d-781318e15f7b --message "GitHub Actions deploy"
+          curl -fsS -X POST -d '{}' \
+            "${NETLIFY_BUILD_HOOK}?trigger_branch=main&trigger_title=GitHub%20Actions%20hook%20deploy&clear_cache=true"
+
+      - name: Netlify credentials missing
+        if: ${{ secrets.NETLIFY_AUTH_TOKEN == '' && secrets.NETLIFY_BUILD_HOOK == '' }}
+        run: |
+          echo "::warning::Skipping Netlify deploy — add NETLIFY_AUTH_TOKEN or NETLIFY_BUILD_HOOK to GitHub secrets."
+          echo "GitHub Pages deploy may still publish the app if that workflow is enabled."
