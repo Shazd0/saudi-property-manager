@@ -234,17 +234,22 @@ export async function requestPasswordReset(loginId: string): Promise<void> {
 }
 
 /**
- * Verify Firestore password and set Firebase Auth password (self-service cutover / reset).
- * Book is resolved automatically by searching all books — no manual --book needed in UI.
+ * Set Firebase Auth password for a staff user.
+ * When skipCurrentPassword is true (temporary cutover), old password is not required.
  */
 export async function migrateStaffPasswordWithLegacy(
   loginId: string,
   oldPassword: string,
   newPassword: string,
   bookId?: string,
+  options?: { skipCurrentPassword?: boolean },
 ): Promise<{ email: string; bookId: string }> {
   const id = normalizeLoginId(loginId);
-  if (!id || !oldPassword || !newPassword) {
+  const skipCurrentPassword = options?.skipCurrentPassword === true;
+  if (!id || !newPassword) {
+    throw new Error('User ID and new password are required');
+  }
+  if (!skipCurrentPassword && !oldPassword) {
     throw new Error('User ID, current password, and new password are required');
   }
   if (newPassword.length < 6) {
@@ -268,9 +273,11 @@ export async function migrateStaffPasswordWithLegacy(
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           userId: id,
-          oldPassword,
+          oldPassword: oldPassword || '',
           newPassword,
           bookId: resolvedBookId,
+          skipCurrentPassword,
+          forceReset: skipCurrentPassword,
         }),
       });
       const data = await res.json().catch(() => ({}));

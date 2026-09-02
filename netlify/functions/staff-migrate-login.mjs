@@ -93,8 +93,13 @@ export default async (req) => {
     const oldPassword = String(body?.oldPassword || '');
     const newPassword = String(body?.newPassword || '');
     const bookId = String(body?.bookId || 'default').trim() || 'default';
+    // Temporary cutover mode: allow reset without verifying current password.
+    const skipCurrentPassword = body?.skipCurrentPassword === true || body?.forceReset === true;
 
-    if (!userId || !oldPassword || !newPassword) {
+    if (!userId || !newPassword) {
+      return json(400, { error: 'userId and newPassword are required' });
+    }
+    if (!skipCurrentPassword && !oldPassword) {
       return json(400, { error: 'userId, oldPassword, and newPassword are required' });
     }
     if (newPassword.length < 6) {
@@ -112,7 +117,7 @@ export default async (req) => {
     if (data.hasSystemAccess === false) {
       return json(403, { error: 'Account does not have system access' });
     }
-    if (!verifyLegacyPassword(oldPassword, data.password)) {
+    if (!skipCurrentPassword && !verifyLegacyPassword(oldPassword, data.password)) {
       return json(401, { error: 'Current password is incorrect' });
     }
 

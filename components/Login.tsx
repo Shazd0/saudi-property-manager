@@ -39,7 +39,6 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
   const [pricingOpen, setPricingOpen] = useState(false);
   const [forgotOpen, setForgotOpen] = useState(false);
   const [forgotId, setForgotId] = useState('');
-  const [forgotOldPass, setForgotOldPass] = useState('');
   const [forgotNewPass, setForgotNewPass] = useState('');
   const [forgotConfirmPass, setForgotConfirmPass] = useState('');
   const [forgotShowPass, setForgotShowPass] = useState(false);
@@ -339,7 +338,7 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                 </div>
                 <div>
                   <h3 className="text-xl font-black">Reset Password</h3>
-                  <p className="text-white/80 text-xs">Enter your current password (from admin or your old login), then choose a new one</p>
+                  <p className="text-white/80 text-xs">Enter your User ID and choose a new password, then sign in</p>
                 </div>
               </div>
             </div>
@@ -351,17 +350,15 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                 e.preventDefault();
                 setForgotMsg(null);
                 if (!forgotId.trim()) { setForgotMsg({ type: 'error', text: 'Enter your User ID' }); return; }
-                if (!forgotOldPass) { setForgotMsg({ type: 'error', text: 'Enter your current (old) password' }); return; }
                 if (forgotNewPass.length < 6) { setForgotMsg({ type: 'error', text: 'New password must be at least 6 characters' }); return; }
                 if (forgotNewPass !== forgotConfirmPass) { setForgotMsg({ type: 'error', text: 'Passwords do not match' }); return; }
                 setForgotLoading(true);
                 try {
-                  await migrateStaffPasswordWithLegacy(forgotId.trim(), forgotOldPass, forgotNewPass);
+                  await migrateStaffPasswordWithLegacy(forgotId.trim(), '', forgotNewPass, undefined, { skipCurrentPassword: true });
                   setForgotMsg({
                     type: 'success',
                     text: 'Password updated! Close this window and log in with your NEW password.',
                   });
-                  setForgotOldPass('');
                   setForgotNewPass('');
                   setForgotConfirmPass('');
                 } catch (err: any) {
@@ -383,22 +380,6 @@ const Login: React.FC<LoginProps> = ({ onLogin, onSwitchToTenant }) => {
                     onChange={e => setForgotId(e.target.value)}
                     className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-400 outline-none text-sm font-medium"
                     placeholder="Enter your User ID"
-                  />
-                </div>
-              </div>
-
-              {/* Current / old password (Mac-era password) */}
-              <div>
-                <label className="block text-xs font-bold text-slate-500 uppercase tracking-wider mb-1">Current password</label>
-                <div className="relative">
-                  <Lock className="absolute left-3 top-3 text-slate-400" size={16} />
-                  <input
-                    type={forgotShowPass ? 'text' : 'password'}
-                    required
-                    value={forgotOldPass}
-                    onChange={e => setForgotOldPass(e.target.value)}
-                    className="w-full pl-10 pr-4 py-2.5 bg-slate-50 border border-slate-200 rounded-xl focus:ring-2 focus:ring-amber-400 outline-none text-sm font-medium"
-                    placeholder="Current password (admin-set or your old password)"
                   />
                 </div>
               </div>
