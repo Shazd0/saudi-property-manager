@@ -50,6 +50,18 @@ force = true
 [redirects.headers]
 
 [[redirects]]
+from = "/api/report-runtime-error"
+to = "/.netlify/functions/report-runtime-error"
+status = 200.0
+force = true
+
+[redirects.query]
+
+[redirects.conditions]
+
+[redirects.headers]
+
+[[redirects]]
 from = "/owner-api/*"
 to = "https://mcp.amlak-app.com/owner/:splat"
 status = 200.0
