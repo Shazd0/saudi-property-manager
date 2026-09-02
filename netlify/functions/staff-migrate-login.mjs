@@ -1,7 +1,5 @@
 import crypto from 'node:crypto';
-import { cert, getApps, initializeApp } from 'firebase-admin/app';
-import { getAuth } from 'firebase-admin/auth';
-import { getFirestore } from 'firebase-admin/firestore';
+import { getAdminDb, getAdminAuth } from './lib/firebase-admin-app.mjs';
 
 const CORS_HEADERS = {
   'Access-Control-Allow-Origin': '*',
@@ -32,19 +30,6 @@ function normalizeRole(role, isOwner) {
   if (value === 'ENGINEER') return 'EMPLOYEE';
   if (['ADMIN', 'MANAGER', 'EMPLOYEE'].includes(value)) return value;
   return 'EMPLOYEE';
-}
-
-function getAdminApp() {
-  if (getApps().length) return getApps()[0];
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON || process.env.AMLAK_ADMIN_FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw?.trim()) {
-    throw new Error('Server missing FIREBASE_SERVICE_ACCOUNT_JSON — add it in Netlify env vars');
-  }
-  const parsed = JSON.parse(raw);
-  if (parsed.private_key && typeof parsed.private_key === 'string') {
-    parsed.private_key = parsed.private_key.replace(/\\n/g, '\n');
-  }
-  return initializeApp({ credential: cert(parsed), projectId: parsed.project_id || 'saudi-property-manager' });
 }
 
 async function lookupStaffInCollection(db, collectionName, userId) {
@@ -116,9 +101,8 @@ export default async (req) => {
       return json(400, { error: 'New password must be at least 6 characters' });
     }
 
-    const app = getAdminApp();
-    const db = getFirestore(app);
-    const auth = getAuth(app);
+    const db = getAdminDb();
+    const auth = getAdminAuth();
 
     const located = await findStaffUserAcrossBooks(db, userId, bookId);
     if (!located) return json(404, { error: 'User ID not found' });

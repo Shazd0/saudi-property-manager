@@ -1,7 +1,12 @@
 import { signInWithEmailAndPassword, sendPasswordResetEmail, type User as FirebaseUser } from 'firebase/auth';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { auth, getDb } from '../firebase';
-import { getCurrentBookId, loadUserByFirebaseUid, loadUserByLoginId } from './firestoreService';
+import {
+  getCurrentBookId,
+  loadUserByFirebaseUid,
+  loadUserByLoginId,
+  verifyPassword,
+} from './firestoreService';
 import type { User } from '../types';
 
 function normalizeLoginId(value: string): string {
@@ -102,43 +107,103 @@ export async function resolveStaffUserAfterAuth(firebaseUser: FirebaseUser, logi
   return staff;
 }
 
-export async function loginWithFirebaseAuth(loginId: string, password: string): Promise<User | null> {
-  const id = normalizeLoginId(loginId);
-  if (!id || !password) return null;
+function isFirebaseCredentialError(error: unknown): boolean {
+  const code = String((error as any)?.code || '');
+  return code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password';
+}
 
+function buildLoginEmailCandidates(loginId: string, target?: { email: string; bookId: string } | null): string[] {
+  const id = normalizeLoginId(loginId);
   const activeBook = getCurrentBookId() || 'default';
-  const candidateEmails: string[] = [];
+  const candidates: string[] = [];
   const seen = new Set<string>();
   const addCandidate = (email: string) => {
     const normalized = String(email || '').trim().toLowerCase();
     if (!normalized || seen.has(normalized)) return;
     seen.add(normalized);
-    candidateEmails.push(normalized);
+    candidates.push(normalized);
   };
 
+  if (target) {
+    addCandidate(target.email);
+    addCandidate(staffEmailForLogin(id, target.bookId));
+  }
   if (id.includes('@')) addCandidate(id);
   addCandidate(staffEmailForLogin(id, activeBook));
   if (activeBook !== 'default') addCandidate(staffEmailForLogin(id, 'default'));
 
+  return candidates;
+}
+
+async function signInWithEmailCandidates(
+  loginId: string,
+  password: string,
+  emails: string[],
+): Promise<User | null> {
   let lastError: unknown = null;
-  for (const email of candidateEmails) {
+  for (const email of emails) {
     try {
       const credential = await signInWithEmailAndPassword(auth, email, password);
-      const user = await resolveStaffUserAfterAuth(credential.user, id);
+      const user = await resolveStaffUserAfterAuth(credential.user, loginId);
       if (user) return user;
       throw new Error('Signed in but no staff profile found. Contact admin to link your Firebase account.');
     } catch (error: any) {
       lastError = error;
-      const code = String(error?.code || '');
-      if (code === 'auth/invalid-credential' || code === 'auth/user-not-found' || code === 'auth/wrong-password') {
-        continue;
-      }
+      if (isFirebaseCredentialError(error)) continue;
       throw error;
     }
   }
-
   if (lastError) throw lastError;
   return null;
+}
+
+/**
+ * Provision Firebase Auth for a staff user when Firestore already has this password
+ * (admin reset, password change, or legacy login cutover).
+ */
+export async function provisionStaffFirebaseAuth(
+  loginId: string,
+  plainPassword: string,
+  bookId?: string,
+): Promise<{ email: string; bookId: string }> {
+  const target = await resolveStaffLoginTarget(loginId);
+  const resolvedBookId = bookId || target?.bookId || getCurrentBookId() || 'default';
+  return migrateStaffPasswordWithLegacy(loginId, plainPassword, plainPassword, resolvedBookId);
+}
+
+export async function loginWithFirebaseAuth(loginId: string, password: string): Promise<User | null> {
+  const id = normalizeLoginId(loginId);
+  if (!id || !password) return null;
+
+  const target = await resolveStaffLoginTarget(id);
+  const candidateEmails = buildLoginEmailCandidates(id, target);
+
+  try {
+    const user = await signInWithEmailCandidates(id, password, candidateEmails);
+    if (user) return user;
+  } catch (error) {
+    if (!isFirebaseCredentialError(error)) throw error;
+  }
+
+  // Firestore password is valid but Firebase Auth was never synced (common after admin reset).
+  if (target?.profile) {
+    const storedHash = String((target.profile as any).password || '');
+    if (storedHash && await verifyPassword(password, storedHash)) {
+      try {
+        await provisionStaffFirebaseAuth(id, password, target.bookId);
+        const syncedUser = await signInWithEmailCandidates(id, password, candidateEmails);
+        if (syncedUser) return syncedUser;
+      } catch (syncError) {
+        console.warn('Auto-sync Firebase password failed', syncError);
+        throw new Error(
+          'Your password is correct in the system but Firebase login is not set up yet. '
+          + 'Use Forgot Password with your current password, or ask admin to reset again after this update is deployed.',
+        );
+      }
+    }
+  }
+
+  throw new Error('Invalid ID or password');
 }
 
 export async function requestPasswordReset(loginId: string): Promise<void> {
@@ -148,7 +213,7 @@ export async function requestPasswordReset(loginId: string): Promise<void> {
 }
 
 /**
- * Verify old Firestore password and set Firebase Auth password (self-service cutover).
+ * Verify Firestore password and set Firebase Auth password (self-service cutover / reset).
  * Book is resolved automatically by searching all books — no manual --book needed in UI.
  */
 export async function migrateStaffPasswordWithLegacy(
@@ -165,7 +230,8 @@ export async function migrateStaffPasswordWithLegacy(
     throw new Error('New password must be at least 6 characters');
   }
 
-  const resolvedBookId = bookId || getCurrentBookId() || 'default';
+  const target = await resolveStaffLoginTarget(id);
+  const resolvedBookId = bookId || target?.bookId || getCurrentBookId() || 'default';
 
   const endpoints = [
     '/api/staff-migrate-login',
@@ -205,6 +271,6 @@ export async function migrateStaffPasswordWithLegacy(
     }
   }
   throw new Error(
-    `${lastError}. Deploy staffMigrateLogin, or on Mac run: cd mac-cloud && npm run migrate:set-password -- --id ${id} --password 'YourNewPassword' --book ${resolvedBookId}`,
+    `${lastError}. Contact admin — password sync service may need FIREBASE_SERVICE_ACCOUNT_JSON on Netlify.`,
   );
 }
