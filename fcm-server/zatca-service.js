@@ -29,7 +29,9 @@ const require = createRequire(import.meta.url);
 const { ZATCASimplifiedTaxInvoice, ZATCAInvoiceTypes, ZATCAPaymentMethods } = require('zatca-xml-js');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CERT_DIR  = path.join(__dirname, '..', 'zatca-cert');
+const CERT_DIR = process.env.ZATCA_CERT_DIR
+  ? path.resolve(process.env.ZATCA_CERT_DIR)
+  : path.join(__dirname, '..', 'zatca-cert');
 const PIH_FILE  = path.join(CERT_DIR, 'pih.txt');
 const CNTR_FILE = path.join(CERT_DIR, 'counter.txt');
 
@@ -216,7 +218,12 @@ function buildAndSign(req) {
 
 // ── Express App ───────────────────────────────────────────────────────────────
 const app = express();
-app.use(cors());
+if (process.env.ZATCA_CORS_ORIGINS && process.env.ZATCA_CORS_ORIGINS.trim()) {
+  const list = process.env.ZATCA_CORS_ORIGINS.split(',').map((s) => s.trim()).filter(Boolean);
+  app.use(cors({ origin: list.length ? list : true }));
+} else {
+  app.use(cors());
+}
 app.use(express.json());
 
 /**
@@ -278,9 +285,10 @@ app.get('/zatca/health', (_, res) => res.json({
 }));
 
 // Default 3022 so another stack can keep using 3002 locally.
-const PORT = process.env.ZATCA_PORT || 3022;
-app.listen(PORT, () => {
-  console.log(`[ZATCA] Service on port ${PORT}  |  mode: ${IS_PRODUCTION ? 'PRODUCTION ✅' : 'COMPLIANCE/SANDBOX (run onboard-production.mjs to go live)'}`);
+const PORT = Number(process.env.PORT || process.env.ZATCA_PORT) || 3022;
+const HOST = process.env.ZATCA_HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`[ZATCA] http://${HOST}:${PORT}  |  mode: ${IS_PRODUCTION ? 'PRODUCTION ✅' : 'COMPLIANCE/SANDBOX (run onboard-production.mjs to go live)'}`);
 });
 
 export default app;

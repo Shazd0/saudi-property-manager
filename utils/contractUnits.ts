@@ -1,7 +1,25 @@
 /**
  * Multi-unit contracts store units as a comma-separated `unitName`
  * (e.g. "101, 102, 103"). Helpers to parse and match safely.
+ *
+ * Commercial shops also use composite labels like "SHOP 904,905&906" as a
+ * single building unit name — normalize lightly so hyphen/space/`&` variants match.
  */
+
+/** Normalize for loose compare: case, spaces, SHOP- vs SHOP, & vs comma. */
+export function normalizeUnitLabel(unitName?: string | null): string {
+  return String(unitName || '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/\s*&\s*/g, ',')
+    .replace(/,/g, ', ')
+    .replace(/\s+,/g, ',')
+    .replace(/,\s+/g, ', ')
+    .replace(/\s+/g, ' ')
+    .replace(/^shop[\s-]*/i, 'shop ')
+    .trim();
+}
 
 /** Split contract unitName into individual unit names. */
 export function parseContractUnits(unitName?: string | null): string[] {
@@ -14,6 +32,7 @@ export function parseContractUnits(unitName?: string | null): string[] {
 /**
  * True when `unit` is this contract's only unit, or one of its listed units.
  * Uses exact unit-token match (not substring) so "A1" does not match "A10".
+ * Also accepts normalized label equality for shop composites (SHOP 904,905&906).
  */
 export function contractIncludesUnit(
   contractUnitName?: string | null,
@@ -24,7 +43,8 @@ export function contractIncludesUnit(
   const full = String(contractUnitName || '').trim();
   if (!full) return false;
   if (full === u) return true;
-  return parseContractUnits(full).some((part) => part === u);
+  if (normalizeUnitLabel(full) === normalizeUnitLabel(u)) return true;
+  return parseContractUnits(full).some((part) => part === u || normalizeUnitLabel(part) === normalizeUnitLabel(u));
 }
 
 /** Prefer Active, then most recent by fromDate. */

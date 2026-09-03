@@ -207,6 +207,34 @@ app.get('/api/calls/online/:userId', requireToken, (req, res) => {
   res.json({ online: !!signalingHub?.isUserOnline(req.params.userId) });
 });
 
+/** Proxy ZATCA signer (Mac Mini docker service) — used by Netlify /zatca-api. */
+app.all('/zatca/*', async (req, res) => {
+  const upstream = String(process.env.ZATCA_UPSTREAM_URL || 'http://zatca:3002').replace(/\/+$/, '');
+  const target = `${upstream}${req.originalUrl || req.url}`;
+  try {
+    const headers = { accept: 'application/json' };
+    const ct = req.get('content-type');
+    if (ct) headers['content-type'] = ct;
+    const init = {
+      method: req.method,
+      headers,
+      signal: AbortSignal.timeout(55000),
+    };
+    if (req.method !== 'GET' && req.method !== 'HEAD' && req.body != null) {
+      init.body = JSON.stringify(req.body);
+    }
+    const r = await fetch(target, init);
+    const text = await r.text();
+    res.status(r.status);
+    const outType = r.headers.get('content-type') || 'application/json';
+    res.setHeader('content-type', outType);
+    res.send(text);
+  } catch (error) {
+    const msg = error?.message || String(error);
+    res.status(502).json({ error: `ZATCA signer unavailable: ${msg}` });
+  }
+});
+
 app.use((error, _req, res, _next) => {
   console.error(error);
   res.status(500).json({ error: error?.message || 'Internal server error' });

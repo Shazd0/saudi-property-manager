@@ -40,6 +40,7 @@ import {
     dedupeTreasuryTransferLegs,
 } from '../utils/transactionUtils';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
+import { zatcaSignAndReportUrl } from '../config/zatcaServiceUrl';
 import { createVatReportSnapshot } from '../utils/vatSnapshot';
 import SearchableSelect from './SearchableSelect';
 
@@ -937,7 +938,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                 const cn = await createCreditNote(txToDelete);
                 // Auto-report Credit Note to ZATCA (Phase 2 or offline fallback)
                 try {
-                    const zatcaUrl = ((import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022') + '/zatca/sign-and-report';
+                    const zatcaUrl = zatcaSignAndReportUrl();
                     const cnPayload = {
                         invoiceNumber: cn.vatInvoiceNumber,
                         issueDate: cn.date,
@@ -951,7 +952,7 @@ const TransactionHistory: React.FC<HistoryProps> = ({ currentUser }) => {
                     };
                     let qrCode = '';
                     try {
-                        const res = await fetch(zatcaUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cnPayload), signal: AbortSignal.timeout(8000) });
+                        const res = await fetch(zatcaUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(cnPayload), signal: AbortSignal.timeout(45000) });
                         const data = await res.json();
                         if (res.ok && data.qrCode) qrCode = data.qrCode;
                     } catch {

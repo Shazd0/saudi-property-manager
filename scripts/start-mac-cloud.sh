@@ -27,6 +27,6 @@ DOCKER_BIN="/usr/local/bin/docker"
 [[ -x "$DOCKER_BIN" ]] || DOCKER_BIN="/opt/homebrew/bin/docker"
 
 "$DOCKER_BIN" compose --env-file "$ENV_FILE" -f "$PROJECT_DIR/docker-compose.mac-mini.yml" \
-  up -d postgres amlak-api fcm-push mcp automation-worker >> "$LOG_DIR/startup.log" 2>&1
+  up -d postgres amlak-api fcm-push mcp automation-worker zatca >> "$LOG_DIR/startup.log" 2>&1
 
 echo "$(date '+%Y-%m-%dT%H:%M:%S%z') startup command finished" >> "$LOG_DIR/startup.log"

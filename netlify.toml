@@ -8,6 +8,7 @@
 
 [build.environment]
   VITE_OWNER_AUTOMATION_URL = "/owner-api"
+  VITE_ZATCA_SERVICE_URL = "/zatca-api"
 
 # Same-origin staff password migration (Netlify Function — no CORS).
 [[redirects]]
@@ -25,6 +26,13 @@
 [[redirects]]
   from = "/owner-api/*"
   to = "https://mcp.amlak-app.com/owner/:splat"
+  status = 200
+  force = true
+
+# ZATCA signer on Mac Mini (amlak-api proxies /zatca → zatca container)
+[[redirects]]
+  from = "/zatca-api/*"
+  to = "https://api.amlak-app.com/:splat"
   status = 200
   force = true
 

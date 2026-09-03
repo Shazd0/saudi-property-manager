@@ -34,7 +34,8 @@ import { getInstallmentRange } from '../utils/installmentSchedule';
 import { getNextVatInvoiceNumber, getNextVatSalesInvoiceNumber } from '../utils/vatInvoiceNumber';
 import { useLanguage } from '../i18n';
 import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
-import { computeInstallmentProgress } from '../utils/installmentPaymentProgress';
+import { contractIncludesUnit, pickBestContractForUnit } from '../utils/contractUnits';
+import { computeVatRentAutofill, unitDefaultRentAmount } from '../utils/vatRentAutofill';
 import { getNonResFeePeriodContext, getNonResFeeBreakdownLines } from '../utils/nonResidentialFeeSchedule';
 
 export type VATQuickEntryType = 'SALES' | 'EXPENSE' | 'FEES';
@@ -394,6 +395,14 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
       setQeContractCustomer(null);
       setQeCustomerVAT('');
       setQeVatAutoFilled(false);
+      setQeActiveContract(undefined);
+      setQeAmount('');
+      setQeDetails('');
+      setQeContractStats({ paid: 0, remaining: 0, installmentNo: 1 });
+      setQeNonVatFeesPerInst(0);
+      setQeFeesPaidThisInst(0);
+      setQeFeePeriodInstallment(null);
+      setQeFeesAllPeriodsPaid(false);
       if (!unit || !qeBuildingId) return;
       setQeContractLookupLoading(true);
       try {
@@ -401,10 +410,9 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
         let contract = await getActiveContract(qeBuildingId, unit);
         if (!contract) {
           const unitContracts = catalog.filter(
-            (c: any) => c.buildingId === qeBuildingId && c.unitName === unit,
+            (c: any) => c.buildingId === qeBuildingId && contractIncludesUnit(c.unitName, unit),
           );
-          unitContracts.sort((a: any, b: any) => (a.status === 'Active' ? -1 : b.status === 'Active' ? 1 : 0));
-          contract = unitContracts[0] || null;
+          contract = pickBestContractForUnit(unitContracts) || null;
         }
         if (contract) {
           setQeActiveContract(contract);
@@ -413,99 +421,26 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
             if (t.type === TransactionType.EXPENSE) return false;
             return transactionAppliesToContract(t, contract as any, catalog);
           });
-          const upfrontPaidAmount = Number((contract as any).upfrontPaid || 0);
           const totalInst = contract.installmentCount || 1;
-          const rentValue = Number((contract as any).rentValue || 0);
-
           const nonResQe = isNonResidentialBuildingForContract(buildings, contract as any);
-          const rentPayments = nonResQe
-            ? prevPayments.filter((t) => !(t as any).feesEntry)
-            : prevPayments;
-          const totalPaidIncl = rentPayments.reduce(
-            (sum, t) =>
-              sum +
-              (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) +
-              ((t as any).discountAmount || 0),
-            0,
-          );
-          const totalPaidEffective = totalPaidIncl + upfrontPaidAmount;
 
-          // IMPORTANT: For non-residential units, VAT Sales/Rent should NOT include non‑VAT fees.
-          // So we compute installment progress from rent-only value (VAT), excluding any fees schedule.
-          let currentInstallment = 1;
-          let currentInstAmt = 0;
-          let paidTowardCurrent = 0;
-          let rentAutoFill = 0;
-
-          if (nonResQe) {
-            const count = Math.max(1, Number(contract.installmentCount) || 1);
-            // ContractForm treats VAT-building rentValue as FINAL price (inclusive of VAT),
-            // and VAT transactions store amountIncludingVAT / totalWithVat as the money collected.
-            const rentTotalIncl = Number((contract as any).rentValue || 0);
-            const rentPerInstIncl = count > 0 ? rentTotalIncl / count : 0;
-            const firstInstIncl = rentPerInstIncl + upfrontPaidAmount;
-            const otherInstIncl = rentPerInstIncl;
-
-            const schedulePaidIncl =
-              rentPayments.reduce(
-                (sum, t) =>
-                  sum +
-                  (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) +
-                  (Number((t as any).discountAmount) || 0),
-                0,
-              ) + upfrontPaidAmount;
-
-            let cumulative = 0;
-            let found = false;
-            for (let i = 1; i <= count; i++) {
-              const instIncl = i === 1 ? firstInstIncl : otherInstIncl;
-              const prevCum = cumulative;
-              cumulative += instIncl;
-              if (schedulePaidIncl < cumulative - 0.01) {
-                currentInstallment = i;
-                currentInstAmt = instIncl;
-                paidTowardCurrent = Math.max(0, schedulePaidIncl - prevCum);
-                rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
-                found = true;
-                break;
-              }
-            }
-            if (!found) {
-              currentInstallment = count;
-              currentInstAmt = otherInstIncl;
-              paidTowardCurrent = currentInstAmt;
-              rentAutoFill = 0;
-            }
-
-            const effectiveTotalIncl = rentTotalIncl + upfrontPaidAmount;
-            const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
-            setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
-          } else {
-            const progress = computeInstallmentProgress({
-              contract,
-              payments: prevPayments,
-              excludeFeesEntry: nonResQe,
-            });
-            currentInstallment = progress.installmentNo;
-
-            const effectiveTotalIncl = rentValue;
-            const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
-            setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
-
-            currentInstAmt =
-              currentInstallment === 1
-                ? progress.firstInstAmt
-                : progress.otherInstAmt > 0
-                  ? progress.otherInstAmt
-                  : progress.firstInstAmt;
-            const prevCumulative =
-              currentInstallment === 1 ? 0 : progress.firstInstAmt + (currentInstallment - 2) * progress.otherInstAmt;
-            paidTowardCurrent = Math.max(0, progress.schedulePaid - prevCumulative);
-            rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
-          }
+          const rentFill = computeVatRentAutofill({
+            contract,
+            payments: prevPayments,
+            buildings,
+          });
+          const currentInstallment = rentFill.installmentNo;
+          const currentInstAmt = rentFill.currentInstAmt;
+          const paidTowardCurrent = rentFill.paidTowardCurrent;
+          const rentAutoFill = rentFill.rentAutoFill;
+          setQeContractStats({
+            paid: rentFill.paid,
+            remaining: rentFill.remaining,
+            installmentNo: currentInstallment,
+          });
 
           let feeCtx: ReturnType<typeof getNonResFeePeriodContext> | null = null;
-          if (contract && nonResQe) {
+          if (nonResQe) {
             feeCtx = getNonResFeePeriodContext(contract, prevPayments);
             setQeNonVatFeesPerInst(feeCtx.nonVatPerInst);
             setQeFeesPaidThisInst(feeCtx.feesPaidThisInst);
@@ -524,7 +459,9 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
             else if (feeCtx.nonVatPerInst > 0) setQeAmount(String(feeCtx.nonVatPerInst));
             else setQeAmount('');
           } else if (rentAutoFill > 0) {
-            setQeAmount(rentAutoFill.toString());
+            setQeAmount(String(rentAutoFill));
+          } else {
+            setQeAmount('');
           }
 
           const { startDate, endDate } = getInstallmentRange(contract, currentInstallment);
@@ -548,7 +485,6 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
               setQeDetails(t('vat.feesAllPeriodsPaidDetail', { customer: contractCustLabel }));
             } else if (feeCtx.activeInstallment != null) {
               const fi = feeCtx.activeInstallment;
-              // Use the exact fee window computed by feeCtx to avoid any drift / mismatch.
               const feePeriodText = feeCtx.feeStartStr && feeCtx.feeEndStr
                 ? `[${fmtDate(feeCtx.feeStartStr)} to ${fmtDate(feeCtx.feeEndStr)}]`
                 : '';
@@ -579,12 +515,21 @@ const VATQuickEntryModal: React.FC<VATQuickEntryModalProps> = ({
               setQeVatAutoFilled(true);
             }
           }
+        } else {
+          const fallback = unitDefaultRentAmount(
+            buildings.find((b) => b.id === qeBuildingId),
+            unit,
+          );
+          if (qeType !== 'FEES' && fallback > 0) {
+            setQeAmount(String(fallback));
+            setQeDetails(`Unit default rent — ${unit}`);
+          }
         }
       } finally {
         setQeContractLookupLoading(false);
       }
     },
-    [qeBuildingId, customers, transactions, qeType, buildings],
+    [qeBuildingId, customers, transactions, qeType, buildings, t],
   );
 
   const handleSave = async () => {

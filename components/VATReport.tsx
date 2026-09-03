@@ -8,6 +8,7 @@ import ConfirmDialog from './ConfirmDialog';
 import { FileText, Download, Calendar, Receipt, TrendingUp, TrendingDown, X, QrCode, FileDown, Search, Send, CheckCircle, AlertCircle, Loader, Eye, Plus, User as UserIcon, Sparkles, RotateCcw, FileUp, Trash2, ArrowLeftRight, History, ChevronDown, ChevronRight, Pencil, Lock, Landmark, ClipboardList, Copy, ExternalLink, ShieldCheck, Scale } from 'lucide-react';
 import PdfPurchaseImport from './PdfPurchaseImport';
 import { fmtDate, dateToLocalStr, contractDateToYmd } from '../utils/dateFormat';
+import { zatcaSignAndReportUrl, resolveZatcaServiceBase } from '../config/zatcaServiceUrl';
 import { buildTransactionSearchHaystack, matchesAdvancedSearch } from '../utils/advancedSearch';
 import { formatNameWithRoom, buildCustomerRoomMap, formatCustomerFromMap } from '../utils/customerDisplay';
 import { getInstallmentRange } from '../utils/installmentSchedule';
@@ -16,13 +17,14 @@ import { applyVatReportSnapshot, createVatReportSnapshot } from '../utils/vatSna
 import { auth } from '../firebase';
 import { useLanguage } from '../i18n';
 import { isNonResidentialBuildingForContract, transactionAppliesToContract } from '../utils/contractTransactionFilter';
-import { computeInstallmentProgress } from '../utils/installmentPaymentProgress';
+import { contractIncludesUnit, normalizeUnitLabel, pickBestContractForUnit } from '../utils/contractUnits';
+import { computeVatRentAutofill, unitDefaultRentAmount } from '../utils/vatRentAutofill';
 import { getNonResFeePeriodContext, getNonResFeeBreakdownLines } from '../utils/nonResidentialFeeSchedule';
 import * as XLSX from 'xlsx';
 import jsPDF from 'jspdf';
 import html2canvas from 'html2canvas';
 
-const ZATCA_SERVICE_URL = (import.meta as any).env?.VITE_ZATCA_SERVICE_URL || 'http://localhost:3022';
+const ZATCA_SERVICE_URL = resolveZatcaServiceBase();
 /** Sentinel for building filter: invoices with no linked property. */
 const NO_BUILDING_FILTER = '__no_building__';
 
@@ -49,6 +51,19 @@ const escapeHtml = (value: string | number | null | undefined): string =>
 const formatAmount = (value: number): string =>
   Number(value || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const hasZatcaReport = (tx: Transaction): boolean => Boolean(tx.zatcaQRCode || (tx as any).zatcaReportedAt);
+
+/** Real Amlak VAT sales rows for the Sales tab (excludes legacy isVATApplicable junk with VAT 0 / year-seq invoices). */
+const isVatSalesListRow = (tx: Transaction): boolean => {
+  if (tx.type !== TransactionType.INCOME || tx.isCreditNote) return false;
+  if (tx.isVATApplicable !== true) return false;
+  if (hasZatcaReport(tx)) return true;
+  const inv = String(tx.vatInvoiceNumber || '').trim();
+  if (/^SV-\d+$/i.test(inv)) return true;
+  const vat = Math.abs(Number(tx.vatAmount || 0));
+  const buyerVat = String(tx.customerVATNumber || '').trim();
+  // Pending ZATCA only when there is actual VAT and a buyer VAT number
+  return vat > 0.009 && !!buyerVat;
+};
 
 const pad2 = (n: number) => (n < 10 ? `0${n}` : `${n}`);
 const compareVatSequence = (a: Transaction, b: Transaction): number =>
@@ -386,7 +401,7 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
   const selectedQEBuilding = buildings.find(b => b.id === qeBuildingId);
   const qeBuildingUnits = useMemo(() => {
     if (!selectedQEBuilding) return [];
-    return selectedQEBuilding.units.map((u: any) => typeof u === 'string' ? u : u.name);
+    return (selectedQEBuilding.units || []).map((u: any) => typeof u === 'string' ? u : u.name);
   }, [selectedQEBuilding]);
 
   /** Banks for the selected property: book banks filtered by per-bank buildingId (if set), else building default bank first + all book banks. */
@@ -480,6 +495,14 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
     setQeContractCustomer(null);
     setQeCustomerVAT('');
     setQeVatAutoFilled(false);
+    setQeActiveContract(undefined);
+    setQeAmount('');
+    setQeDetails('');
+    setQeContractStats({ paid: 0, remaining: 0, installmentNo: 1 });
+    setQeNonVatFeesPerInst(0);
+    setQeFeesPaidThisInst(0);
+    setQeFeePeriodInstallment(null);
+    setQeFeesAllPeriodsPaid(false);
     if (!unit || !qeBuildingId) return;
     setQeContractLookupLoading(true);
     try {
@@ -490,10 +513,10 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
       // Try active contract first; if not found, fall back to any contract for this unit
       let contract = await getActiveContract(qeBuildingId, unit);
       if (!contract) {
-        const unitContracts = catalog.filter((c: any) => c.buildingId === qeBuildingId && c.unitName === unit);
-        // Prefer Active status, then most-recently-started
-        unitContracts.sort((a: any, b: any) => (a.status === 'Active' ? -1 : b.status === 'Active' ? 1 : 0));
-        contract = unitContracts[0] || null;
+        const unitContracts = catalog.filter(
+          (c: any) => c.buildingId === qeBuildingId && contractIncludesUnit(c.unitName, unit),
+        );
+        contract = pickBestContractForUnit(unitContracts) || null;
       }
       if (contract) {
         setQeActiveContract(contract);
@@ -502,88 +525,23 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
           if (t.type === TransactionType.EXPENSE) return false;
           return transactionAppliesToContract(t, contract as any, catalog);
         });
-        const upfrontPaidAmount = Number((contract as any).upfrontPaid || 0);
         const totalInst = contract.installmentCount || 1;
-        const rentValue = Number((contract as any).rentValue || 0);
-
         const nonResQe = isNonResidentialBuildingForContract(buildings, contract as any);
-        const rentPayments = nonResQe ? prevPayments.filter(t => !(t as any).feesEntry) : prevPayments;
-        const totalPaidIncl = rentPayments.reduce((sum, t) => sum + (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) + ((t as any).discountAmount || 0), 0);
-        const totalPaidEffective = totalPaidIncl + upfrontPaidAmount;
 
-        // IMPORTANT: For non-residential units, VAT Sales/Rent should NOT include non‑VAT fees.
-        // So we compute installment progress from rent-only value (VAT), excluding any fees schedule.
-        let currentInstallment = 1;
-        let currentInstAmt = 0;
-        let paidTowardCurrent = 0;
-        let rentAutoFill = 0;
-
-        if (nonResQe) {
-          const count = Math.max(1, Number(contract.installmentCount) || 1);
-          // ContractForm treats VAT-building rentValue as FINAL price (inclusive of VAT),
-          // and VAT transactions store amountIncludingVAT / totalWithVat as the money collected.
-          const rentTotalIncl = Number((contract as any).rentValue || 0);
-          const rentPerInstIncl = count > 0 ? rentTotalIncl / count : 0;
-          const firstInstIncl = rentPerInstIncl + upfrontPaidAmount;
-          const otherInstIncl = rentPerInstIncl;
-
-          const schedulePaidIncl =
-            rentPayments.reduce(
-              (sum, t) =>
-                sum +
-                (Number((t as any).amountIncludingVAT || (t as any).totalWithVat || t.amount) || 0) +
-                (Number((t as any).discountAmount) || 0),
-              0,
-            ) + upfrontPaidAmount;
-
-          let cumulative = 0;
-          let found = false;
-          for (let i = 1; i <= count; i++) {
-            const instIncl = i === 1 ? firstInstIncl : otherInstIncl;
-            const prevCum = cumulative;
-            cumulative += instIncl;
-            if (schedulePaidIncl < cumulative - 0.01) {
-              currentInstallment = i;
-              currentInstAmt = instIncl;
-              paidTowardCurrent = Math.max(0, schedulePaidIncl - prevCum);
-              rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
-              found = true;
-              break;
-            }
-          }
-          if (!found) {
-            currentInstallment = count;
-            currentInstAmt = otherInstIncl;
-            paidTowardCurrent = currentInstAmt;
-            rentAutoFill = 0;
-          }
-
-          const effectiveTotalIncl = rentTotalIncl + upfrontPaidAmount;
-          const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
-          setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
-        } else {
-          const progress = computeInstallmentProgress({
-            contract,
-            payments: prevPayments,
-            excludeFeesEntry: nonResQe,
-          });
-          currentInstallment = progress.installmentNo;
-
-          const effectiveTotalIncl = rentValue;
-          const remainingDisplay = Math.max(0, effectiveTotalIncl - totalPaidEffective);
-          setQeContractStats({ paid: totalPaidEffective, remaining: remainingDisplay, installmentNo: currentInstallment });
-
-          currentInstAmt =
-            currentInstallment === 1
-              ? progress.firstInstAmt
-              : progress.otherInstAmt > 0
-                ? progress.otherInstAmt
-                : progress.firstInstAmt;
-          const prevCumulative =
-            currentInstallment === 1 ? 0 : progress.firstInstAmt + (currentInstallment - 2) * progress.otherInstAmt;
-          paidTowardCurrent = Math.max(0, progress.schedulePaid - prevCumulative);
-          rentAutoFill = Math.max(0, Math.round((currentInstAmt - paidTowardCurrent) * 100) / 100);
-        }
+        const rentFill = computeVatRentAutofill({
+          contract,
+          payments: prevPayments,
+          buildings,
+        });
+        const currentInstallment = rentFill.installmentNo;
+        const currentInstAmt = rentFill.currentInstAmt;
+        const paidTowardCurrent = rentFill.paidTowardCurrent;
+        const rentAutoFill = rentFill.rentAutoFill;
+        setQeContractStats({
+          paid: rentFill.paid,
+          remaining: rentFill.remaining,
+          installmentNo: currentInstallment,
+        });
 
         let feeCtx: ReturnType<typeof getNonResFeePeriodContext> | null = null;
         if (nonResQe) {
@@ -606,7 +564,9 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
           else if (feeCtx.nonVatPerInst > 0) setQeAmount(String(feeCtx.nonVatPerInst));
           else setQeAmount('');
         } else if (rentAutoFill > 0) {
-          setQeAmount(rentAutoFill.toString());
+          setQeAmount(String(rentAutoFill));
+        } else {
+          setQeAmount('');
         }
 
         // Period computation (rent uses rent installment; FEES uses active fee period in details below)
@@ -650,6 +610,16 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
             setQeCustomerVAT(cust.vatNumber);
             setQeVatAutoFilled(true);
           }
+        }
+      } else {
+        // No contract: still seed amount from the unit's listed default rent when available
+        const fallback = unitDefaultRentAmount(
+          buildings.find((b) => b.id === qeBuildingId),
+          unit,
+        );
+        if (qeType !== 'FEES' && fallback > 0) {
+          setQeAmount(String(fallback));
+          setQeDetails(`Unit default rent — ${unit}`);
         }
       }
     } finally {
@@ -872,11 +842,11 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
         isCreditNote: !!t.isCreditNote,
         originalInvoiceId: t.originalInvoiceId,
       };
-      const res = await fetch(`${ZATCA_SERVICE_URL}/zatca/sign-and-report`, {
+      const res = await fetch(zatcaSignAndReportUrl(), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(45000),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'ZATCA service error');
@@ -895,7 +865,14 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
       setZatcaStatus(prev => ({ ...prev, [t.id]: { ok, msg: ok ? 'Reported Phase 2' : 'HTTP ' + data.zatcaStatus } }));
       setInvoiceModal(updated);
     } catch (err: any) {
-      setZatcaStatus(prev => ({ ...prev, [t.id]: { ok: false, msg: err.message } }));
+      const raw = String(err?.message || err || '');
+      const offline =
+        /Failed to fetch|NetworkError|ERR_CONNECTION_REFUSED|ECONNREFUSED|Load failed|abort|timeout/i.test(raw);
+      const msg = offline
+        ? `ZATCA service not reachable at ${ZATCA_SERVICE_URL}. The Mac Mini signer must be running (docker zatca + api.amlak-app.com tunnel).`
+        : raw;
+      setZatcaStatus(prev => ({ ...prev, [t.id]: { ok: false, msg } }));
+      window.alert(msg);
     } finally {
       setZatcaSending(prev => ({ ...prev, [t.id]: false }));
     }
@@ -1081,9 +1058,9 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
   useEffect(() => {
     let filtered = vatReportTransactions.filter(t => t.isVATApplicable === true);
     if (reportView === 'SALES') {
-      // Sales VAT report should list only actual VAT sales invoices (ZATCA-tagged / reported),
-      // not every income record that happens to have VAT toggled.
-      filtered = filtered.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote && isReportedToZatca(t));
+      // Real VAT sales only: ZATCA-reported, SV-* invoices, or taxable sales with buyer VAT.
+      // Do not list legacy year-seq invoices (2025-01) with VAT 0 and no customer.
+      filtered = filtered.filter(isVatSalesListRow);
     }
     else if (reportView === 'PURCHASE') filtered = filtered.filter(t => t.type === TransactionType.EXPENSE && !t.isCreditNote);
     else if (reportView === 'CREDIT_NOTE') filtered = filtered.filter(t => !!t.isCreditNote);
@@ -1094,7 +1071,12 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
     // New Search & Building Filters
     if (filterBuildingId) filtered = filtered.filter(t => matchesBuildingFilter(t, filterBuildingId));
     if (filterUnit && filterBuildingId !== NO_BUILDING_FILTER) {
-      filtered = filtered.filter(t => t.unitNumber === filterUnit);
+      filtered = filtered.filter(t => {
+        const u = String(t.unitNumber || '').trim();
+        const want = String(filterUnit || '').trim();
+        if (!want) return true;
+        return u === want || normalizeUnitLabel(u) === normalizeUnitLabel(want);
+      });
     }
     if (searchTerm.trim()) {
       filtered = filtered.filter((t) => {
@@ -1109,7 +1091,7 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
   const allFilteredSelected = filteredVATTransactions.length > 0 && filteredVATTransactions.every(t => selectedIds.has(t.id));
 
   const allSelectedFiltered = filteredVATTransactions;
-  const salesTransactionsAll = allSelectedFiltered.filter(t => t.type === TransactionType.INCOME && !t.isCreditNote);
+  const salesTransactionsAll = allSelectedFiltered.filter(isVatSalesListRow);
   /** Match Sales report tab: only ZATCA-reported sales count toward Output VAT. */
   const salesTransactions = salesTransactionsAll.filter(t => isReportedToZatca(t));
   const salesUnreportedTransactions = salesTransactionsAll.filter(t => !isReportedToZatca(t));
@@ -2837,7 +2819,9 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
               <div className="bg-slate-50 p-5 rounded-xl border border-slate-200">
                 <div className="text-[10px] font-bold text-slate-500 uppercase mb-1">Unreported sales VAT</div>
                 <div className="text-2xl font-black text-slate-800">{formatAmount(salesUnreportedVAT)} <span className="text-xs">SAR</span></div>
-                <div className="text-[11px] font-bold text-slate-500 mt-1">Not included in Output (not on Sales report)</div>
+                <div className="text-[11px] font-bold text-slate-500 mt-1">
+                  On Sales tab · not in Output until ZATCA · {salesUnreportedTransactions.length} invoices
+                </div>
               </div>
             </div>
             <div className={`rounded-xl border-2 p-5 flex flex-wrap items-center justify-between gap-4 ${
@@ -2857,6 +2841,15 @@ const VATReport: React.FC<{ currentUser?: User | null }> = ({ currentUser }) => 
               <div className={`text-sm font-bold px-4 py-2 rounded-lg ${netVATPayable >= 0 ? 'bg-white/10 text-white' : 'bg-white text-emerald-900 border border-emerald-200'}`}>
                 Rows: {filteredVATTransactions.length}
               </div>
+            </div>
+          </div>
+        )}
+
+        {reportView === 'SALES' && salesUnreportedTransactions.length > 0 && (
+          <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3">
+            <div className="text-sm font-bold text-amber-900">
+              {salesUnreportedTransactions.length} sales invoice{salesUnreportedTransactions.length === 1 ? '' : 's'} not yet sent to ZATCA
+              <span className="font-semibold text-amber-800/80"> · VAT {formatAmount(salesUnreportedVAT)} SAR (listed below; use Send in the ZATCA column)</span>
             </div>
           </div>
         )}
